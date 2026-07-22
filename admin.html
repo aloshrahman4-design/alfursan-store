@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>لوحة التحكم | أزياء الشيخة والأميرات</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=El+Messiri:wght@500;600;700&family=IBM+Plex+Sans+Arabic:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --plum:#5C1A33;--rose-bg:#FAF3F5;--gold:#C9A24B;--ink:#2B1B22;
+  --muted:#8A6F7B;--card:#FFFFFF;--ok:#2E7D4F;--err:#B3261E;
+  --shadow:0 10px 30px rgba(92,26,51,.10);--radius:16px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'IBM Plex Sans Arabic',system-ui,sans-serif;background:var(--rose-bg);color:var(--ink);min-height:100vh;padding-bottom:60px}
+h1,h2,.display{font-family:'El Messiri',serif}
+
+/* ===== قفل PIN ===== */
+#gate{
+  position:fixed;inset:0;background:linear-gradient(135deg,var(--plum),#7A2547);
+  display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;
+}
+.gate-box{background:#fff;border-radius:24px;padding:36px 30px;max-width:340px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.gate-box .badge{width:60px;height:60px;border-radius:50%;background:var(--gold);color:var(--plum);display:grid;place-items:center;font-family:'El Messiri';font-weight:700;font-size:1.7rem;margin:0 auto 14px}
+.gate-box h1{font-size:1.2rem;margin-bottom:6px}
+.gate-box p{color:var(--muted);font-size:.85rem;margin-bottom:20px}
+#pinInput{
+  width:100%;text-align:center;font-size:1.6rem;letter-spacing:10px;padding:14px;
+  border:2px solid #E7D5DC;border-radius:14px;font-family:inherit;outline:none;margin-bottom:14px;
+}
+#pinInput:focus{border-color:var(--plum)}
+.gate-box button{width:100%;background:var(--plum);color:#fff;border:none;border-radius:14px;padding:14px;font-family:inherit;font-weight:700;font-size:1rem;cursor:pointer}
+.gate-err{color:var(--err);font-size:.82rem;margin-top:10px;min-height:18px}
+
+/* ===== الهيدر ===== */
+header{background:linear-gradient(135deg,var(--plum) 0%, #7A2547 100%);color:#fff;padding:20px;position:relative}
+header::after{content:"";position:absolute;inset-inline:0;bottom:-1px;height:22px;background:radial-gradient(circle at 50% 0, transparent 10px, var(--rose-bg) 11px);background-size:30px 22px;background-position:center top}
+.header-row{max-width:820px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-badge{width:44px;height:44px;border-radius:50%;background:var(--gold);color:var(--plum);display:grid;place-items:center;font-family:'El Messiri';font-weight:700;font-size:1.2rem;flex-shrink:0}
+.brand h1{font-size:1.1rem}
+.brand p{font-size:.75rem;opacity:.85}
+.store-link{color:#fff;font-size:.82rem;text-decoration:none;border:1.5px solid rgba(255,255,255,.5);padding:8px 14px;border-radius:999px;white-space:nowrap}
+
+/* ===== المحتوى ===== */
+.wrap{max-width:820px;margin:26px auto;padding:0 18px;display:flex;flex-direction:column;gap:22px}
+.panel{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px}
+.panel h2{font-size:1.15rem;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+
+.field{margin-bottom:16px}
+.field label{display:block;font-size:.85rem;font-weight:700;margin-bottom:7px;color:var(--ink)}
+.field .hint{font-weight:400;color:var(--muted);font-size:.78rem}
+.field input[type=text],.field input[type=number],.field textarea,.field select{
+  width:100%;padding:12px 14px;border:1.5px solid #E7D5DC;border-radius:12px;
+  font-family:inherit;font-size:.95rem;outline:none;transition:border-color .15s;background:#fff;
+}
+.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--plum)}
+.field textarea{resize:vertical;min-height:70px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+/* رفع الصورة */
+.uploader{
+  border:2px dashed #E0C7D2;border-radius:16px;padding:18px;text-align:center;
+  cursor:pointer;position:relative;background:#FDF8F9;transition:border-color .15s;
+}
+.uploader.drag{border-color:var(--plum);background:#F6E9EE}
+.uploader input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.uploader .icon{font-size:1.8rem;margin-bottom:6px}
+.uploader p{font-size:.85rem;color:var(--muted)}
+.preview-wrap{margin-top:14px;display:flex;justify-content:center}
+.preview-wrap img{max-width:220px;max-height:280px;border-radius:14px;box-shadow:var(--shadow);object-fit:cover}
+
+/* شرائح المقاسات/الألوان */
+.tags-input{
+  display:flex;flex-wrap:wrap;gap:8px;padding:10px;border:1.5px solid #E7D5DC;border-radius:12px;background:#fff;
+}
+.tags-input input{flex:1;min-width:100px;border:none;outline:none;font-family:inherit;font-size:.9rem;padding:4px}
+.tag-chip{
+  background:#F6E9EE;color:var(--plum);padding:6px 10px;border-radius:999px;font-size:.82rem;
+  display:flex;align-items:center;gap:6px;white-space:nowrap;
+}
+.tag-chip button{background:none;border:none;color:var(--plum);cursor:pointer;font-size:1rem;line-height:1;opacity:.6}
+.tag-chip button:hover{opacity:1}
+
+.submit-btn{
+  width:100%;background:var(--plum);color:#fff;border:none;border-radius:14px;padding:16px;
+  font-family:inherit;font-weight:700;font-size:1.02rem;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;
+  transition:filter .15s;
+}
+.submit-btn:hover{filter:brightness(1.12)}
+.submit-btn:disabled{background:#D8B8C4;cursor:not-allowed}
+.spin{width:18px;height:18px;border-radius:50%;border:2.5px solid rgba(255,255,255,.4);border-top-color:#fff;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+.result{margin-top:14px;padding:14px 16px;border-radius:12px;font-size:.88rem;display:none}
+.result.ok{background:#E9F7EF;color:#1E7A45;display:block}
+.result.err{background:#FBEAEA;color:var(--err);display:block}
+.result a{color:inherit;font-weight:700;text-decoration:underline}
+
+/* قائمة المنتجات الأخيرة */
+.recent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}
+.rcard{background:#FDF8F9;border-radius:12px;overflow:hidden;box-shadow:0 3px 10px rgba(92,26,51,.08)}
+.rcard .thumb{aspect-ratio:3/4;background:#F1E3E9;display:grid;place-items:center;overflow:hidden}
+.rcard img{width:100%;height:100%;object-fit:cover}
+.rcard .ph{color:#C9A9B7;font-size:1.6rem;font-family:'El Messiri'}
+.rcard .info{padding:8px 10px}
+.rcard .n{font-size:.8rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rcard .p{font-size:.78rem;color:var(--plum);font-weight:700}
+.muted-note{color:var(--muted);font-size:.85rem;text-align:center;padding:20px}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="gate-box">
+    <div class="badge">ش</div>
+    <h1>لوحة تحكم المتجر</h1>
+    <p>دخلي رمز الدخول الخاص بج</p>
+    <input id="pinInput" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autofocus>
+    <button onclick="checkPin()">دخول</button>
+    <div class="gate-err" id="gateErr"></div>
+  </div>
+</div>
+
+<header>
+  <div class="header-row">
+    <div class="brand">
+      <div class="brand-badge">ش</div>
+      <div><h1>لوحة التحكم</h1><p>إضافة منتج جديد مباشرة للمتجر</p></div>
+    </div>
+    <a class="store-link" href="./index.html" target="_blank">فتح المتجر ↗</a>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="panel">
+    <h2>🆕 إضافة منتج جديد</h2>
+    <form id="productForm">
+
+      <div class="field">
+        <label>صورة المنتج <span class="hint">(مطلوبة — الصورة الأصلية بأعلى جودة)</span></label>
+        <div class="uploader" id="uploader">
+          <input type="file" id="imageInput" accept="image/*" capture="environment">
+          <div class="icon">📷</div>
+          <p id="uploaderText">اضغطي هنا أو اسحبي الصورة</p>
+        </div>
+        <div class="preview-wrap" id="previewWrap" style="display:none">
+          <img id="previewImg" alt="معاينة">
+        </div>
+      </div>
+
+      <div class="field">
+        <label>اسم المنتج</label>
+        <input type="text" id="fName" placeholder="مثال: فستان تركي مطرز">
+      </div>
+
+      <div class="field">
+        <label>الوصف <span class="hint">(اختياري)</span></label>
+        <textarea id="fDesc" placeholder="تفاصيل القماش، القصة، أي ملاحظات..."></textarea>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label>السعر المفرد (د.ع)</label>
+          <input type="number" id="fPrice" placeholder="40000">
+        </div>
+        <div class="field">
+          <label>سعر الجملة (د.ع) <span class="hint">اختياري</span></label>
+          <input type="number" id="fWholesale" placeholder="319000">
+        </div>
+      </div>
+
+      <div class="field">
+        <label>الصنف</label>
+        <input type="text" id="fCategory" list="catList" placeholder="فستان، طقم، حذاء، عباية...">
+        <datalist id="catList"></datalist>
+      </div>
+
+      <div class="field">
+        <label>القياسات <span class="hint">(اكتبي رقم واضغطي Enter لكل قياس)</span></label>
+        <div class="tags-input" id="sizesBox">
+          <input type="text" id="sizesInput" placeholder="38">
+        </div>
+      </div>
+
+      <div class="field">
+        <label>الألوان <span class="hint">(اكتبي لون واضغطي Enter)</span></label>
+        <div class="tags-input" id="colorsBox">
+          <input type="text" id="colorsInput" placeholder="أسود">
+        </div>
+      </div>
+
+      <button type="submit" class="submit-btn" id="submitBtn">
+        <span id="btnText">✨ نشر المنتج بالمتجر</span>
+      </button>
+      <div class="result" id="resultBox"></div>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>📦 آخر المنتجات المضافة</h2>
+    <div id="recentBox"><div class="muted-note">جاري التحميل...</div></div>
+  </div>
+
+</div>
+
+<script>
+/* ═══════════════ إعدادات ═══════════════ */
+const ADMIN_PIN = "2580";                 // ← غيّريه لأي رقم تريدينه
+const CLOUD_FUNCTION_URL = "https://europe-west1-alfursan-market.cloudfunctions.net/addProductFromTelegram";
+const SHARED_SECRET = "azyaa-secret-2026-x9f";
+const FIREBASE_PROJECT = "alfursan-market";
+const COLLECTION = "products";
+const MAX_DIMENSION = 1600; // أقصى بعد للصورة بعد الضغط، يحافظ على الوضوح
+
+/* ═══════════════ قفل PIN ═══════════════ */
+const pinInput = document.getElementById("pinInput");
+pinInput.addEventListener("keydown", e => { if(e.key === "Enter") checkPin(); });
+if(sessionStorage.getItem("admin_ok") === "1") document.getElementById("gate").style.display = "none";
+
+function checkPin(){
+  if(pinInput.value.trim() === ADMIN_PIN){
+    sessionStorage.setItem("admin_ok","1");
+    document.getElementById("gate").style.display = "none";
+  }else{
+    document.getElementById("gateErr").textContent = "رمز غير صحيح، حاولي مرة ثانية";
+    pinInput.value = ""; pinInput.focus();
+  }
+}
+
+/* ═══════════════ رفع وضغط الصورة ═══════════════ */
+let compressedBlob = null;
+const uploader = document.getElementById("uploader");
+const imageInput = document.getElementById("imageInput");
+
+["dragover","dragenter"].forEach(ev => uploader.addEventListener(ev, e=>{e.preventDefault(); uploader.classList.add("drag");}));
+["dragleave","drop"].forEach(ev => uploader.addEventListener(ev, e=>{e.preventDefault(); uploader.classList.remove("drag");}));
+uploader.addEventListener("drop", e=>{
+  if(e.dataTransfer.files[0]){ imageInput.files = e.dataTransfer.files; handleImage(e.dataTransfer.files[0]); }
+});
+imageInput.addEventListener("change", e=>{ if(e.target.files[0]) handleImage(e.target.files[0]); });
+
+function handleImage(file){
+  document.getElementById("uploaderText").textContent = "جاري التجهيز...";
+  const img = new Image();
+  const reader = new FileReader();
+  reader.onload = e => { img.src = e.target.result; };
+  img.onload = () => {
+    let {width, height} = img;
+    if(width > height && width > MAX_DIMENSION){ height = height*MAX_DIMENSION/width; width = MAX_DIMENSION; }
+    else if(height > MAX_DIMENSION){ width = width*MAX_DIMENSION/height; height = MAX_DIMENSION; }
+    const canvas = document.createElement("canvas");
+    canvas.width = width; canvas.height = height;
+    canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+    canvas.toBlob(blob => {
+      compressedBlob = blob;
+      const url = URL.createObjectURL(blob);
+      document.getElementById("previewImg").src = url;
+      document.getElementById("previewWrap").style.display = "flex";
+      document.getElementById("uploaderText").textContent = "اضغطي لتغيير الصورة";
+    }, "image/jpeg", 0.88);
+  };
+  reader.readAsDataURL(file);
+}
+
+/* ═══════════════ شرائح القياسات والألوان ═══════════════ */
+function setupTags(boxId, inputId){
+  const box = document.getElementById(boxId);
+  const input = document.getElementById(inputId);
+  const items = [];
+  input.addEventListener("keydown", e=>{
+    if(e.key === "Enter" && input.value.trim()){
+      e.preventDefault();
+      items.push(input.value.trim());
+      renderTags();
+      input.value = "";
+    }else if(e.key === "Backspace" && !input.value && items.length){
+      items.pop(); renderTags();
+    }
+  });
+  function renderTags(){
+    box.querySelectorAll(".tag-chip").forEach(el=>el.remove());
+    items.forEach((t,i)=>{
+      const chip = document.createElement("span");
+      chip.className = "tag-chip";
+      chip.innerHTML = `${esc(t)} <button type="button">×</button>`;
+      chip.querySelector("button").onclick = ()=>{ items.splice(i,1); renderTags(); };
+      box.insertBefore(chip, input);
+    });
+  }
+  return { get: ()=>items, clear: ()=>{ items.length=0; renderTags(); } };
+}
+const sizesTags = setupTags("sizesBox","sizesInput");
+const colorsTags = setupTags("colorsBox","colorsInput");
+
+/* ═══════════════ إرسال المنتج ═══════════════ */
+document.getElementById("productForm").addEventListener("submit", async e=>{
+  e.preventDefault();
+  const name = document.getElementById("fName").value.trim();
+  const resultBox = document.getElementById("resultBox");
+  resultBox.className = "result"; resultBox.textContent = "";
+
+  if(!compressedBlob){ showResult(false,"لازم تضيفي صورة المنتج أول"); return; }
+  if(!name){ showResult(false,"لازم تكتبي اسم المنتج"); return; }
+
+  const btn = document.getElementById("submitBtn");
+  btn.disabled = true;
+  document.getElementById("btnText").innerHTML = `<span class="spin"></span> جاري النشر...`;
+
+  try{
+    const fd = new FormData();
+    fd.append("secret", SHARED_SECRET);
+    fd.append("name", name);
+    fd.append("description", document.getElementById("fDesc").value.trim());
+    fd.append("price", document.getElementById("fPrice").value || "0");
+    fd.append("wholesale_price", document.getElementById("fWholesale").value || "null");
+    fd.append("category", document.getElementById("fCategory").value.trim() || "منوعات");
+    fd.append("sizes", sizesTags.get().join(","));
+    fd.append("colors", colorsTags.get().join(","));
+    fd.append("file", compressedBlob, "product.jpg");
+
+    const res = await fetch(CLOUD_FUNCTION_URL, { method:"POST", body: fd });
+    const data = await res.json();
+
+    if(res.ok && data.success){
+      showResult(true, `تم نشر المنتج بنجاح ✓ — <a href="./index.html" target="_blank">شوفيه بالمتجر</a>`);
+      resetForm();
+      setTimeout(loadRecent, 1000);
+    }else{
+      showResult(false, "صار خطأ: " + (data.error || "حاولي مرة ثانية"));
+    }
+  }catch(err){
+    showResult(false, "ما وصلت البيانات للسيرفر. تأكدي من الإنترنت وحاولي مرة ثانية.");
+  }finally{
+    btn.disabled = false;
+    document.getElementById("btnText").textContent = "✨ نشر المنتج بالمتجر";
+  }
+});
+
+function showResult(ok, html){
+  const box = document.getElementById("resultBox");
+  box.className = "result " + (ok ? "ok" : "err");
+  box.innerHTML = html;
+}
+function resetForm(){
+  document.getElementById("productForm").reset();
+  compressedBlob = null;
+  document.getElementById("previewWrap").style.display = "none";
+  document.getElementById("uploaderText").textContent = "اضغطي هنا أو اسحبي الصورة";
+  sizesTags.clear(); colorsTags.clear();
+}
+function esc(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+/* ═══════════════ قائمة آخر المنتجات (قراءة فقط) ═══════════════ */
+async function loadRecent(){
+  const box = document.getElementById("recentBox");
+  try{
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents/${COLLECTION}?pageSize=12`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const docs = (data.documents || []).map(parseDoc)
+      .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)).slice(0,12);
+
+    if(!docs.length){ box.innerHTML = `<div class="muted-note">ماكو منتجات لحد الآن</div>`; return; }
+
+    // تعبئة قائمة الأصناف تلقائياً بالفورم
+    const cats = [...new Set(docs.map(d=>d.category).filter(Boolean))];
+    document.getElementById("catList").innerHTML = cats.map(c=>`<option value="${esc(c)}">`).join("");
+
+    box.innerHTML = `<div class="recent-grid">` + docs.map(p=>`
+      <div class="rcard">
+        <div class="thumb">${p.image ? `<img src="${esc(p.image)}" loading="lazy">` : `<span class="ph">ش</span>`}</div>
+        <div class="info">
+          <div class="n">${esc(p.name)}</div>
+          <div class="p">${p.price>0 ? p.price.toLocaleString('en-US')+' د.ع' : 'بدون سعر'}</div>
+        </div>
+      </div>`).join("") + `</div>`;
+  }catch(err){
+    box.innerHTML = `<div class="muted-note">ما گدرنا نجيب القائمة، جربي تحدثين الصفحة</div>`;
+  }
+}
+function parseDoc(doc){
+  const f = doc.fields || {};
+  const val = v => {
+    if(v==null) return null;
+    if("stringValue" in v) return v.stringValue;
+    if("integerValue" in v) return Number(v.integerValue);
+    if("doubleValue" in v) return Number(v.doubleValue);
+    if("timestampValue" in v) return new Date(v.timestampValue).getTime();
+    return null;
+  };
+  const clean = s => { if(s==null) return ""; s=String(s).trim(); return (s===""||s==="غير محدد")?"":s; };
+  return {
+    name: clean(val(f.name)) || "بدون اسم",
+    price: Number(val(f.price)) || 0,
+    category: clean(val(f.category)),
+    image: clean(val(f.image)),
+    createdAt: val(f.createdAt) || 0,
+  };
+}
+loadRecent();
+</script>
+</body>
+</html>
