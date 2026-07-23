@@ -155,6 +155,44 @@ header::after{ /* حافة أقواس - توقيع التصميم */
 }
 @media(hover:none){ .g-nav{opacity:1} } /* على الموبايل الأسهم دائماً ظاهرة */
 
+/* ===== نافذة اختيار اللون والقياس ===== */
+.picker-modal{
+  position:fixed;inset:0;background:rgba(43,27,34,.6);z-index:70;
+  display:none;align-items:center;justify-content:center;padding:20px;
+}
+.picker-modal.open{display:flex}
+.pk-box{
+  background:#fff;border-radius:22px;padding:24px 22px 22px;
+  max-width:380px;width:100%;max-height:88vh;overflow-y:auto;position:relative;
+  box-shadow:0 24px 60px rgba(0,0,0,.3);
+}
+.pk-close{
+  position:absolute;top:12px;left:14px;background:none;border:none;
+  font-size:1.7rem;color:var(--muted);cursor:pointer;line-height:1;
+}
+.pk-head{display:flex;gap:14px;align-items:center;margin-bottom:18px;padding-left:30px}
+.pk-img{width:64px;height:80px;border-radius:12px;overflow:hidden;flex-shrink:0;background:#F1E3E9}
+.pk-img img{width:100%;height:100%;object-fit:cover}
+.pk-ph{width:100%;height:100%;display:grid;place-items:center;color:#C9A9B7;font-family:'El Messiri';font-size:1.5rem}
+.pk-head h3{font-size:1rem;line-height:1.45}
+.pk-label{font-size:.85rem;font-weight:700;margin:14px 0 8px;color:var(--ink)}
+.pk-opts{display:flex;flex-wrap:wrap;gap:8px}
+.pk-opt{
+  border:1.5px solid #E7D5DC;background:#fff;color:var(--ink);
+  padding:9px 16px;border-radius:999px;font-family:inherit;font-size:.88rem;
+  cursor:pointer;transition:all .15s;
+}
+.pk-opt:hover{border-color:var(--plum)}
+.pk-opt.sel{background:var(--plum);border-color:var(--plum);color:#fff;font-weight:700}
+.pk-err{color:#B3261E;font-size:.83rem;min-height:20px;margin-top:10px;text-align:center}
+.pk-add{
+  width:100%;background:var(--plum);color:#fff;border:none;border-radius:14px;
+  padding:14px;font-family:inherit;font-weight:700;font-size:1rem;cursor:pointer;
+  margin-top:6px;transition:filter .15s;
+}
+.pk-add:hover{filter:brightness(1.15)}
+.ci-opts{font-size:.75rem;color:var(--gold);font-weight:700}
+
 /* ===== نافذة الفيديو ===== */
 .video-modal{
   position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:80;
@@ -344,6 +382,21 @@ footer b{color:var(--plum)}
     </button>
   </div>
 </aside>
+
+<!-- نافذة اختيار اللون والقياس -->
+<div class="picker-modal" id="pickerModal" onclick="closePicker(event)">
+  <div class="pk-box">
+    <button class="pk-close" onclick="closePicker()" aria-label="إغلاق">×</button>
+    <div class="pk-head">
+      <div class="pk-img" id="pkImg"></div>
+      <h3 id="pkName"></h3>
+    </div>
+    <div id="pkColors"></div>
+    <div id="pkSizes"></div>
+    <div class="pk-err" id="pkErr"></div>
+    <button class="pk-add" onclick="confirmPicker()">أضيفي للسلة 🛍️</button>
+  </div>
+</div>
 
 <!-- نافذة الفيديو -->
 <div class="video-modal" id="videoModal" onclick="closeVideo(event)">
@@ -573,28 +626,90 @@ function closeVideo(ev){
 document.addEventListener("keydown", e=>{ if(e.key === "Escape") closeVideo(); });
 
 /* ─────────── السلة ─────────── */
-function loadCart(){ try{ return JSON.parse(localStorage.getItem("cart_v1")) || {}; }catch(e){ return {}; } }
-function saveCart(){ try{ localStorage.setItem("cart_v1", JSON.stringify(CART)); }catch(e){} }
+/* المفتاح: معرّف المنتج + اللون + القياس، حتى نفس المنتج بلونين يكون سطرين */
+function loadCart(){ try{ return JSON.parse(localStorage.getItem("cart_v2")) || {}; }catch(e){ return {}; } }
+function saveCart(){ try{ localStorage.setItem("cart_v2", JSON.stringify(CART)); }catch(e){} }
+
+function cartKey(id, color, size){ return `${id}|${color||""}|${size||""}`; }
+function parseKey(k){ const [id, color, size] = k.split("|"); return { id, color, size }; }
+
+/* ── اختيار اللون والقياس قبل الإضافة ── */
+let pickerState = null;
 
 function addToCart(id){
-  CART[id] = (CART[id]||0) + 1;
+  const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
+  // إذا ماكو خيارات، نضيف مباشرة
+  if(!p.sizes.length && !p.colors.length){ commitToCart(id, "", ""); return; }
+  openPicker(p);
+}
+
+function openPicker(p){
+  pickerState = { id: p.id, color: p.colors.length ? "" : "-", size: p.sizes.length ? "" : "-" };
+  document.getElementById("pkName").textContent = p.name;
+  const img = p.images[0];
+  document.getElementById("pkImg").innerHTML = img
+    ? `<img src="${esc(img)}" alt="">` : `<div class="pk-ph">ش</div>`;
+
+  document.getElementById("pkColors").innerHTML = p.colors.length
+    ? `<div class="pk-label">اختاري اللون</div><div class="pk-opts">` +
+      p.colors.map(c=>`<button class="pk-opt" onclick="pickOpt('color','${esc(c)}',this)">${esc(c)}</button>`).join("") +
+      `</div>` : "";
+
+  document.getElementById("pkSizes").innerHTML = p.sizes.length
+    ? `<div class="pk-label">اختاري القياس</div><div class="pk-opts">` +
+      p.sizes.map(s=>`<button class="pk-opt" onclick="pickOpt('size','${esc(s)}',this)">${esc(s)}</button>`).join("") +
+      `</div>` : "";
+
+  document.getElementById("pkErr").textContent = "";
+  document.getElementById("pickerModal").classList.add("open");
+}
+
+function pickOpt(kind, val, btn){
+  pickerState[kind] = val;
+  [...btn.parentElement.children].forEach(b=>b.classList.remove("sel"));
+  btn.classList.add("sel");
+  document.getElementById("pkErr").textContent = "";
+}
+
+function closePicker(ev){
+  if(ev && ev.target.id !== "pickerModal" && ev.type === "click" && !ev.target.classList.contains("pk-close")) return;
+  document.getElementById("pickerModal").classList.remove("open");
+  pickerState = null;
+}
+
+function confirmPicker(){
+  if(!pickerState) return;
+  const p = PRODUCTS.find(x=>x.id===pickerState.id); if(!p) return;
+  if(p.colors.length && !pickerState.color){ document.getElementById("pkErr").textContent = "اختاري اللون أول 🌸"; return; }
+  if(p.sizes.length && !pickerState.size){ document.getElementById("pkErr").textContent = "اختاري القياس أول 🌸"; return; }
+  const color = pickerState.color === "-" ? "" : pickerState.color;
+  const size  = pickerState.size  === "-" ? "" : pickerState.size;
+  commitToCart(p.id, color, size);
+  document.getElementById("pickerModal").classList.remove("open");
+  pickerState = null;
+}
+
+function commitToCart(id, color, size){
+  const k = cartKey(id, color, size);
+  CART[k] = (CART[k]||0) + 1;
   saveCart(); updateCartUI();
   toast("انضاف للسلة ✓");
 }
-function changeQty(id, d){
-  CART[id] = (CART[id]||0) + d;
-  if(CART[id] <= 0) delete CART[id];
+
+function changeQty(k, d){
+  CART[k] = (CART[k]||0) + d;
+  if(CART[k] <= 0) delete CART[k];
   saveCart(); updateCartUI();
 }
-function removeItem(id){ delete CART[id]; saveCart(); updateCartUI(); }
+function removeItem(k){ delete CART[k]; saveCart(); updateCartUI(); }
 
 function updateCartUI(){
   const count = Object.values(CART).reduce((a,b)=>a+b,0);
   document.getElementById("cartCount").textContent = count;
 
   const box = document.getElementById("cartItems");
-  const ids = Object.keys(CART);
-  if(!ids.length){
+  const keys = Object.keys(CART);
+  if(!keys.length){
     box.innerHTML = `<div class="empty-cart">السلة فارغة<br>ضيفي منتجاتج المفضلة 💜</div>`;
     document.getElementById("cartTotal").textContent = "0 د.ع";
     document.getElementById("checkoutBtn").disabled = true;
@@ -603,24 +718,27 @@ function updateCartUI(){
   document.getElementById("checkoutBtn").disabled = false;
 
   let total = 0;
-  box.innerHTML = ids.map(id => {
+  box.innerHTML = keys.map(k => {
+    const { id, color, size } = parseKey(k);
     const p = PRODUCTS.find(x=>x.id===id);
     if(!p) return "";
-    const qty = CART[id];
+    const qty = CART[k];
     total += (p.price||0) * qty;
     const img = p.images[0];
+    const opts = [color && `اللون: ${color}`, size && `القياس: ${size}`].filter(Boolean).join(" · ");
     return `<div class="ci">
       ${img ? `<img src="${esc(img)}" alt="">` : `<div class="ph2">ش</div>`}
       <div class="ci-info">
         <span class="ci-name">${esc(p.name)}</span>
+        ${opts ? `<span class="ci-opts">${esc(opts)}</span>` : ""}
         <span class="ci-price">${p.price>0 ? fmt(p.price) : "السعر عند الطلب"}</span>
         <div class="qty">
-          <button onclick="changeQty('${id}',1)">+</button>
+          <button onclick="changeQty('${k}',1)">+</button>
           <span>${qty}</span>
-          <button onclick="changeQty('${id}',-1)">−</button>
+          <button onclick="changeQty('${k}',-1)">−</button>
         </div>
       </div>
-      <button class="ci-remove" onclick="removeItem('${id}')">حذف</button>
+      <button class="ci-remove" onclick="removeItem('${k}')">حذف</button>
     </div>`;
   }).join("");
   document.getElementById("cartTotal").textContent = total>0 ? fmt(total) : "حسب الطلب";
@@ -635,27 +753,69 @@ function toggleCart(open){
 function waLink(msg){
   return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(msg)}`;
 }
+
+/* رقم طلب قصير مميز */
+function orderNo(){
+  const d = new Date();
+  const p = n => String(n).padStart(2,"0");
+  return `${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
 function orderSingle(id){
   const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
-  let msg = `السلام عليكم 🌸\nحابة أطلب من متجر أزياء الشيخة والأميرات:\n\n• ${p.name}`;
-  if(p.price>0) msg += `\n  السعر: ${fmt(p.price)}`;
-  if(p.sizes.length) msg += `\n  القياسات المتوفرة: ${p.sizes.join("، ")}`;
-  if(p.images[0]) msg += `\n  صورة المنتج: ${p.images[0]}`;
-  msg += `\n\nممكن التفاصيل؟ 💜`;
+  let msg = `السلام عليكم 🌸\n*طلب من متجر أزياء الشيخة والأميرات*\n`;
+  msg += `رقم الطلب: #${orderNo()}\n`;
+  msg += `━━━━━━━━━━━━━━━\n\n`;
+  msg += `*${p.name}*\n`;
+  if(p.category) msg += `الصنف: ${p.category}\n`;
+  if(p.price>0) msg += `السعر: ${fmt(p.price)}\n`;
+  if(p.wholesalePrice>0) msg += `سعر الجملة: ${fmt(p.wholesalePrice)}\n`;
+  if(p.sizes.length)  msg += `القياسات المتوفرة: ${p.sizes.join("، ")}\n`;
+  if(p.colors.length) msg += `الألوان المتوفرة: ${p.colors.join("، ")}\n`;
+  if(p.images[0]) msg += `\n📷 ${p.images[0]}\n`;
+  msg += `\n━━━━━━━━━━━━━━━\n`;
+  msg += `📝 *معلومات التوصيل:*\n`;
+  msg += `الاسم: \nرقم الهاتف: \nالمحافظة: \nأقرب نقطة دالة: \n`;
+  msg += `\nشكراً 💜`;
   window.open(waLink(msg), "_blank");
 }
+
 function checkout(){
-  const ids = Object.keys(CART); if(!ids.length) return;
-  let msg = `السلام عليكم 🌸\nحابة أطلب من متجر أزياء الشيخة والأميرات:\n`;
-  let total = 0;
-  ids.forEach((id,i) => {
+  const keys = Object.keys(CART); if(!keys.length) return;
+
+  let msg = `السلام عليكم 🌸\n*طلب من متجر أزياء الشيخة والأميرات*\n`;
+  msg += `رقم الطلب: #${orderNo()}\n`;
+  msg += `━━━━━━━━━━━━━━━\n`;
+
+  let total = 0, anyPrice = false, i = 0;
+  keys.forEach(k => {
+    const { id, color, size } = parseKey(k);
     const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
-    const qty = CART[id];
-    msg += `\n${i+1}. ${p.name} × ${qty}`;
-    if(p.price>0){ msg += ` — ${fmt(p.price*qty)}`; total += p.price*qty; }
+    const qty = CART[k];
+    i++;
+
+    msg += `\n*${i}. ${p.name}*\n`;
+    if(color) msg += `   • اللون: ${color}\n`;
+    if(size)  msg += `   • القياس: ${size}\n`;
+    msg += `   • الكمية: ${qty}\n`;
+    if(p.price>0){
+      msg += `   • السعر: ${fmt(p.price)}`;
+      if(qty>1) msg += ` × ${qty} = ${fmt(p.price*qty)}`;
+      msg += `\n`;
+      total += p.price*qty; anyPrice = true;
+    }else{
+      msg += `   • السعر: عند الطلب\n`;
+    }
+    if(p.images[0]) msg += `   📷 ${p.images[0]}\n`;
   });
-  if(total>0) msg += `\n\nالمجموع: ${fmt(total)}`;
-  msg += `\n\nشكراً 💜`;
+
+  msg += `\n━━━━━━━━━━━━━━━\n`;
+  msg += `عدد القطع: ${Object.values(CART).reduce((a,b)=>a+b,0)}\n`;
+  if(anyPrice) msg += `*المجموع: ${fmt(total)}*\n`;
+  msg += `\n📝 *معلومات التوصيل:*\n`;
+  msg += `الاسم: \nرقم الهاتف: \nالمحافظة: \nأقرب نقطة دالة: \n`;
+  msg += `\nشكراً 💜`;
+
   window.open(waLink(msg), "_blank");
 }
 
