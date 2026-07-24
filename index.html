@@ -572,6 +572,8 @@ function checkout(){
     const qty = CART[id];
     msg += `\n${i+1}. ${p.name} × ${qty}`;
     if(p.price>0){ msg += ` — ${fmt(p.price*qty)}`; total += p.price*qty; }
+    if(p.sizes.length) msg += `\n   القياس: ${p.sizes.join("، ")}`;
+    if(p.images[0]) msg += `\n   صورة: ${p.images[0]}`;
   });
   if(total>0) msg += `\n\nالمجموع: ${fmt(total)}`;
   msg += `\n\nشكراً 💜`;
