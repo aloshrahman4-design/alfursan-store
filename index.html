@@ -410,7 +410,44 @@ footer b{color:var(--plum)}
 /* ═══════════════════════════════════════════════
    إعدادات المتجر — عدّل رقم الواتساب فقط
    ═══════════════════════════════════════════════ */
-const WHATSAPP_NUMBER = "9647707878933";   // ← حط رقمك هنا بالصيغة الدولية بدون +
+/* ═══════════════════════════════════════════════
+   الصفحات ــ كل صفحة فيسبوك ورقم واتسابها
+   الرابط: الموقع/?p=الرمز
+   ═══════════════════════════════════════════════ */
+const PAGES = {
+  shaikha: { name: "أزياء الشيخة",   badge: "ش", wa: "9647744062559" },
+  amirat:  { name: "أزياء الأميرات", badge: "أ", wa: "9647773433130" },
+  dijlah:  { name: "أزياء دجلة",     badge: "د", wa: "9647873211311" },
+  kanari:  { name: "كناري",          badge: "ك", wa: "9647778032767" },
+  main:    { name: "مجموعة الفرسان", badge: "ف", wa: "9647707878933" },
+};
+const DEFAULT_PAGE = "main";
+
+/* نقرأ الرمز من الرابط ونحفظه — يبقى محفوظ طول الجلسة */
+function detectPage(){
+  try{
+    const q = new URLSearchParams(location.search);
+    const code = (q.get("p") || q.get("page") || "").toLowerCase().trim();
+    if(code && PAGES[code]){
+      localStorage.setItem("src_page", code);
+      return code;
+    }
+    const saved = localStorage.getItem("src_page");
+    if(saved && PAGES[saved]) return saved;
+  }catch(e){}
+  return DEFAULT_PAGE;
+}
+const PAGE_CODE = detectPage();
+const PAGE = PAGES[PAGE_CODE];
+const WHATSAPP_NUMBER = PAGE.wa;
+
+/* نعرض اسم الصفحة بالهيدر */
+document.addEventListener("DOMContentLoaded", ()=>{
+  const badge = document.querySelector(".brand-badge");
+  const title = document.querySelector(".brand h1");
+  if(badge) badge.textContent = PAGE.badge;
+  if(title && PAGE_CODE !== "main") title.textContent = PAGE.name;
+});
 const FIREBASE_PROJECT = "alfursan-market";
 const COLLECTION = "products";
 
@@ -763,7 +800,7 @@ function orderNo(){
 
 function orderSingle(id){
   const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
-  let msg = `السلام عليكم 🌸\n*طلب من متجر أزياء الشيخة والأميرات*\n`;
+  let msg = `السلام عليكم 🌸\n*طلب من ${PAGE.name}*\n`;
   msg += `رقم الطلب: #${orderNo()}\n`;
   msg += `━━━━━━━━━━━━━━━\n\n`;
   msg += `*${p.name}*\n`;
@@ -783,7 +820,7 @@ function orderSingle(id){
 function checkout(){
   const keys = Object.keys(CART); if(!keys.length) return;
 
-  let msg = `السلام عليكم 🌸\n*طلب من متجر أزياء الشيخة والأميرات*\n`;
+  let msg = `السلام عليكم 🌸\n*طلب من ${PAGE.name}*\n`;
   msg += `رقم الطلب: #${orderNo()}\n`;
   msg += `━━━━━━━━━━━━━━━\n`;
 
