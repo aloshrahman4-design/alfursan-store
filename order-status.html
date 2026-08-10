@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>تحديث حالة الطلب | أزياء الشيخة والأميرات</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=El+Messiri:wght@500;600;700&family=IBM+Plex+Sans+Arabic:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --plum:#5C1A33;--plum-dark:#431225;--rose-bg:#FAF3F5;--gold:#C9A24B;--ink:#2B1B22;
+  --muted:#8A6F7B;--card:#FFFFFF;--ok:#2E7D4F;--err:#B3261E;
+  --shadow:0 10px 30px rgba(92,26,51,.10);--radius:16px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'IBM Plex Sans Arabic',system-ui,sans-serif;background:var(--rose-bg);color:var(--ink);min-height:100vh;padding-bottom:60px}
+h1,h2,.display{font-family:'El Messiri',serif}
+
+#gate{
+  position:fixed;inset:0;background:linear-gradient(135deg,var(--plum),var(--plum-dark));
+  display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;
+}
+.gate-box{background:#fff;border-radius:24px;padding:36px 30px;max-width:340px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.gate-box .badge{width:60px;height:60px;border-radius:50%;background:var(--gold);color:var(--plum);display:grid;place-items:center;font-family:'El Messiri';font-weight:700;font-size:1.7rem;margin:0 auto 14px}
+.gate-box h1{font-size:1.2rem;margin-bottom:6px}
+.gate-box p{color:var(--muted);font-size:.85rem;margin-bottom:20px}
+#pinInput{
+  width:100%;text-align:center;font-size:1.6rem;letter-spacing:10px;padding:14px;
+  border:2px solid #E7D5DC;border-radius:14px;font-family:inherit;outline:none;margin-bottom:14px;
+}
+#pinInput:focus{border-color:var(--plum)}
+.gate-box button{width:100%;background:var(--plum);color:#fff;border:none;border-radius:14px;padding:14px;font-family:inherit;font-weight:700;font-size:1rem;cursor:pointer}
+.gate-err{color:var(--err);font-size:.82rem;margin-top:10px;min-height:18px}
+
+header{background:linear-gradient(135deg,var(--plum) 0%, #7A2547 100%);color:#fff;padding:20px;position:relative}
+header::after{content:"";position:absolute;inset-inline:0;bottom:-1px;height:22px;background:radial-gradient(circle at 50% 0, transparent 10px, var(--rose-bg) 11px);background-size:30px 22px;background-position:center top}
+.header-row{max-width:520px;margin:0 auto;display:flex;align-items:center;gap:12px}
+.brand-badge{width:44px;height:44px;border-radius:50%;background:var(--gold);color:var(--plum);display:grid;place-items:center;font-family:'El Messiri';font-weight:700;font-size:1.2rem;flex-shrink:0}
+header h1{font-size:1.1rem}
+header p{font-size:.75rem;opacity:.85}
+
+.wrap{max-width:520px;margin:26px auto;padding:0 18px}
+.panel{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px}
+
+.field{margin-bottom:18px}
+.field label{display:block;font-size:.85rem;font-weight:700;margin-bottom:7px}
+.field input{
+  width:100%;padding:14px;border:1.5px solid #E7D5DC;border-radius:12px;
+  font-family:inherit;font-size:1.1rem;text-align:center;letter-spacing:4px;text-transform:uppercase;
+  outline:none;
+}
+.field input:focus{border-color:var(--plum)}
+
+.status-choices{display:flex;flex-direction:column;gap:10px;margin-bottom:20px}
+.status-choice{
+  display:flex;align-items:center;gap:10px;border:1.5px solid #E7D5DC;border-radius:12px;
+  padding:12px 14px;cursor:pointer;font-size:.92rem;font-weight:700;transition:all .15s;
+}
+.status-choice.active{border-color:var(--plum);background:#F6E9EE;color:var(--plum)}
+.status-choice input{width:auto;accent-color:var(--plum)}
+
+.submit-btn{
+  width:100%;background:var(--plum);color:#fff;border:none;border-radius:14px;padding:15px;
+  font-family:inherit;font-weight:700;font-size:1rem;cursor:pointer;
+}
+.submit-btn:disabled{background:#D8B8C6;cursor:not-allowed}
+
+.result{margin-top:14px;padding:14px 16px;border-radius:12px;font-size:.88rem;display:none;text-align:center}
+.result.ok{background:#E9F7EF;color:#1E7A45;display:block}
+.result.err{background:#FBEAEA;color:var(--err);display:block}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="gate-box">
+    <div class="badge">ش</div>
+    <h1>تحديث حالة الطلب</h1>
+    <p>دخّلي رمز المندوبة</p>
+    <input id="pinInput" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autofocus>
+    <button onclick="checkPin()">دخول</button>
+    <div class="gate-err" id="gateErr"></div>
+  </div>
+</div>
+
+<header>
+  <div class="header-row">
+    <div class="brand-badge">ش</div>
+    <div><h1>تحديث حالة الطلب</h1><p>أزياء الشيخة والأميرات</p></div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <div class="field">
+      <label>رقم الطلب (4 رموز)</label>
+      <input id="orderNumber" type="text" maxlength="4" placeholder="ABCD">
+    </div>
+
+    <div class="status-choices" id="statusChoices">
+      <label class="status-choice"><input type="radio" name="status" value="تجهيز"> 🛠️ تجهيز</label>
+      <label class="status-choice"><input type="radio" name="status" value="بالشحن"> 🚚 بالشحن</label>
+      <label class="status-choice"><input type="radio" name="status" value="تم التسليم"> ✅ تم التسليم</label>
+    </div>
+
+    <button class="submit-btn" id="submitBtn" onclick="submitUpdate()">تحديث الحالة</button>
+    <div class="result" id="resultBox"></div>
+  </div>
+</div>
+
+<script>
+const CHECK_PIN_URL = "https://europe-west1-alfursan-market.cloudfunctions.net/checkRepPin";
+const UPDATE_STATUS_URL = "https://europe-west1-alfursan-market.cloudfunctions.net/updateOrderStatus";
+
+const pinInput = document.getElementById("pinInput");
+const pinBtn = document.querySelector(".gate-box button");
+const gateErr = document.getElementById("gateErr");
+pinInput.addEventListener("keydown", e => { if(e.key === "Enter") checkPin(); });
+if(sessionStorage.getItem("rep_ok") === "1" && sessionStorage.getItem("rep_secret")){
+  document.getElementById("gate").style.display = "none";
+}
+applyLockIfAny();
+
+function applyLockIfAny(){
+  const until = Number(sessionStorage.getItem("rep_lock_until") || 0);
+  if(until > Date.now()) lockGate(Math.ceil((until - Date.now())/1000));
+}
+function lockGate(seconds){
+  const until = Date.now() + seconds*1000;
+  sessionStorage.setItem("rep_lock_until", String(until));
+  pinInput.disabled = true; pinBtn.disabled = true;
+  (function tick(){
+    const left = Math.ceil((until - Date.now())/1000);
+    if(left <= 0){
+      pinInput.disabled = false; pinBtn.disabled = false;
+      gateErr.textContent = "";
+      sessionStorage.removeItem("rep_lock_until");
+      return;
+    }
+    gateErr.textContent = `عدد محاولات كثير — حاولي بعد ${Math.floor(left/60)}:${String(left%60).padStart(2,"0")}`;
+    setTimeout(tick, 1000);
+  })();
+}
+
+async function checkPin(){
+  const pin = pinInput.value.trim();
+  if(!pin || pinBtn.disabled) return;
+  pinBtn.disabled = true;
+  gateErr.textContent = "";
+  try{
+    const res = await fetch(CHECK_PIN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin })
+    });
+    const data = await res.json();
+
+    if(res.ok && data.success){
+      sessionStorage.setItem("rep_ok","1");
+      sessionStorage.setItem("rep_secret", data.secret);
+      document.getElementById("gate").style.display = "none";
+      return;
+    }
+
+    if(res.status === 429 || data.error === "locked"){
+      lockGate(data.retryAfter || 300);
+      return;
+    }
+
+    pinBtn.disabled = false;
+    gateErr.textContent = data.attemptsLeft != null
+      ? `رمز غير صحيح — تبقى ${data.attemptsLeft} محاولات`
+      : "رمز غير صحيح، حاولي مرة ثانية";
+    pinInput.value = ""; pinInput.focus();
+  }catch(err){
+    pinBtn.disabled = false;
+    gateErr.textContent = "تعذر الاتصال بالسيرفر، تأكدي من الإنترنت";
+  }
+}
+
+document.querySelectorAll(".status-choice").forEach(el=>{
+  el.addEventListener("click", ()=>{
+    document.querySelectorAll(".status-choice").forEach(x=>x.classList.remove("active"));
+    el.classList.add("active");
+  });
+});
+
+async function submitUpdate(){
+  const orderNumber = document.getElementById("orderNumber").value.trim().toUpperCase();
+  const statusEl = document.querySelector('input[name="status"]:checked');
+  const resultBox = document.getElementById("resultBox");
+  resultBox.className = "result"; resultBox.textContent = "";
+
+  if(!orderNumber){ showResult(false, "لازم تدخلين رقم الطلب"); return; }
+  if(!statusEl){ showResult(false, "لازم تختارين الحالة الجديدة"); return; }
+
+  const btn = document.getElementById("submitBtn");
+  btn.disabled = true; btn.textContent = "جاري التحديث...";
+
+  try{
+    const res = await fetch(UPDATE_STATUS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: sessionStorage.getItem("rep_secret") || "",
+        orderNumber, status: statusEl.value
+      })
+    });
+    const data = await res.json();
+    if(res.ok && data.success){
+      showResult(true, `تم تحديث الطلب ${orderNumber} ✓`);
+      document.getElementById("orderNumber").value = "";
+      document.querySelectorAll(".status-choice").forEach(x=>x.classList.remove("active"));
+      statusEl.checked = false;
+    }else if(data.error === "not_found"){
+      showResult(false, "ماكو طلب بهذا الرقم، تأكدي منه");
+    }else{
+      showResult(false, "صار خطأ: " + (data.error || "حاولي مرة ثانية"));
+    }
+  }catch(err){
+    showResult(false, "تعذر الاتصال بالسيرفر");
+  }finally{
+    btn.disabled = false; btn.textContent = "تحديث الحالة";
+  }
+}
+function showResult(ok, text){
+  const box = document.getElementById("resultBox");
+  box.className = "result " + (ok ? "ok" : "err");
+  box.textContent = text;
+}
+</script>
+</body>
+</html>
