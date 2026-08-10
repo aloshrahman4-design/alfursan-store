@@ -376,6 +376,8 @@ const WHATSAPP_NUMBER = CURRENT_PAGE ? CURRENT_PAGE.whatsapp : "9647707878933";
 const STORE_NAME = CURRENT_PAGE ? CURRENT_PAGE.name : "مجموعة الفرسان";
 const FIREBASE_PROJECT = "alfursan-market";
 const COLLECTION = "products";
+const CREATE_ORDER_URL = "https://europe-west1-alfursan-market.cloudfunctions.net/createOrder";
+const ORDER_STATUS_WHATSAPP = "9647855688747";
 
 /* ─────────── قراءة المنتجات من Firestore مباشرة (REST) ─────────── */
 const API = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents/${COLLECTION}`;
@@ -655,27 +657,58 @@ function toggleCart(open){
 function waLink(msg){
   return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(msg)}`;
 }
-function orderSingle(id){
+
+/* رقم تتبع الطلب — لا يوقف عملية الطلب لو فشل (best-effort) */
+async function createOrderRecord(items, total){
+  try{
+    const res = await fetch(CREATE_ORDER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ page: PAGE_KEY || "", items, total })
+    });
+    const data = await res.json();
+    return (res.ok && data.success) ? data.orderNumber : null;
+  }catch(e){ return null; }
+}
+function orderTrackingLine(orderNumber){
+  if(!orderNumber) return "";
+  return `\n\n📦 رقم تتبع طلبج: ${orderNumber}\nترسلينه لهذا الرقم بواتساب لمعرفة حالة الطلب: wa.me/${ORDER_STATUS_WHATSAPP}`;
+}
+
+async function orderSingle(id){
   const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
+  const win = window.open("", "_blank"); // نفتحها فوري داخل نفس نقرة المستخدم حتى المتصفح ما يحجبها كنافذة منبثقة
+  const orderNumber = await createOrderRecord([{ name: p.name, qty: 1 }], p.price || 0);
   let msg = `السلام عليكم 🌸\nحابة أطلب من ${STORE_NAME}:\n\n• ${p.name}`;
   if(p.price>0) msg += `\n  السعر: ${fmt(p.price)}`;
   if(p.sizes.length) msg += `\n  القياسات المتوفرة: ${p.sizes.join("، ")}`;
   if(p.images[0]) msg += `\n  صورة المنتج: ${p.images[0]}`;
   msg += `\n\n🔄 سياسة الإرجاع: الفحص حصراً بوجود المندوب وقت التسليم، وأي عيب أو عدم مطابقة الإرجاع مجاني بدون تكلفة نقل.`;
   msg += `\n✅ الدفع عند الاستلام متوفر لجميع الطلبات.`;
+  msg += orderTrackingLine(orderNumber);
   msg += `\n\nممكن التفاصيل؟ 💜`;
-  window.open(waLink(msg), "_blank");
+  if(win) win.location.href = waLink(msg); else window.open(waLink(msg), "_blank");
 }
-function checkout(){
+async function checkout(){
   const ids = Object.keys(CART); if(!ids.length) return;
-  let msg = `السلام عليكم 🌸\nحابة أطلب من ${STORE_NAME}:\n`;
+  const win = window.open("", "_blank");
   let total = 0, totalQty = 0;
-  ids.forEach((id,i) => {
+  const orderItems = [];
+  ids.forEach(id => {
     const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
     const qty = CART[id];
     totalQty += qty;
+    if(p.price>0) total += p.price*qty;
+    orderItems.push({ name: p.name, qty });
+  });
+  const orderNumber = await createOrderRecord(orderItems, total);
+
+  let msg = `السلام عليكم 🌸\nحابة أطلب من ${STORE_NAME}:\n`;
+  ids.forEach((id,i) => {
+    const p = PRODUCTS.find(x=>x.id===id); if(!p) return;
+    const qty = CART[id];
     msg += `\n${i+1}. ${p.name} × ${qty}`;
-    if(p.price>0){ msg += ` — ${fmt(p.price*qty)}`; total += p.price*qty; }
+    if(p.price>0) msg += ` — ${fmt(p.price*qty)}`;
     if(p.sizes.length) msg += `\n   القياس: ${p.sizes.join("، ")}`;
     if(p.images[0]) msg += `\n   صورة: ${p.images[0]}`;
   });
@@ -683,8 +716,9 @@ function checkout(){
   if(totalQty>=3) msg += `\n\n🚚 شحن مجاني (الطلبية 3 قطع أو أكثر).`;
   msg += `\n\n🔄 سياسة الإرجاع: الفحص حصراً بوجود المندوب وقت التسليم، وأي عيب أو عدم مطابقة الإرجاع مجاني بدون تكلفة نقل.`;
   msg += `\n✅ الدفع عند الاستلام متوفر لجميع الطلبات.`;
+  msg += orderTrackingLine(orderNumber);
   msg += `\n\nشكراً 💜`;
-  window.open(waLink(msg), "_blank");
+  if(win) win.location.href = waLink(msg); else window.open(waLink(msg), "_blank");
 }
 
 function toast(t){
