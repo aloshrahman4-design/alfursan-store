@@ -211,10 +211,20 @@ header::after{content:"";position:absolute;inset-inline:0;bottom:-1px;height:22p
 /* ═══════════════ إعدادات ═══════════════ */
 const ADMIN_PIN = "2580";                 // ← غيّريه لأي رقم تريدينه
 const CLOUD_FUNCTION_URL = "https://europe-west1-alfursan-market.cloudfunctions.net/addProductFromTelegram";
-const SHARED_SECRET = "azyaa-secret-2026-x9f";
 const FIREBASE_PROJECT = "alfursan-market";
 const COLLECTION = "products";
 const MAX_DIMENSION = 1600; // أقصى بعد للصورة بعد الضغط، يحافظ على الوضوح
+
+/* ═══════════════ رمز الربط مع الخادم (Secret) ═══════════════ */
+// ما نخزن السر بالكود عشان ما ينرفع لـGitHub. تُدخلينه مرة وحدة كل جلسة متصفح.
+function getSharedSecret(){
+  let s = sessionStorage.getItem("admin_secret");
+  if(!s){
+    s = (prompt("أدخلي رمز الربط مع الخادم (Secret) — يُطلب مرة وحدة كل جلسة:") || "").trim();
+    if(s) sessionStorage.setItem("admin_secret", s);
+  }
+  return s;
+}
 
 /* ═══════════════ قفل PIN ═══════════════ */
 const pinInput = document.getElementById("pinInput");
@@ -312,7 +322,7 @@ document.getElementById("productForm").addEventListener("submit", async e=>{
 
   try{
     const fd = new FormData();
-    fd.append("secret", SHARED_SECRET);
+    fd.append("secret", getSharedSecret());
     fd.append("name", name);
     fd.append("description", document.getElementById("fDesc").value.trim());
     fd.append("price", document.getElementById("fPrice").value || "0");
@@ -330,6 +340,7 @@ document.getElementById("productForm").addEventListener("submit", async e=>{
       resetForm();
       setTimeout(loadRecent, 1000);
     }else{
+      if(res.status === 401 || res.status === 403) sessionStorage.removeItem("admin_secret");
       showResult(false, "صار خطأ: " + (data.error || "حاولي مرة ثانية"));
     }
   }catch(err){
