@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Optional
+from typing import List, Optional
 
 from google import genai
 from google.genai import types
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 _client: Optional[genai.Client] = None
 
 # Retried on transient failures (network blip, rate limit, momentary 5xx)
-# so one flaky call doesn't fail an entire batch item outright.
-_MAX_ATTEMPTS = 3
+# for EACH model tried, so one flaky call doesn't fail an entire batch item.
+_MAX_ATTEMPTS_PER_MODEL = 2
 _RETRY_BACKOFF_SECONDS = 1.5
 
 # A wholesale shoe/clothing price outside this range is almost certainly a
@@ -131,49 +131,20 @@ def _get_client() -> genai.Client:
     return _client
 
 
-def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> ProductData:
-    """Send the raw image to Gemini Vision and return strictly-typed supplier data.
-
-    Retries a couple of times on transient failures (network blip, rate
-    limit, momentary 5xx) with a short backoff -- a validation failure
-    (bad/implausible data) is NOT retried, since asking the same model the
-    same question again won't fix a genuine misread.
-
-    Blocking (network) call -- callers on an asyncio event loop should run
-    this via `asyncio.to_thread`.
+def _model_candidates() -> List[str]:
+    """GEMINI_MODEL first, then config.GEMINI_FALLBACK_MODELS, de-duplicated
+    in order. If Google retires/renames the configured model, the bot tries
+    the next one instead of hard-failing every photo until someone notices
+    and edits .env.
     """
-    client = _get_client()
+    seen: List[str] = []
+    for name in [config.GEMINI_MODEL, *config.GEMINI_FALLBACK_MODELS]:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
 
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        try:
-            response = client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    EXTRACTION_PROMPT,
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ProductData,
-                    temperature=0,
-                ),
-            )
-            break
-        except ValidationError as exc:
-            raise ExtractionError(f"Could not validate supplier data: {exc}") from exc
-        except Exception as exc:
-            last_exc = exc
-            if attempt < _MAX_ATTEMPTS:
-                logger.warning(
-                    "Gemini call failed (attempt %s/%s), retrying: %s", attempt, _MAX_ATTEMPTS, exc
-                )
-                time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
-                continue
-            raise ExtractionError(f"Gemini request failed after {_MAX_ATTEMPTS} attempts: {exc}") from exc
-    else:
-        raise ExtractionError(f"Gemini request failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
 
+def _parse_response(response) -> ProductData:
     if response.parsed is not None:
         return response.parsed
 
@@ -186,3 +157,60 @@ def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> P
     except (json.JSONDecodeError, TypeError, ValidationError) as exc:
         logger.error("Gemini response was not valid ProductData JSON: %s", response.text)
         raise ExtractionError(f"Could not parse supplier data from the image: {exc}") from exc
+
+
+def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> ProductData:
+    """Send the raw image to Gemini Vision and return strictly-typed supplier data.
+
+    Tries each model in _model_candidates() in order (see its docstring),
+    retrying each one a couple of times on transient failures (network
+    blip, rate limit, momentary 5xx, a retired/renamed model) with a short
+    backoff before moving to the next model. A validation failure
+    (bad/implausible DATA, as opposed to a failed API call) is raised
+    immediately without retrying or falling back -- a different model
+    reading the same blurry digit isn't a fix worth guessing at, and the
+    admin's reply-correction flow (see main.py) handles that case instead.
+
+    Blocking (network) call -- callers on an asyncio event loop should run
+    this via `asyncio.to_thread`.
+    """
+    client = _get_client()
+    candidates = _model_candidates()
+
+    call_errors: List[str] = []
+    for model_name in candidates:
+        for attempt in range(1, _MAX_ATTEMPTS_PER_MODEL + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        EXTRACTION_PROMPT,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ProductData,
+                        temperature=0,
+                    ),
+                )
+                if model_name != config.GEMINI_MODEL:
+                    logger.warning(
+                        "extract_product_data succeeded on fallback model %r (primary %r unavailable)",
+                        model_name, config.GEMINI_MODEL,
+                    )
+                return _parse_response(response)
+            except ValidationError as exc:
+                raise ExtractionError(f"Could not validate supplier data: {exc}") from exc
+            except Exception as exc:
+                call_errors.append(f"{model_name} (attempt {attempt}): {exc}")
+                if attempt < _MAX_ATTEMPTS_PER_MODEL:
+                    logger.warning(
+                        "Gemini call failed on %s (attempt %s/%s), retrying: %s",
+                        model_name, attempt, _MAX_ATTEMPTS_PER_MODEL, exc,
+                    )
+                    time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+
+    raise ExtractionError(
+        f"Gemini request failed on every model tried ({', '.join(candidates)}): "
+        + "; ".join(call_errors[-3:])
+    )

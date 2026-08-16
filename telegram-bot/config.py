@@ -9,7 +9,19 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# "-latest" is a Google-maintained alias that always points at their current
+# default fast multimodal model, so this keeps working without anyone having
+# to notice a model was renamed/retired and go edit .env. GEMINI_FALLBACK_MODELS
+# are tried in order if the primary model's call fails for any reason (see
+# gemini_extractor._model_candidates) -- belt-and-suspenders against the
+# exact "this model doesn't exist anymore" failure that prompted this.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash").split(",")
+    if m.strip()
+]
 
 # Target channel for the "publish" button: "@channel_username" or "-100xxxxxxxxxx"
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
