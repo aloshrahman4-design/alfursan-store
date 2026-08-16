@@ -10,16 +10,19 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# "-latest" is a Google-maintained alias that always points at their current
-# default fast multimodal model, so this keeps working without anyone having
-# to notice a model was renamed/retired and go edit .env. GEMINI_FALLBACK_MODELS
-# are tried in order if the primary model's call fails for any reason (see
-# gemini_extractor._model_candidates) -- belt-and-suspenders against the
-# exact "this model doesn't exist anymore" failure that prompted this.
+# Both the primary and the fallbacks are deliberately Google-maintained
+# "-latest" aliases (not pinned version numbers like "gemini-2.5-flash"):
+# confirmed live against a real key that a pinned version can 404 as "no
+# longer available to new users" well before its training-data-adjacent
+# name stops sounding current. An alias always points at Google's current
+# model in that tier, so this never needs a manual update again.
+# GEMINI_FALLBACK_MODELS are tried in order -- ideally different tiers
+# (flash / pro / flash-lite), not the same model twice, so a per-model rate
+# limit on the primary doesn't take down the fallback too.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_FALLBACK_MODELS = [
     m.strip()
-    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash").split(",")
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-pro-latest,gemini-flash-lite-latest").split(",")
     if m.strip()
 ]
 

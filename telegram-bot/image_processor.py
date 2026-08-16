@@ -19,6 +19,7 @@ sizes) is left untouched -- only the price digits themselves are edited.
 from __future__ import annotations
 
 import io
+import statistics
 from typing import Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
@@ -31,8 +32,11 @@ Color = Tuple[int, int, int]
 
 # Padding around Gemini's box, as a fraction of the box's own size, to
 # absorb small localization error without eating into neighboring text.
-_BOX_PADDING_RATIO = 0.18
-_MIN_PADDING_PX = 4
+# Checked live against a real photo: 0.18 was generous enough to occasionally
+# clip an adjacent closing paren -- 0.12 still comfortably covers normal
+# bbox slop.
+_BOX_PADDING_RATIO = 0.12
+_MIN_PADDING_PX = 3
 
 
 def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -63,9 +67,77 @@ def _pad_box(
     )
 
 
+def _luminance(pixel: Tuple[int, int, int]) -> float:
+    r, g, b = pixel
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _grow_to_content(
+    image: Image.Image, box: Tuple[int, int, int, int], bg_color: Color
+) -> Tuple[int, int, int, int]:
+    """Nudge each edge outward while it's still crossing dark (digit-colored)
+    pixels, so the patch box's true size is discovered from the actual
+    pixels instead of guessed with a fixed padding percentage -- checked
+    live against a real photo, a static percentage either left a sliver of
+    the original digit visible (too tight) or ate into an adjacent
+    parenthesis (too generous), because Gemini's bbox error isn't
+    proportional to the box's own size. Growth is capped per side so a
+    genuinely light background (nothing left to grow into) stops quickly.
+    """
+    left, top, right, bottom = box
+    width, height = image.size
+    pixels = image.load()
+    dark_threshold = _luminance(bg_color) - 60
+    max_growth = max(6, int(max(right - left, bottom - top) * 0.35))
+
+    def col_is_dark(x: int) -> bool:
+        if x < 0 or x >= width:
+            return False
+        # Full scan, not sparse sampling: these regions are small (tens of
+        # pixels), and a curved digit stroke (e.g. "3") can be dark at only
+        # a handful of rows in a given column -- sparse sampling missed it
+        # in practice and left a sliver of the old digit visible.
+        return any(
+            _luminance(pixels[x, y]) < dark_threshold for y in range(max(top, 0), min(bottom, height))
+        )
+
+    def row_is_dark(y: int) -> bool:
+        if y < 0 or y >= height:
+            return False
+        return any(
+            _luminance(pixels[x, y]) < dark_threshold for x in range(max(left, 0), min(right, width))
+        )
+
+    for _ in range(max_growth):
+        if not col_is_dark(left - 1):
+            break
+        left -= 1
+    for _ in range(max_growth):
+        if not col_is_dark(right):
+            break
+        right += 1
+    for _ in range(max_growth):
+        if not row_is_dark(top - 1):
+            break
+        top -= 1
+    for _ in range(max_growth):
+        if not row_is_dark(bottom):
+            break
+        bottom += 1
+
+    return max(left, 0), max(top, 0), min(right, width), min(bottom, height)
+
+
 def _sample_background_color(image: Image.Image, box: Tuple[int, int, int, int]) -> Color:
-    """Average the ring of pixels just outside the box to estimate the real
+    """Sample the ring of pixels just outside the box to estimate the real
     local background color (flat color bar, photo backdrop, whatever it is).
+
+    Uses the MEDIAN per channel rather than the mean: checked live against a
+    real photo, a plain mean let a handful of dark anti-aliased pixels from
+    the original digit's edge (just outside Gemini's bbox, so not excluded
+    by the interior skip below) drag a should-be-white patch into a faint
+    gray. The median ignores that minority of outliers as long as most of
+    the ring is genuinely background, which it normally is.
     """
     left, top, right, bottom = box
     width, height = image.size
@@ -96,10 +168,10 @@ def _sample_background_color(image: Image.Image, box: Tuple[int, int, int, int])
     if not sample_pixels:
         return (255, 255, 255)
 
-    r = sum(p[0] for p in sample_pixels) // len(sample_pixels)
-    g = sum(p[1] for p in sample_pixels) // len(sample_pixels)
-    b = sum(p[2] for p in sample_pixels) // len(sample_pixels)
-    return (r, g, b)
+    r = statistics.median(p[0] for p in sample_pixels)
+    g = statistics.median(p[1] for p in sample_pixels)
+    b = statistics.median(p[2] for p in sample_pixels)
+    return (int(r), int(g), int(b))
 
 
 def _contrast_text_color(background: Color) -> Color:
@@ -135,11 +207,16 @@ def _patch_price(
     width, height = image.size
     raw_box = _bbox_to_pixels(box, width, height)
     padded = _pad_box(*raw_box, width, height)
-    left, top, right, bottom = padded
+    if padded[2] <= padded[0] or padded[3] <= padded[1]:
+        return False
+
+    preliminary_bg = _sample_background_color(image, padded)
+    grown = _grow_to_content(image, padded, preliminary_bg)
+    left, top, right, bottom = grown
     if right <= left or bottom <= top:
         return False
 
-    bg_color = _sample_background_color(image, padded)
+    bg_color = _sample_background_color(image, grown)
     text_color = _contrast_text_color(bg_color)
 
     draw.rectangle([(left, top), (right, bottom)], fill=bg_color)
