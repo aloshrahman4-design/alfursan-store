@@ -38,7 +38,7 @@ telegram-bot/
 ├── tests/test_pricing.py     # اختبارات ثابتة (regression) على أرقام عيّنات حقيقية
 ├── requirements.txt
 ├── .env.example
-├── fonts/                    # ضع هنا خطوط عربية .ttf (راجع fonts/README.md)
+├── fonts/                    # ضع هنا خطاً غامقاً .ttf لكتابة الأرقام (راجع fonts/README.md)
 └── systemd/alfursan-bot.service
 ```
 
@@ -169,10 +169,11 @@ pip install -r requirements.txt
 cp .env.example .env   # ثم عبّئ القيم (التوكن، مفتاح Gemini، القناة، المستخدمون المصرح لهم)
 ```
 
-نزّل خط عربي (مثل Cairo من Google Fonts) وضع ملفات `Cairo-Regular.ttf` و
-`Cairo-Bold.ttf` داخل مجلد `fonts/` (راجع `fonts/README.md`) -- يُستخدم
-فقط لكتابة الأرقام الجديدة، وهو نفس الخط الغامق (Bold) لأن الأرقام
-الإنجليزية لا تحتاج تشكيلاً عربياً.
+نزّل خطاً غامقاً (Bold) مثل Cairo-Bold من Google Fonts وضعه باسم
+`Cairo-Bold.ttf` داخل مجلد `fonts/` (راجع `fonts/README.md`). يُستخدم فقط
+لكتابة الأرقام الجديدة على الصورة -- التسميات العربية تبقى في نص الكابشن
+الذي يعرضه تيليجرام مباشرة، وليست مرسومة على الصورة، فلا حاجة لخط يدعم
+التشكيل العربي.
 
 تشغيل تجريبي:
 

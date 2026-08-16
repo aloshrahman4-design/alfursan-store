@@ -1,15 +1,11 @@
 # Fonts
 
-Pillow needs real `.ttf` font files with Arabic glyph coverage to draw the
-footer text — it can't use system font names.
+`image_processor.py` only ever draws digits and commas (the new price
+numbers patched into an image) -- Arabic labels live in the Telegram
+caption text, which Telegram renders natively, not in the image itself.
+So Pillow just needs one bold `.ttf` with numeral glyphs; it doesn't need
+to be Arabic-capable.
 
-Download an Arabic-capable font family and place the files here as:
-
-- `Cairo-Regular.ttf`
-- `Cairo-Bold.ttf`
-
-Good options (all free/open-license, available on Google Fonts):
-`Cairo`, `Noto Naskh Arabic`, `Noto Kufi Arabic`, `Amiri`, `Tajawal`.
-
-If you use a different font or filenames, update `FONT_REGULAR_PATH` /
-`FONT_BOLD_PATH` in `.env` to match.
+Download a font and place it here as `Cairo-Bold.ttf` (or point
+`FONT_BOLD_PATH` in `.env` at wherever you put it). `Cairo`, `Tajawal`,
+or any standard bold sans-serif from Google Fonts works fine.

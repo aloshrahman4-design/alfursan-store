@@ -22,13 +22,11 @@ ALLOWED_USER_IDS = {
     if uid.strip()
 }
 
-FONT_REGULAR_PATH = os.getenv("FONT_REGULAR_PATH", "fonts/Cairo-Regular.ttf")
+# Used to draw the new price digits patched into the image (image_processor.py).
+# Only digits/commas are ever drawn onto images -- Arabic labels live in the
+# Telegram caption text, which Telegram renders natively -- so any TTF with
+# numeral glyphs works; a bold weight just looks best for a price callout.
 FONT_BOLD_PATH = os.getenv("FONT_BOLD_PATH", "fonts/Cairo-Bold.ttf")
-
-# Fraction of the image height, measured from the bottom, treated as the
-# supplier's footer strip. Proportional (not raw pixels) so the bot keeps
-# working across suppliers who don't all export the same resolution.
-FOOTER_HEIGHT_RATIO = float(os.getenv("FOOTER_HEIGHT_RATIO", "0.22"))
 
 # Append-only JSON Lines audit trail of every published item (see audit_log.py).
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
@@ -48,10 +46,8 @@ def validate() -> None:
             "Missing required environment variable(s): " + ", ".join(missing) +
             ". Copy .env.example to .env and fill them in."
         )
-    for path in (FONT_REGULAR_PATH, FONT_BOLD_PATH):
-        if not os.path.isfile(path):
-            raise RuntimeError(
-                f"Font file not found: {path}. Download an Arabic-capable TTF "
-                "(e.g. Cairo or Noto Naskh Arabic) and place it there, or set "
-                "FONT_REGULAR_PATH/FONT_BOLD_PATH in .env."
-            )
+    if not os.path.isfile(FONT_BOLD_PATH):
+        raise RuntimeError(
+            f"Font file not found: {FONT_BOLD_PATH}. Download a bold TTF "
+            "(e.g. Cairo-Bold) and place it there, or set FONT_BOLD_PATH in .env."
+        )
