@@ -259,6 +259,14 @@ def build_caption(product: ProductData, prices: PriceResult) -> str:
 def process_image(image_bytes: bytes, product: ProductData, prices: PriceResult) -> Tuple[bytes, bool]:
     """Patch the price digits in place. Returns (jpeg_bytes, fully_patched).
 
+    In CARTON mode the dozen-price slot printed on the photo is repurposed
+    to show the carton TOTAL instead of a per-dozen figure -- otherwise the
+    edited photo would still display a "دزن" price sitting right there even
+    though the whole point of carton mode is to not talk about dozens at
+    all, contradicting the caption underneath it (caught by checking the
+    actual pixels against a real supplier photo, not just the caption
+    text). DOZEN mode is unaffected: the dozen slot shows new_dozen_price.
+
     fully_patched is False when at least one price had no usable bounding
     box (Gemini couldn't localize it) -- the image is still returned as-is
     in that case (old digits untouched), and the caller should tell the
@@ -271,7 +279,8 @@ def process_image(image_bytes: bytes, product: ProductData, prices: PriceResult)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     draw = ImageDraw.Draw(image)
 
-    dozen_patched = _patch_price(draw, image, product.dozen_price_bbox, prices.new_dozen_price)
+    dozen_slot_value = prices.new_dozen_price if prices.mode is PricingMode.DOZEN else prices.carton_total
+    dozen_patched = _patch_price(draw, image, product.dozen_price_bbox, dozen_slot_value)
     single_patched = _patch_price(draw, image, product.single_price_bbox, prices.new_single_price)
 
     wanted_dozen = product.dozen_price_bbox is not None
