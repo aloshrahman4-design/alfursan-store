@@ -69,8 +69,10 @@ def _is_authorized(user_id: int) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "أهلاً 👋\n"
-        "أرسل صورة المنتج مع كتابة قيمة الزيادة في الكابشن، مثال:\n"
-        "+1000  أو  15%"
+        "أرسل صورة المنتج مع كتابة قيمة الزيادة في الكابشن (تُضاف على "
+        "مجموع سعر الكارتونة ثم يُقسَّم الناتج على عدد القطع لاستخراج سعر "
+        "المفرد الجديد)، مثال:\n"
+        "+10000  أو  15%"
     )
 
 

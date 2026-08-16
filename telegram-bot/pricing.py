@@ -50,11 +50,13 @@ def parse_markup(caption: Optional[str]) -> MarkupSpec:
     """Read the admin's markup instruction from the photo's caption.
 
     Accepts: "+1000", "+1,000", "-250", "15%", "+15%".
+    The value is applied to the CARTON's total price (see compute_prices),
+    not to the single/dozen price directly.
     """
     if not caption or not caption.strip():
         raise MarkupParseError(
             "لم يتم تحديد قيمة الزيادة في نص الرسالة (caption).\n"
-            "أرسل الصورة مع كتابة الزيادة، مثال: +1000 أو 15%"
+            "أرسل الصورة مع كتابة الزيادة على مجموع الكارتونة، مثال: +10000 أو 15%"
         )
 
     cleaned = caption.replace(",", "").replace("،", "").replace("٬", "")
@@ -70,7 +72,7 @@ def parse_markup(caption: Optional[str]) -> MarkupSpec:
         return MarkupSpec(kind=MarkupKind.FLAT, value=value)
 
     raise MarkupParseError(
-        "تعذر فهم قيمة الزيادة من الكابشن. استخدم صيغة مثل +1000 أو 15%"
+        "تعذر فهم قيمة الزيادة من الكابشن. استخدم صيغة مثل +10000 أو 15%"
     )
 
 
@@ -79,36 +81,41 @@ def _round_int(value: Decimal) -> int:
 
 
 def compute_prices(product: ProductData, markup: MarkupSpec) -> PriceResult:
-    """Apply the markup to the supplier's prices.
+    """Apply the markup to the CARTON TOTAL, then derive everything else from it.
 
-    FLAT markup adds the same amount per single unit, and 12x that per
-    dozen (so a single unit's price stays consistent whether it's counted
-    on its own or as part of a dozen).
+    Single source of truth = the carton's total price, so there is exactly
+    one number the markup touches and no risk of the single/dozen/carton
+    figures drifting apart:
 
-    PERCENT markup is applied independently to the supplier's single and
-    dozen prices, since a supplier's dozen price is often already a bulk
-    discount rather than exactly single_price * 12.
-
-    carton_total = new_dozen_price * (pack_quantity / 12), i.e. however
-    many dozens actually make up this product's carton.
+    1. supplier_carton_total = supplier_dozen_price * (pack_quantity / 12)
+       (the dozen price is the wholesale unit, so the carton total is
+       however many dozens actually make up this product's carton).
+    2. Apply the markup to that ONE total:
+         FLAT    -> new_carton_total = supplier_carton_total + markup.value
+         PERCENT -> new_carton_total = supplier_carton_total * (1 + value/100)
+    3. new_single_price = round(new_carton_total / pack_quantity)
+    4. new_dozen_price and carton_total are then derived from the rounded
+       single price (single * 12, single * pack_quantity) instead of
+       rounded independently, so single*12 always equals dozen and
+       single*pack_quantity always equals the displayed carton total --
+       no independent-rounding drift between the three numbers.
     """
-    single = Decimal(product.supplier_single_price)
-    dozen = Decimal(product.supplier_dozen_price)
+    dozens_in_carton = Decimal(product.pack_quantity) / DOZEN
+    supplier_carton_total = Decimal(product.supplier_dozen_price) * dozens_in_carton
 
     if markup.kind is MarkupKind.FLAT:
-        new_single = single + markup.value
-        new_dozen = dozen + (markup.value * DOZEN)
+        new_carton_total = supplier_carton_total + markup.value
     else:
         factor = Decimal(1) + (markup.value / Decimal(100))
-        new_single = single * factor
-        new_dozen = dozen * factor
+        new_carton_total = supplier_carton_total * factor
 
-    dozens_in_carton = Decimal(product.pack_quantity) / DOZEN
-    carton_total = new_dozen * dozens_in_carton
+    new_single_price = _round_int(new_carton_total / Decimal(product.pack_quantity))
+    new_dozen_price = new_single_price * 12
+    carton_total = new_single_price * product.pack_quantity
 
     return PriceResult(
-        new_single_price=_round_int(new_single),
-        new_dozen_price=_round_int(new_dozen),
-        carton_total=_round_int(carton_total),
+        new_single_price=new_single_price,
+        new_dozen_price=new_dozen_price,
+        carton_total=carton_total,
         dozens_in_carton=dozens_in_carton,
     )
