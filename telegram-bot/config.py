@@ -30,6 +30,9 @@ FONT_BOLD_PATH = os.getenv("FONT_BOLD_PATH", "fonts/Cairo-Bold.ttf")
 # working across suppliers who don't all export the same resolution.
 FOOTER_HEIGHT_RATIO = float(os.getenv("FOOTER_HEIGHT_RATIO", "0.22"))
 
+# Append-only JSON Lines audit trail of every published item (see audit_log.py).
+AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
+
 
 def validate() -> None:
     """Fail fast and loudly on startup instead of on the first incoming photo."""

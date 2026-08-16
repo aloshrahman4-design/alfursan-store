@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Optional
 
 from google import genai
@@ -28,6 +29,16 @@ import config
 logger = logging.getLogger(__name__)
 
 _client: Optional[genai.Client] = None
+
+# Retried on transient failures (network blip, rate limit, momentary 5xx)
+# so one flaky call doesn't fail an entire batch item outright.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 1.5
+
+# A wholesale shoe/clothing price outside this range is almost certainly a
+# misread digit (e.g. reading "24" as a price) rather than a real price.
+_MIN_PLAUSIBLE_PRICE = 100
+_MAX_PLAUSIBLE_PRICE = 5_000_000
 
 
 class BBox(BaseModel):
@@ -56,6 +67,17 @@ class ProductData(BaseModel):
     def _check_has_price(self) -> "ProductData":
         if self.dozen_price is None and self.single_price is None:
             raise ValueError("No price (dozen or single) could be read from the image.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_plausible(self) -> "ProductData":
+        for label, price in (("dozen_price", self.dozen_price), ("single_price", self.single_price)):
+            if price is not None and not (_MIN_PLAUSIBLE_PRICE <= price <= _MAX_PLAUSIBLE_PRICE):
+                raise ValueError(f"{label}={price} is outside a plausible price range, likely a misread.")
+        if not self.model_code.strip():
+            raise ValueError("model_code is empty.")
+        if not self.sizes.strip():
+            raise ValueError("sizes is empty.")
         return self
 
 
@@ -112,26 +134,45 @@ def _get_client() -> genai.Client:
 def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> ProductData:
     """Send the raw image to Gemini Vision and return strictly-typed supplier data.
 
+    Retries a couple of times on transient failures (network blip, rate
+    limit, momentary 5xx) with a short backoff -- a validation failure
+    (bad/implausible data) is NOT retried, since asking the same model the
+    same question again won't fix a genuine misread.
+
     Blocking (network) call -- callers on an asyncio event loop should run
     this via `asyncio.to_thread`.
     """
     client = _get_client()
 
-    try:
-        response = client.models.generate_content(
-            model=config.GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                EXTRACTION_PROMPT,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ProductData,
-                temperature=0,
-            ),
-        )
-    except ValidationError as exc:
-        raise ExtractionError(f"Could not validate supplier data: {exc}") from exc
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    EXTRACTION_PROMPT,
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ProductData,
+                    temperature=0,
+                ),
+            )
+            break
+        except ValidationError as exc:
+            raise ExtractionError(f"Could not validate supplier data: {exc}") from exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS:
+                logger.warning(
+                    "Gemini call failed (attempt %s/%s), retrying: %s", attempt, _MAX_ATTEMPTS, exc
+                )
+                time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise ExtractionError(f"Gemini request failed after {_MAX_ATTEMPTS} attempts: {exc}") from exc
+    else:
+        raise ExtractionError(f"Gemini request failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
 
     if response.parsed is not None:
         return response.parsed

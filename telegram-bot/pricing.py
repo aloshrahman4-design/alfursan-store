@@ -16,6 +16,13 @@ from gemini_extractor import ProductData
 
 DOZEN = Decimal(12)
 
+# When a supplier prints BOTH prices and they don't agree mathematically
+# within this tolerance, it's a strong signal Gemini misread a digit --
+# see _check_price_mismatch(). 5% comfortably covers normal supplier
+# rounding (checked against real samples: worst case ~0.25% off) while
+# still catching a genuinely wrong digit (which is off by tens of percent).
+_MISMATCH_TOLERANCE = Decimal("0.05")
+
 
 class MarkupKind(str, Enum):
     FLAT = "flat"
@@ -35,6 +42,8 @@ class PriceResult:
     new_single_price: int
     new_dozen_price: int
     carton_total: int
+    mismatch: bool = False              # True when the supplier's own dozen/single prices don't agree
+    mismatch_detail: Optional[str] = None
 
 
 class MarkupParseError(ValueError):
@@ -133,6 +142,40 @@ def _supplier_carton_total(product: ProductData, total_pieces: int, dozens_count
     raise PackQuantityError("لا يوجد أي سعر (مفرد أو درزن) لهذا المنتج.")
 
 
+def _check_price_mismatch(
+    product: ProductData, total_pieces: int, dozens_count: Decimal
+) -> Tuple[bool, Optional[str]]:
+    """When both prices were read, cross-check them against each other.
+
+    single_price * total_pieces should roughly equal dozen_price *
+    dozens_count -- they're two ways of pricing the same carton. A big gap
+    means Gemini almost certainly misread a digit in one of them, so the
+    item gets flagged instead of silently trusting one of two disagreeing
+    numbers. Doesn't raise: the caller still gets a usable PriceResult
+    (computed from the preferred dozen-price basis) so a preview can be
+    shown and corrected via reply, rather than blocking the whole item.
+    """
+    if product.dozen_price is None or product.single_price is None:
+        return False, None
+
+    from_single = Decimal(product.single_price) * total_pieces
+    from_dozen = Decimal(product.dozen_price) * dozens_count
+    bigger = max(from_single, from_dozen)
+    if bigger == 0:
+        return False, None
+
+    diff_ratio = abs(from_single - from_dozen) / bigger
+    if diff_ratio <= _MISMATCH_TOLERANCE:
+        return False, None
+
+    detail = (
+        f"مفرد {product.single_price:,}×{total_pieces} قطعة = {from_single:,.0f} دينار، "
+        f"بينما درزن {product.dozen_price:,}×{dozens_count} = {from_dozen:,.0f} دينار "
+        f"(فرق {diff_ratio * 100:.1f}٪)"
+    )
+    return True, detail
+
+
 def compute_prices(product: ProductData, markup: MarkupSpec) -> PriceResult:
     """Apply the markup to the CARTON TOTAL, then derive everything else from it.
 
@@ -153,6 +196,7 @@ def compute_prices(product: ProductData, markup: MarkupSpec) -> PriceResult:
        no independent-rounding drift between the three numbers.
     """
     total_pieces, dozens_count = parse_pack_quantity(product.pack_quantity_raw)
+    mismatch, mismatch_detail = _check_price_mismatch(product, total_pieces, dozens_count)
     supplier_carton_total = _supplier_carton_total(product, total_pieces, dozens_count)
 
     if markup.kind is MarkupKind.FLAT:
@@ -171,4 +215,6 @@ def compute_prices(product: ProductData, markup: MarkupSpec) -> PriceResult:
         new_single_price=new_single_price,
         new_dozen_price=new_dozen_price,
         carton_total=carton_total,
+        mismatch=mismatch,
+        mismatch_detail=mismatch_detail,
     )
