@@ -229,14 +229,23 @@ def _patch_price(
 
 
 def build_caption(product: ProductData, prices: PriceResult) -> str:
-    """PricingMode.CARTON shows مفرد + إجمالي الكرتونة (no درزن);
-    PricingMode.DOZEN shows مفرد + درزن (no إجمالي) -- see pricing.PricingMode.
+    """PricingMode.CARTON shows مفرد + إجمالي الكرتونة (no mention of درزن
+    anywhere at all, including the pack-quantity line); PricingMode.DOZEN
+    shows مفرد + درزن (no إجمالي) -- see pricing.PricingMode. The whole
+    point of picking a mode is to talk about the deal in ONE unit
+    consistently, so carton mode drops "دزن" from the pack-quantity line
+    too instead of just from the price line.
     """
-    dozens_str = f"{prices.dozens_count:.2f}".rstrip("0").rstrip(".")
+    if prices.mode is PricingMode.DOZEN:
+        dozens_str = f"{prices.dozens_count:.2f}".rstrip("0").rstrip(".")
+        pack_line = f"📦 التعبئة: {prices.total_pieces} قطعة ({dozens_str} درزن)"
+    else:
+        pack_line = f"📦 التعبئة: {prices.total_pieces} قطعة"
+
     lines = [
         f"🏷️ كود الموديل: {product.model_code}",
         f"📏 القياسات: {product.sizes}",
-        f"📦 التعبئة: {prices.total_pieces} قطعة ({dozens_str} درزن)",
+        pack_line,
         "",
         f"💵 سعر المفرد: {prices.new_single_price:,} دينار",
     ]

@@ -147,7 +147,10 @@ class PricingModeTests(unittest.TestCase):
         caption = build_caption(self.PRODUCT, prices)
         self.assertIn("سعر المفرد", caption)
         self.assertIn("إجمالي سعر الكارتونة", caption)
-        self.assertNotIn("سعر الدرزن", caption)
+        # "درزن" must not appear ANYWHERE in carton mode -- not the price
+        # line, not the pack-quantity line either (regression: it used to
+        # leak into "التعبئة: 24 قطعة (2 درزن)" even in carton mode).
+        self.assertNotIn("درزن", caption)
 
     def test_dozen_mode_applies_markup_to_dozen_price(self):
         markup = parse_markup("+15000 درزن")
