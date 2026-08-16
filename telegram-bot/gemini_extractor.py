@@ -1,9 +1,17 @@
-"""Step 1 of the pipeline: Gemini Vision reads the supplier's footer text.
+"""Step 1 of the pipeline: Gemini Vision reads the supplier's price data.
 
-This module does exactly one job -- optical transcription of whatever the
-supplier already printed on the image -- and returns it as strict JSON.
+This module does exactly one job -- optical transcription and localization
+of whatever the supplier already printed -- and returns it as strict JSON.
 It never computes a price. All arithmetic lives in pricing.py so a result
 can never depend on an LLM doing math.
+
+Suppliers use wildly different layouts (a clean bottom strip, a colored
+corner badge, text overlaid directly on the photo, English vs Arabic price
+labels, two unlabeled stacked numbers, ...) so this module also asks for a
+bounding box around each price's digits. image_processor.py uses that box
+to patch just the numbers in place -- sampling the real local background
+color instead of assuming a fixed white strip -- so the edit adapts to
+whatever the source image actually looks like.
 """
 from __future__ import annotations
 
@@ -13,7 +21,7 @@ from typing import Optional
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 import config
 
@@ -22,30 +30,75 @@ logger = logging.getLogger(__name__)
 _client: Optional[genai.Client] = None
 
 
+class BBox(BaseModel):
+    """Normalized 0-1000 bounding box, in Gemini's standard [y, x] order."""
+
+    y_min: int = Field(ge=0, le=1000)
+    x_min: int = Field(ge=0, le=1000)
+    y_max: int = Field(ge=0, le=1000)
+    x_max: int = Field(ge=0, le=1000)
+
+
 class ProductData(BaseModel):
-    model_code: str = Field(description="كود/رقم موديل المنتج كما هو مكتوب بالضبط في الصورة")
-    pack_quantity: int = Field(description="عدد القطع في الكرتونة/التعبئة كرقم صحيح")
-    sizes: str = Field(description="مدى القياسات كما هو مكتوب حرفياً، مثال: 40/45")
-    supplier_single_price: int = Field(description="سعر القطعة الواحدة من المورد، رقم صحيح بدون رموز")
-    supplier_dozen_price: int = Field(description="سعر الدرزن من المورد، رقم صحيح بدون رموز")
+    model_code: str = Field(description="كود/رمز الموديل كما هو مكتوب حرفياً")
+    sizes: str = Field(description="مدى القياسات كما هو مكتوب حرفياً، مثال: 40/45 أو 31-36")
+    pack_quantity_raw: str = Field(
+        description="القيمة المكتوبة أمام التعبئة/Packing كما هي حرفياً، بما فيها أي كسر عشري أو وحدة ملحقة (مثال: 24, 18, 1.25, 1.5, 18PRS)"
+    )
+
+    dozen_price: Optional[int] = Field(default=None, description="سعر الدرزن كرقم صحيح بدون رموز")
+    dozen_price_bbox: Optional[BBox] = Field(default=None, description="صندوق إحاطة حول أرقام سعر الدرزن فقط")
+
+    single_price: Optional[int] = Field(default=None, description="سعر القطعة/المفرد كرقم صحيح بدون رموز")
+    single_price_bbox: Optional[BBox] = Field(default=None, description="صندوق إحاطة حول أرقام سعر المفرد فقط")
+
+    @model_validator(mode="after")
+    def _check_has_price(self) -> "ProductData":
+        if self.dozen_price is None and self.single_price is None:
+            raise ValueError("No price (dozen or single) could be read from the image.")
+        return self
 
 
 class ExtractionError(RuntimeError):
-    """Raised when Gemini can't confidently transcribe the footer strip."""
+    """Raised when Gemini can't confidently transcribe the supplier's data."""
 
 
 EXTRACTION_PROMPT = """
-أنت أداة استخراج بيانات فقط (OCR منظم) -- ممنوع عليك إجراء أي عملية حسابية إطلاقاً.
+أنت أداة استخراج بيانات وتحديد مواقع فقط (OCR + Localization) -- ممنوع عليك إجراء أي عملية حسابية إطلاقاً.
 
-اقرأ الشريط النصي أسفل صورة المنتج، والذي يحتوي عادة على:
-كود الموديل، التعبئة (عدد القطع)، القياسات، سعر المفرد، سعر الدرزن.
+الصورة هي بطاقة منتج من مورد جملة (أحذية/ملابس). المعلومات قد تكون في شريط أسفل الصورة،
+أو في زاوية (أعلى/أسفل)، أو مكتوبة مباشرة فوق الصورة نفسها بدون خلفية منفصلة. لا تفترض
+مكاناً أو تصميماً ثابتاً -- ابحث في الصورة كاملة.
 
-القواعد:
-- انقل كل قيمة كما هي مكتوبة حرفياً في الصورة، دون تقريب أو تعديل أو حساب.
-- الحقول الرقمية (pack_quantity, supplier_single_price, supplier_dozen_price) يجب أن
-  تُعاد كأرقام صحيحة فقط، بدون رموز عملة أو فواصل أو مسافات.
-- إن كان رقم غير واضح تماماً، اقرأه بأعلى دقة ممكنة من الصورة نفسها فقط -- لا تخترع قيماً
-  ولا تستنتجها من سياق خارجي.
+انسخ كل نص كما هو مكتوب حرفياً، دون تقريب أو تعديل أو حساب. الحقول الرقمية يجب أن تكون
+أرقاماً صحيحة فقط، بدون رموز عملة أو فواصل أو مسافات أو أقواس.
+
+1) model_code: كود/رمز الموديل كما هو مكتوب (قد يبدأ بحروف مثل PJKM, GHG, MR, N, RS, DX, FRTM ...).
+
+2) sizes: مدى القياسات كما هو مكتوب حرفياً (مثال: 40/45، 31-36، 37_41).
+
+3) pack_quantity_raw: القيمة المكتوبة أمام كلمة "التعبئة" أو "Packing" أو قبل/بعد "PRS"،
+   انسخها حرفياً كما هي بما فيها أي كسر عشري أو وحدة ملحقة (مثال: "24"، "18"، "1.25"،
+   "1.5"، "18PRS").
+
+4) الأسعار -- قد تظهر بأشكال مختلفة جداً، ميّز بينها بهذا الترتيب من القواعد:
+   a. إذا كان الرقم مُسمّى صراحة بكلمة "درزن" أو "دزن" أو "D/DOZ" أو "دستة" -> dozen_price.
+   b. إذا كان الرقم مُسمّى صراحة بكلمة "مفرد" أو "قطعة" أو "D/PC" أو "القطعة" -> single_price.
+   c. إذا ظهرت كلمة "سعر" وحدها (بدون تحديد "درزن") بجانب رقم، ووُجد رقم آخر في نفس
+      البطاقة مُسمّى "مفرد" -> اعتبر الرقم المُسمّى "سعر" هو dozen_price.
+   d. إذا ظهر رقمان بلا أي تسمية نصية إطلاقاً (مجرد رقمين، غالباً أحدهما فوق الآخر أو
+      بجانب بعض) -> الرقم الأكبر = dozen_price، والرقم الأصغر = single_price (لأن سعر
+      الدرزن يساوي تقريباً 12 ضعف سعر القطعة، فهذا يميّزهما رياضياً دون الحاجة لتسمية).
+   e. إذا ظهر سعر واحد فقط في كامل الصورة، اعتبره dozen_price، واترك single_price فارغاً
+      (null) بدل اختراع رقم غير موجود.
+   f. إن تعذّرت قراءة سعر ما بثقة كافية، اترك حقله فارغاً (null) تماماً بدل التخمين.
+
+5) لكل سعر وجدته (dozen_price و/أو single_price)، حدّد أيضاً صندوق إحاطة (bounding box)
+   ضيقاً حول أرقام ذلك السعر فقط -- بدون رمز العملة، بدون الأقواس، بدون كلمة الوصف
+   المجاورة له -- بمقياس 0 إلى 1000 نسبةً لأبعاد الصورة الكاملة، بالترتيب:
+   y_min (الحافة العلوية)، x_min (الحافة اليسرى)، y_max (الحافة السفلية)، x_max (الحافة
+   اليمنى). ضعه في dozen_price_bbox أو single_price_bbox المقابل. إن لم تستطع تحديد
+   الموقع بدقة كافية، اترك حقل الـ bbox فارغاً حتى لو أعطيت الرقم نفسه في الحقل الرقمي.
 """
 
 
@@ -64,18 +117,21 @@ def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> P
     """
     client = _get_client()
 
-    response = client.models.generate_content(
-        model=config.GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            EXTRACTION_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ProductData,
-            temperature=0,
-        ),
-    )
+    try:
+        response = client.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                EXTRACTION_PROMPT,
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ProductData,
+                temperature=0,
+            ),
+        )
+    except ValidationError as exc:
+        raise ExtractionError(f"Could not validate supplier data: {exc}") from exc
 
     if response.parsed is not None:
         return response.parsed
@@ -86,6 +142,6 @@ def extract_product_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> P
     try:
         data = json.loads(response.text)
         return ProductData(**data)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (json.JSONDecodeError, TypeError, ValidationError) as exc:
         logger.error("Gemini response was not valid ProductData JSON: %s", response.text)
-        raise ExtractionError("Could not parse supplier data from the image.") from exc
+        raise ExtractionError(f"Could not parse supplier data from the image: {exc}") from exc
