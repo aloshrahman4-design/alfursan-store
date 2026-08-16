@@ -20,10 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gemini_extractor import ProductData  # noqa: E402
 from pricing import (  # noqa: E402
     MarkupKind,
+    PricingMode,
     compute_prices,
     parse_markup,
     parse_pack_quantity,
+    parse_pricing_mode,
 )
+from image_processor import build_caption  # noqa: E402
 
 
 class PackQuantityTests(unittest.TestCase):
@@ -118,6 +121,51 @@ class MismatchDetectionTests(unittest.TestCase):
         product = ProductData(model_code="Y1", sizes="40/45", pack_quantity_raw="24", single_price=4000)
         prices = compute_prices(product, parse_markup("+1000"))
         self.assertFalse(prices.mismatch)
+
+
+class PricingModeTests(unittest.TestCase):
+    """Admin writes "درزن" in the caption to apply the markup to the dozen
+    price instead of the carton total -- and the caption shows a different
+    pair of fields depending on which mode was used (see build_caption).
+    Real sample: FRTM12934, dozen=56250, single=4687, pack=24.
+    """
+
+    PRODUCT = ProductData(
+        model_code="FRTM12934", sizes="40/45", pack_quantity_raw="24", dozen_price=56250, single_price=4687
+    )
+
+    def test_mode_detection(self):
+        self.assertEqual(parse_pricing_mode("+15000"), PricingMode.CARTON)
+        self.assertEqual(parse_pricing_mode("+15000 درزن"), PricingMode.DOZEN)
+        self.assertEqual(parse_pricing_mode("دزن +15000"), PricingMode.DOZEN)
+
+    def test_carton_mode_matches_default_behavior(self):
+        markup = parse_markup("+15000")
+        prices = compute_prices(self.PRODUCT, markup, PricingMode.CARTON)
+        self.assertEqual(prices.new_single_price, 5313)
+        self.assertEqual(prices.carton_total, 127512)
+        caption = build_caption(self.PRODUCT, prices)
+        self.assertIn("سعر المفرد", caption)
+        self.assertIn("إجمالي سعر الكارتونة", caption)
+        self.assertNotIn("سعر الدرزن", caption)
+
+    def test_dozen_mode_applies_markup_to_dozen_price(self):
+        markup = parse_markup("+15000 درزن")
+        prices = compute_prices(self.PRODUCT, markup, PricingMode.DOZEN)
+        # 56250 + 15000 = 71250; single = round(71250/12) = 5938
+        self.assertEqual(prices.new_dozen_price, 71250)
+        self.assertEqual(prices.new_single_price, 5938)
+        caption = build_caption(self.PRODUCT, prices)
+        self.assertIn("سعر المفرد", caption)
+        self.assertIn("سعر الدرزن", caption)
+        self.assertNotIn("إجمالي سعر الكارتونة", caption)
+
+    def test_dozen_mode_derives_basis_from_single_when_dozen_missing(self):
+        product = ProductData(model_code="Z1", sizes="40/45", pack_quantity_raw="24", single_price=4000)
+        prices = compute_prices(product, parse_markup("+1000 درزن"), PricingMode.DOZEN)
+        # basis = 4000*12 = 48000; +1000 = 49000; single = round(49000/12) = 4083
+        self.assertEqual(prices.new_dozen_price, 49000)
+        self.assertEqual(prices.new_single_price, 4083)
 
 
 if __name__ == "__main__":

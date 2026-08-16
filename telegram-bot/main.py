@@ -51,8 +51,10 @@ from pricing import (
     MarkupSpec,
     PackQuantityError,
     PriceResult,
+    PricingMode,
     compute_prices,
     parse_markup,
+    parse_pricing_mode,
 )
 
 logging.basicConfig(
@@ -137,6 +139,7 @@ def _build_audit_data(
         "supplier_single_price": product.single_price,
         "markup_kind": markup.kind.value,
         "markup_value": str(markup.value),
+        "pricing_mode": prices.mode.value,
         "new_single_price": prices.new_single_price,
         "new_dozen_price": prices.new_dozen_price,
         "carton_total": prices.carton_total,
@@ -184,9 +187,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "أهلاً 👋\n"
         "أرسل صورة منتج واحدة أو ألبوماً كاملاً (حتى 10 صور دفعة واحدة) مع كتابة "
-        "قيمة الزيادة في الكابشن -- تُضاف على مجموع سعر الكارتونة لكل منتج ثم "
-        "يُقسَّم الناتج على عدد القطع لاستخراج سعر المفرد الجديد. مثال:\n"
+        "قيمة الزيادة في الكابشن. مثال:\n"
         "+10000  أو  15%\n\n"
+        "افتراضياً تُضاف الزيادة على مجموع سعر الكارتونة كامل، والكليشة تعرض "
+        "سعر المفرد + إجمالي الكرتونة (بدون ذكر الدرزن). أضف كلمة \"درزن\" بالكابشن "
+        "لتطبيق الزيادة على سعر الدرزن مباشرة بدلاً من الكرتون، وبهالحالة الكليشة "
+        "تعرض سعر المفرد + سعر الدرزن (بدون الإجمالي). مثال: +15000 درزن\n\n"
         "أرد عليك بنفس المحادثة بالصورة معدَّلة وسعرها الجديد مباشرة.\n\n"
         "التعبئة تُقرأ تلقائياً سواء كُتبت كعدد قطع (24، 18) أو كعدد درزنات "
         "عشري (1.5 = 18 قطعة، 1.25 = 15 قطعة).\n\n"
@@ -220,7 +226,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _process_one(
-    index: int, message: Message, markup: MarkupSpec, sender_id: Optional[int], sender_username: Optional[str]
+    index: int,
+    message: Message,
+    markup: MarkupSpec,
+    mode: PricingMode,
+    sender_id: Optional[int],
+    sender_username: Optional[str],
 ) -> Dict[str, Any]:
     try:
         photo = message.photo[-1]
@@ -228,7 +239,7 @@ async def _process_one(
         image_bytes = bytes(await tg_file.download_as_bytearray())
 
         product = await asyncio.to_thread(extract_product_data, image_bytes)
-        prices = compute_prices(product, markup)
+        prices = compute_prices(product, markup, mode)
         processed_image, fully_patched = await asyncio.to_thread(
             process_image, image_bytes, product, prices
         )
@@ -242,6 +253,7 @@ async def _process_one(
             "caption": caption_text,
             "product": product,
             "markup": markup,
+            "mode": mode,
             "audit": _build_audit_data(product, prices, markup, sender_id, sender_username),
         }
     except (ExtractionError, PackQuantityError) as exc:
@@ -265,6 +277,7 @@ async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
     except MarkupParseError as exc:
         await context.bot.send_message(chat_id, str(exc))
         return
+    mode = parse_pricing_mode(batch.caption)
 
     status_msg = await context.bot.send_message(
         chat_id,
@@ -275,7 +288,7 @@ async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     async def _guarded(index: int, message: Message) -> Dict[str, Any]:
         async with semaphore:
-            return await _process_one(index, message, markup, batch.from_user_id, batch.from_username)
+            return await _process_one(index, message, markup, mode, batch.from_user_id, batch.from_username)
 
     results = await asyncio.gather(*(_guarded(i, m) for i, m in enumerate(messages, start=1)))
 
@@ -296,6 +309,7 @@ async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
             "image_bytes": r["image_bytes"],
             "product": r["product"],
             "markup": r["markup"],
+            "mode": r["mode"],
             "audit": r["audit"],
         }
         for r in successes
@@ -358,6 +372,7 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     item = batch["items"][item_id]
     product: ProductData = item["product"]
     markup: MarkupSpec = item["markup"]
+    mode: PricingMode = item["mode"]
 
     try:
         if field_name in ("single_price", "dozen_price"):
@@ -366,7 +381,7 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             corrected_product = product.model_copy(update={field_name: value_raw.strip()})
 
-        prices = compute_prices(corrected_product, markup)
+        prices = compute_prices(corrected_product, markup, mode)
         processed_image, fully_patched = await asyncio.to_thread(
             process_image, item["image_bytes"], corrected_product, prices
         )

@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import config
 from gemini_extractor import BBox, ProductData
-from pricing import PriceResult
+from pricing import PriceResult, PricingMode
 
 Color = Tuple[int, int, int]
 
@@ -229,15 +229,22 @@ def _patch_price(
 
 
 def build_caption(product: ProductData, prices: PriceResult) -> str:
+    """PricingMode.CARTON shows مفرد + إجمالي الكرتونة (no درزن);
+    PricingMode.DOZEN shows مفرد + درزن (no إجمالي) -- see pricing.PricingMode.
+    """
     dozens_str = f"{prices.dozens_count:.2f}".rstrip("0").rstrip(".")
-    return (
-        f"🏷️ كود الموديل: {product.model_code}\n"
-        f"📏 القياسات: {product.sizes}\n"
-        f"📦 التعبئة: {prices.total_pieces} قطعة ({dozens_str} درزن)\n\n"
-        f"💵 سعر المفرد: {prices.new_single_price:,} دينار\n"
-        f"💰 سعر الدرزن: {prices.new_dozen_price:,} دينار\n"
-        f"📦 إجمالي سعر الكارتونة: {prices.carton_total:,} دينار"
-    )
+    lines = [
+        f"🏷️ كود الموديل: {product.model_code}",
+        f"📏 القياسات: {product.sizes}",
+        f"📦 التعبئة: {prices.total_pieces} قطعة ({dozens_str} درزن)",
+        "",
+        f"💵 سعر المفرد: {prices.new_single_price:,} دينار",
+    ]
+    if prices.mode is PricingMode.DOZEN:
+        lines.append(f"💰 سعر الدرزن: {prices.new_dozen_price:,} دينار")
+    else:
+        lines.append(f"📦 إجمالي سعر الكارتونة: {prices.carton_total:,} دينار")
+    return "\n".join(lines)
 
 
 def process_image(image_bytes: bytes, product: ProductData, prices: PriceResult) -> Tuple[bytes, bool]:
