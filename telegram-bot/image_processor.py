@@ -247,7 +247,7 @@ def process_image(image_bytes: bytes, product: ProductData, prices: PriceResult)
     box (Gemini couldn't localize it) -- the image is still returned as-is
     in that case (old digits untouched), and the caller should tell the
     admin the caption has the correct number even though the picture might
-    not, so they can crop/relabel manually before publishing if needed.
+    not, so they can crop/relabel manually if needed.
 
     CPU-bound (Pillow) -- callers on an asyncio event loop should run this
     via `asyncio.to_thread`.

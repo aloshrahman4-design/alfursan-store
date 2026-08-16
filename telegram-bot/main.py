@@ -1,12 +1,17 @@
-"""Telegram bot entry point: supplier photo(s) in -> priced, approved post(s) out.
+"""Telegram bot entry point: supplier photo(s) in -> priced photo(s) back to the same chat.
 
 Pipeline (kept in separate modules on purpose -- see each file's docstring
 for why -- so nothing "hallucinates" numbers or pixels):
   1. gemini_extractor.py  Gemini Vision reads + localizes the supplier's prices into strict JSON.
   2. pricing.py            Plain Python applies the markup arithmetic and cross-checks the two prices.
   3. image_processor.py    Pillow patches only the price digits, wherever they are.
-  4. Admin approves via an inline button -> bot posts to the channel.
-  5. audit_log.py          Every publish is appended to a local audit trail.
+  4. audit_log.py          Every processed item is appended to a local audit trail.
+
+No channel, no publish step: the bot just replies in the same chat it
+received the photo(s) from, with the priced photo(s) and a caption. If a
+price is flagged as mismatched or unlocated, that's noted directly in the
+caption instead of gating anything, since there's no separate approval
+action to gate.
 
 Batching: admins commonly send a whole album (Telegram "media group") of up
 to 10 photos at once, with ONE caption carrying the markup for the whole
@@ -15,11 +20,8 @@ incoming photos are buffered per media_group_id and flushed together after
 a short quiet period (see _BATCH_DEBOUNCE_SECONDS). A lone photo is just
 a batch of one, processed on the same path with a near-zero debounce.
 
-Reliability: an item whose supplier-printed dozen/single prices disagree
-by more than pricing._MISMATCH_TOLERANCE is still previewed (so nothing
-blocks silently) but excluded from "publish all" until either fixed by
-replying to that specific photo with a correction (see handle_correction)
-or the batch is republished after a fix.
+Corrections: reply to a specific delivered photo with e.g. "مفرد 4700" to
+fix a misread field without resending it -- see handle_correction.
 """
 from __future__ import annotations
 
@@ -31,16 +33,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-    Message,
-    Update,
-)
+from telegram import InputMediaPhoto, Message, Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -68,7 +63,7 @@ logger = logging.getLogger("alfursan-bot")
 
 _BATCH_DEBOUNCE_SECONDS = 2.0
 _MAX_CONCURRENT_EXTRACTIONS = 3
-_PENDING_TTL_SECONDS = 3600
+_SENT_TTL_SECONDS = 3600  # how long a delivered item stays correctable by reply
 
 _CORRECTION_FIELD_MAP = {
     "مفرد": "single_price",
@@ -81,14 +76,12 @@ _CORRECTION_FIELD_MAP = {
     "تعبئة": "pack_quantity_raw",
 }
 
-# Batches waiting for admin approval: pending_id -> {"items": {item_id: item}, "created_at": ts}.
-# item_id (a small string) is stable for the batch's lifetime so a reply
-# correction can always find the right item even after other items in the
-# same batch have already been published.
-_PENDING: Dict[str, Dict[str, Any]] = {}
+# Delivered batches, kept around only so a reply can still correct one of
+# their items: batch_id -> {"items": {item_id: item}, "created_at": ts}.
+_SENT: Dict[str, Dict[str, Any]] = {}
 
-# Maps a sent preview photo's Telegram message_id -> (pending_id, item_id),
-# so a text reply to that specific photo can be routed to the right item.
+# Maps a delivered photo's Telegram message_id -> (batch_id, item_id), so a
+# text reply to that specific photo can be routed to the right item.
 _ITEM_INDEX: Dict[int, "tuple[str, str]"] = {}
 
 
@@ -97,6 +90,8 @@ class _Batch:
     chat_id: int
     messages: List[Message] = field(default_factory=list)
     caption: Optional[str] = None
+    from_user_id: Optional[int] = None
+    from_username: Optional[str] = None
 
 
 # Photos waiting for their album (or the single-photo debounce) to settle.
@@ -109,27 +104,29 @@ def _is_authorized(user_id: int) -> bool:
     return user_id in config.ALLOWED_USER_IDS
 
 
-def _remember_batch(items: List[Dict[str, Any]]) -> str:
-    _cleanup_pending()
-    pending_id = uuid.uuid4().hex[:12]
-    _PENDING[pending_id] = {
+def _remember_sent(items: List[Dict[str, Any]]) -> str:
+    _cleanup_sent()
+    batch_id = uuid.uuid4().hex[:12]
+    _SENT[batch_id] = {
         "items": {str(i): item for i, item in enumerate(items)},
         "created_at": time.time(),
     }
-    return pending_id
+    return batch_id
 
 
-def _cleanup_pending() -> None:
+def _cleanup_sent() -> None:
     now = time.time()
-    expired = [k for k, v in _PENDING.items() if now - v["created_at"] > _PENDING_TTL_SECONDS]
+    expired = [k for k, v in _SENT.items() if now - v["created_at"] > _SENT_TTL_SECONDS]
     for k in expired:
-        _PENDING.pop(k, None)
-    stale = [mid for mid, (pid, _) in _ITEM_INDEX.items() if pid not in _PENDING]
+        _SENT.pop(k, None)
+    stale = [mid for mid, (bid, _) in _ITEM_INDEX.items() if bid not in _SENT]
     for mid in stale:
         _ITEM_INDEX.pop(mid, None)
 
 
-def _build_audit_data(product: ProductData, prices: PriceResult, markup: MarkupSpec) -> Dict[str, Any]:
+def _build_audit_data(
+    product: ProductData, prices: PriceResult, markup: MarkupSpec, sender_id: Optional[int], sender_username: Optional[str]
+) -> Dict[str, Any]:
     return {
         "model_code": product.model_code,
         "sizes": product.sizes,
@@ -145,16 +142,18 @@ def _build_audit_data(product: ProductData, prices: PriceResult, markup: MarkupS
         "carton_total": prices.carton_total,
         "mismatch": prices.mismatch,
         "mismatch_detail": prices.mismatch_detail,
+        "sent_by_user_id": sender_id,
+        "sent_by_username": sender_username or "",
     }
 
 
 def _caption_with_flags(base_caption: str, prices: PriceResult, fully_patched: bool) -> str:
     caption = base_caption
     if not fully_patched:
-        caption += "\n\n⚠️ لم يتم تحديد موقع أحد السعرين بدقة في الصورة، تحقق يدوياً قبل النشر."
+        caption += "\n\n⚠️ لم يتم تحديد موقع أحد السعرين بدقة في الصورة، راجعها يدوياً."
     if prices.mismatch:
         caption += (
-            f"\n\n🚫 تعارض بالأسعار (لن يُنشر تلقائياً): {prices.mismatch_detail}\n"
+            f"\n\n🚫 تعارض بالأسعار: {prices.mismatch_detail}\n"
             f"للتصحيح: رُد على هذه الصورة بـ \"مفرد <القيمة>\" أو \"درزن <القيمة>\"."
         )
     return caption
@@ -181,17 +180,6 @@ async def _send_processed_photos(bot, chat_id, items: List[Dict[str, Any]]) -> L
     return sent
 
 
-def _publish_keyboard(pending_id: str, publishable_count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(f"✅ نشر الكل للقناة ({publishable_count})", callback_data=f"publish:{pending_id}"),
-                InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel:{pending_id}"),
-            ]
-        ]
-    )
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "أهلاً 👋\n"
@@ -199,6 +187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "قيمة الزيادة في الكابشن -- تُضاف على مجموع سعر الكارتونة لكل منتج ثم "
         "يُقسَّم الناتج على عدد القطع لاستخراج سعر المفرد الجديد. مثال:\n"
         "+10000  أو  15%\n\n"
+        "أرد عليك بنفس المحادثة بالصورة معدَّلة وسعرها الجديد مباشرة.\n\n"
         "التعبئة تُقرأ تلقائياً سواء كُتبت كعدد قطع (24، 18) أو كعدد درزنات "
         "عشري (1.5 = 18 قطعة، 1.25 = 15 قطعة).\n\n"
         "لو طلعت قراءة غلط لأي منتج، رُد على صورته مباشرة بالتصحيح بدون إعادة "
@@ -215,7 +204,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     group_key = message.media_group_id or f"single-{message.message_id}"
-    batch = _BATCHES.setdefault(group_key, _Batch(chat_id=message.chat_id))
+    batch = _BATCHES.setdefault(
+        group_key, _Batch(chat_id=message.chat_id, from_user_id=user.id, from_username=user.username)
+    )
     batch.messages.append(message)
     if message.caption:
         batch.caption = message.caption
@@ -228,7 +219,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.job_queue.run_once(_flush_batch, when=delay, name=job_name, data=group_key, chat_id=message.chat_id)
 
 
-async def _process_one(index: int, message: Message, markup: MarkupSpec) -> Dict[str, Any]:
+async def _process_one(
+    index: int, message: Message, markup: MarkupSpec, sender_id: Optional[int], sender_username: Optional[str]
+) -> Dict[str, Any]:
     try:
         photo = message.photo[-1]
         tg_file = await photo.get_file()
@@ -247,10 +240,9 @@ async def _process_one(index: int, message: Message, markup: MarkupSpec) -> Dict
             "image": processed_image,
             "image_bytes": image_bytes,
             "caption": caption_text,
-            "needs_review": prices.mismatch,
             "product": product,
             "markup": markup,
-            "audit": _build_audit_data(product, prices, markup),
+            "audit": _build_audit_data(product, prices, markup, sender_id, sender_username),
         }
     except (ExtractionError, PackQuantityError) as exc:
         return {"ok": False, "index": index, "error": str(exc)}
@@ -276,14 +268,14 @@ async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"⏳ جارِ معالجة {len(messages)} صورة..." if len(messages) > 1 else "⏳ جارِ استخراج البيانات وتجهيز المنشور...",
+        f"⏳ جارِ معالجة {len(messages)} صورة..." if len(messages) > 1 else "⏳ جارِ استخراج البيانات وتعديل الصورة...",
     )
 
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_EXTRACTIONS)
 
     async def _guarded(index: int, message: Message) -> Dict[str, Any]:
         async with semaphore:
-            return await _process_one(index, message, markup)
+            return await _process_one(index, message, markup, batch.from_user_id, batch.from_username)
 
     results = await asyncio.gather(*(_guarded(i, m) for i, m in enumerate(messages, start=1)))
 
@@ -302,102 +294,34 @@ async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
             "image": r["image"],
             "caption": r["caption"],
             "image_bytes": r["image_bytes"],
-            "needs_review": r["needs_review"],
             "product": r["product"],
             "markup": r["markup"],
             "audit": r["audit"],
         }
         for r in successes
     ]
-    pending_id = _remember_batch(items)
+    batch_id = _remember_sent(items)
 
     sent_messages = await _send_processed_photos(context.bot, chat_id, items)
-    for item_id, msg in zip(_PENDING[pending_id]["items"].keys(), sent_messages):
-        _ITEM_INDEX[msg.message_id] = (pending_id, item_id)
-
-    review_count = sum(1 for it in items if it["needs_review"])
-    publishable_count = len(items) - review_count
-
-    summary_lines = [f"✅ تمت معالجة {len(successes)} من {len(messages)} صورة بنجاح."]
-    if review_count:
-        summary_lines.append(f"🚫 {review_count} منها يحتاج مراجعة (تعارض أسعار) قبل أن يُنشر.")
-    if failures:
-        summary_lines.append("")
-        summary_lines.append("⚠️ تعذّرت معالجة:")
-        summary_lines.extend(f"  صورة {r['index']}: {r['error']}" for r in failures)
-
-    keyboard = _publish_keyboard(pending_id, publishable_count) if publishable_count else None
-    await context.bot.send_message(chat_id, "\n".join(summary_lines), reply_markup=keyboard)
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user = update.effective_user
-
-    if user is None or not _is_authorized(user.id):
-        await query.answer("غير مصرح لك.", show_alert=True)
-        return
-
-    await query.answer()
-
-    action, _, pending_id = (query.data or "").partition(":")
-    pending = _PENDING.get(pending_id)
-
-    if pending is None:
-        await query.edit_message_text("⚠️ انتهت صلاحية هذه الدفعة، أرسل الصور مجدداً.")
-        return
-
-    items_by_id: Dict[str, Dict[str, Any]] = pending["items"]
-
-    if action == "cancel":
-        _PENDING.pop(pending_id, None)
-        await query.edit_message_text("❌ تم إلغاء هذه الدفعة.")
-        return
-
-    if action != "publish":
-        return
-
-    publishable_ids = [iid for iid, it in items_by_id.items() if not it["needs_review"]]
-    skipped_ids = [iid for iid, it in items_by_id.items() if it["needs_review"]]
-
-    if not publishable_ids:
-        await query.answer("كل عناصر هذه الدفعة تحتاج مراجعة أولاً.", show_alert=True)
-        return
-
-    publishable_items = [items_by_id[iid] for iid in publishable_ids]
-    await _send_processed_photos(context.bot, config.CHANNEL_ID, publishable_items)
+    for item_id, msg in zip(_SENT[batch_id]["items"].keys(), sent_messages):
+        _ITEM_INDEX[msg.message_id] = (batch_id, item_id)
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    for item in publishable_items:
-        audit_log.record(
-            {
-                **item["audit"],
-                "timestamp": now_iso,
-                "approved_by_user_id": user.id,
-                "approved_by_username": user.username or "",
-                "channel_id": config.CHANNEL_ID,
-            }
-        )
+    for item in items:
+        audit_log.record({**item["audit"], "timestamp": now_iso, "chat_id": chat_id})
 
-    for iid in publishable_ids:
-        items_by_id.pop(iid, None)
-
-    if skipped_ids:
-        await query.edit_message_text(
-            f"✅ تم نشر {len(publishable_ids)} منتج.\n"
-            f"⏸️ تبقّى {len(skipped_ids)} منتج يحتاج تصحيح (تعارض أسعار) قبل النشر.",
-            reply_markup=_publish_keyboard(pending_id, 0),
+    if failures:
+        fail_lines = "\n".join(f"❌ صورة {r['index']}: {r['error']}" for r in failures)
+        await context.bot.send_message(
+            chat_id, f"⚠️ تعذّرت معالجة {len(failures)} من {len(messages)}:\n{fail_lines}"
         )
-    else:
-        _PENDING.pop(pending_id, None)
-        await query.edit_message_text(f"✅ تم نشر {len(publishable_ids)} منتج في القناة.")
 
 
 async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to a specific preview photo with e.g. "مفرد 4700" to fix a
-    misread field without resending the photo. Recomputes from the
-    ORIGINAL image bytes (not the already-patched one) so the price patch
-    is always drawn fresh, never stacked on a previous edit.
+    """Reply to a specific delivered photo with e.g. "مفرد 4700" to fix a
+    misread field without resending it. Recomputes from the ORIGINAL image
+    bytes (not the already-patched one) so the price patch is always drawn
+    fresh, never stacked on a previous edit.
     """
     message = update.effective_message
     user = update.effective_user
@@ -411,12 +335,12 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     lookup = _ITEM_INDEX.get(replied.message_id)
     if lookup is None:
-        return  # not a reply to one of our previews -- ignore silently
+        return  # not a reply to one of our delivered photos -- ignore silently
 
-    pending_id, item_id = lookup
-    pending = _PENDING.get(pending_id)
-    if pending is None or item_id not in pending["items"]:
-        await message.reply_text("⚠️ انتهت صلاحية هذا العنصر أو تم نشره مسبقاً.")
+    batch_id, item_id = lookup
+    batch = _SENT.get(batch_id)
+    if batch is None or item_id not in batch["items"]:
+        await message.reply_text("⚠️ انتهت صلاحية التصحيح لهذا العنصر (مرّت أكثر من ساعة)، أرسل الصورة مجدداً.")
         return
 
     text = (message.text or "").strip()
@@ -431,7 +355,7 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("حقل غير معروف. استخدم: مفرد / درزن / كود / قياس / تعبئة")
         return
 
-    item = pending["items"][item_id]
+    item = batch["items"][item_id]
     product: ProductData = item["product"]
     markup: MarkupSpec = item["markup"]
 
@@ -451,7 +375,7 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text(f"❌ تعذر تطبيق التصحيح: {exc}")
         return
     except Exception:
-        logger.exception("Correction failed for item %s/%s", pending_id, item_id)
+        logger.exception("Correction failed for item %s/%s", batch_id, item_id)
         await message.reply_text("❌ خطأ غير متوقع أثناء تطبيق التصحيح.")
         return
 
@@ -459,9 +383,10 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         {
             "image": processed_image,
             "caption": caption_text,
-            "needs_review": prices.mismatch,
             "product": corrected_product,
-            "audit": _build_audit_data(corrected_product, prices, markup),
+            "audit": {**item["audit"], **_build_audit_data(
+                corrected_product, prices, markup, user.id, user.username
+            )},
         }
     )
 
@@ -472,7 +397,11 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             media=InputMediaPhoto(media=processed_image, caption=caption_text),
         )
     except Exception:
-        logger.exception("Failed to update preview photo after correction")
+        logger.exception("Failed to update delivered photo after correction")
+
+    audit_log.record(
+        {**item["audit"], "timestamp": datetime.now(timezone.utc).isoformat(), "chat_id": replied.chat_id, "corrected": True}
+    )
 
     status = "✅ تم التصحيح." if not prices.mismatch else "⚠️ التصحيح مطبّق، لكن لا يزال هناك تعارض بالأسعار."
     await message.reply_text(status)
@@ -485,7 +414,6 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_correction))
 
     logger.info("Bot starting (polling)...")

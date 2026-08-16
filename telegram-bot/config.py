@@ -26,9 +26,6 @@ GEMINI_FALLBACK_MODELS = [
     if m.strip()
 ]
 
-# Target channel for the "publish" button: "@channel_username" or "-100xxxxxxxxxx"
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-
 # Comma-separated Telegram user IDs allowed to use the bot.
 # Leave empty during local testing to allow everyone (NOT recommended in production).
 ALLOWED_USER_IDS = {
@@ -43,7 +40,7 @@ ALLOWED_USER_IDS = {
 # numeral glyphs works; a bold weight just looks best for a price callout.
 FONT_BOLD_PATH = os.getenv("FONT_BOLD_PATH", "fonts/Cairo-Bold.ttf")
 
-# Append-only JSON Lines audit trail of every published item (see audit_log.py).
+# Append-only JSON Lines audit trail of every processed item (see audit_log.py).
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
 
 
@@ -54,8 +51,6 @@ def validate() -> None:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not GEMINI_API_KEY:
         missing.append("GEMINI_API_KEY")
-    if not CHANNEL_ID:
-        missing.append("CHANNEL_ID")
     if missing:
         raise RuntimeError(
             "Missing required environment variable(s): " + ", ".join(missing) +
