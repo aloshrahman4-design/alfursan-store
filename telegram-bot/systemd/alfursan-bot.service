@@ -1,0 +1,24 @@
+[Unit]
+Description=Alfursan Store - Telegram Product Pricing Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alfursan
+Group=alfursan
+WorkingDirectory=/opt/alfursan-bot
+EnvironmentFile=/opt/alfursan-bot/.env
+ExecStart=/opt/alfursan-bot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Light sandboxing -- adjust WorkingDirectory above if you relocate the app.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

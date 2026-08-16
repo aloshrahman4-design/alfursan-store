@@ -1,0 +1,123 @@
+# بوت تيليجرام لمعالجة صور المنتجات وأتمتة التسعير
+
+بوت يستقبل صورة منتج من المورد (تحتوي على كود الموديل، التعبئة، القياسات،
+سعر المفرد وسعر الدرزن في شريط أسفل الصورة)، يستخرج البيانات، يطبّق هامش
+ربح، يعدّل الشريط السفلي فقط بالأسعار الجديدة، ويعرض معاينة مع زر نشر
+مباشر إلى القناة.
+
+## 1. ملاحظات ومراجعة على البنية المقترحة (Task item 1)
+
+البنية الأصلية (Gemini Vision للاستخراج → Python للحساب → Pillow للتعديل →
+Telegram للنشر) سليمة ومناسبة لحل المشاكل الثلاث المذكورة (أخطاء الحساب،
+تلف الصور، إجهاد السياق). التحسينات المطبقة في هذا الكود:
+
+1. **إحداثيات نسبية بدل إحداثيات ثابتة بالبكسل.** الطلب الأصلي يذكر
+   "إحداثيات ثابتة (X, Y)"، لكن صور الموردين نادراً ما تكون بنفس الدقة
+   بالضبط. لذلك `FOOTER_HEIGHT_RATIO` في `config.py` نسبة مئوية من ارتفاع
+   الصورة (مثلاً 22% السفلية)، وكل إحداثيات النص تُحسب كنسبة من ذلك
+   الشريط. هذا يحافظ على نفس السلوك (تغطية بيضاء + كتابة في نفس المكان
+   تقريباً) لكن دون كسر البوت إذا أرسل مورد آخر صورة بأبعاد مختلفة.
+2. **Structured Outputs عبر Pydantic schema** بدل الاعتماد على تعليمات
+   نصية فقط لضمان JSON صالح دائماً (`response_schema=ProductData` في
+   `gemini_extractor.py`)، مع `temperature=0` لتقليل التذبذب.
+3. **فصل صارم للحسابات.** Gemini مُلزَم بنص الأمر بعدم إجراء أي عملية
+   حسابية؛ كل الجمع والضرب يتم بـ `Decimal` في `pricing.py` فقط.
+4. **تشكيل ولفّ نص عربي صحيح.** Pillow لا يدعم RTL/shaping عربي أصلاً،
+   لذلك تمت إضافة `arabic-reshaper` + `python-bidi` لضمان ظهور الحروف
+   متصلة ومتجهة بالاتجاه الصحيح بدل حروف منفصلة أو معكوسة.
+5. **زر الموافقة لا يخزّن البيانات في `callback_data`** (المحدود بـ 64
+   بايت في تيليجرام)، بل يستخدم معرّف قصير (`pending_id`) يشير إلى
+   الصورة/الكابشن المخزّنين مؤقتاً في الذاكرة مع صلاحية ساعة واحدة.
+6. **العمليات الثقيلة (شبكة Gemini + معالجة Pillow) تعمل عبر
+   `asyncio.to_thread`** حتى لا تُجمّد حلقة أحداث تيليجرام أثناء معالجة
+   صورة، مما يسمح للبوت بالرد على مستخدمين/رسائل أخرى بالتوازي.
+7. **تحقق من صلاحية المستخدم (`ALLOWED_USER_IDS`)** لأن هذا بوت أتمتة
+   داخلي (نشر مباشر لقناة رسمية)، وليس بوتاً عاماً.
+
+## 2. البنية
+
+```
+telegram-bot/
+├── main.py                # نقطة الدخول: معالجات تيليجرام + تدفق العمل
+├── gemini_extractor.py     # الخطوة 1: استخراج JSON فقط عبر Gemini Vision
+├── pricing.py               # الخطوة 2: حسابات الأسعار الحتمية (Decimal)
+├── image_processor.py       # الخطوة 3: تعديل الشريط السفلي فقط (Pillow)
+├── config.py                 # قراءة متغيرات البيئة والتحقق منها
+├── requirements.txt
+├── .env.example
+├── fonts/                    # ضع هنا خطوط عربية .ttf (راجع fonts/README.md)
+└── systemd/alfursan-bot.service
+```
+
+## 3. طريقة الاستخدام
+
+1. أرسل للبوت صورة المنتج مع كتابة قيمة الزيادة في نص الرسالة (caption):
+   - مبلغ ثابت: `+1000` (يُضاف على سعر المفرد، و×12 على سعر الدرزن)
+   - نسبة مئوية: `15%` أو `+15%` (تُطبَّق على سعر المفرد وسعر الدرزن من المورد كل على حدة)
+2. يرد البوت بمعاينة: صورة معدّلة (نفس صورة المنتج، مع شريط سفلي جديد
+   بالأسعار المحدّثة) + كليشة نصية، مع زرَّي **✅ نشر للقناة** و **❌ إلغاء**.
+3. الضغط على "نشر للقناة" يرسل نفس الصورة والنص إلى `CHANNEL_ID` مباشرة.
+
+## 4. التثبيت المحلي
+
+```bash
+cd telegram-bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # ثم عبّئ القيم (التوكن، مفتاح Gemini، القناة، المستخدمون المصرح لهم)
+```
+
+نزّل خط عربي (مثل Cairo من Google Fonts) وضع ملفات `Cairo-Regular.ttf` و
+`Cairo-Bold.ttf` داخل مجلد `fonts/` (راجع `fonts/README.md`).
+
+تشغيل تجريبي:
+
+```bash
+python main.py
+```
+
+## 5. النشر على سيرفر Ubuntu (systemd، يعمل 24/7)
+
+```bash
+# 1) إنشاء مستخدم مخصص وتحضير المجلد
+sudo useradd --system --create-home --shell /usr/sbin/nologin alfursan
+sudo mkdir -p /opt/alfursan-bot
+sudo chown alfursan:alfursan /opt/alfursan-bot
+
+# 2) نسخ الملفات إلى السيرفر (من جهازك المحلي)
+rsync -av --exclude venv telegram-bot/ user@server:/opt/alfursan-bot/
+
+# 3) على السيرفر: تجهيز البيئة الافتراضية
+sudo -u alfursan python3 -m venv /opt/alfursan-bot/venv
+sudo -u alfursan /opt/alfursan-bot/venv/bin/pip install -r /opt/alfursan-bot/requirements.txt
+
+# 4) إعداد ملف البيئة
+sudo -u alfursan cp /opt/alfursan-bot/.env.example /opt/alfursan-bot/.env
+sudo -u alfursan nano /opt/alfursan-bot/.env   # عبّئ القيم الحقيقية
+
+# 5) تثبيت خدمة systemd
+sudo cp /opt/alfursan-bot/systemd/alfursan-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now alfursan-bot
+
+# متابعة السجلات
+sudo journalctl -u alfursan-bot -f
+```
+
+أوامر مفيدة لاحقاً:
+
+```bash
+sudo systemctl restart alfursan-bot   # بعد تحديث الكود أو .env
+sudo systemctl status alfursan-bot
+```
+
+## 6. أمان وصلاحيات
+
+- `ALLOWED_USER_IDS` **يجب** ضبطه في الإنتاج بمعرّفات تيليجرام لأصحاب
+  الصلاحية فقط (يمكن معرفة معرّفك عبر بوت مثل `@userinfobot`)، وإلا
+  سيستطيع أي شخص إرسال صور والنشر في قناتك.
+- تأكد أن البوت مُضاف كمشرف (Admin) في القناة الهدف مع صلاحية "نشر
+  الرسائل".
+- لا تضع `.env` أو `GEMINI_API_KEY`/`TELEGRAM_BOT_TOKEN` في git — الملف
+  موجود كمثال فقط (`.env.example`).
