@@ -69,6 +69,7 @@ class PriceResult:
     mode: PricingMode = PricingMode.CARTON
     mismatch: bool = False              # True when the supplier's own dozen/single prices don't agree
     mismatch_detail: Optional[str] = None
+    used_derived_basis: bool = False    # True when dozen_price was missing and estimated from single_price*12
 
 
 class MarkupParseError(ValueError):
@@ -253,6 +254,7 @@ def compute_prices(
     """
     total_pieces, dozens_count = parse_pack_quantity(product.pack_quantity_raw)
     mismatch, mismatch_detail = _check_price_mismatch(product, total_pieces, dozens_count)
+    used_derived_basis = product.dozen_price is None
 
     if mode is PricingMode.DOZEN:
         new_dozen_price = _round_int(_apply_markup(_supplier_dozen_basis(product), markup))
@@ -274,4 +276,5 @@ def compute_prices(
         mode=mode,
         mismatch=mismatch,
         mismatch_detail=mismatch_detail,
+        used_derived_basis=used_derived_basis,
     )

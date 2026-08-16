@@ -154,6 +154,11 @@ def _caption_with_flags(base_caption: str, prices: PriceResult, fully_patched: b
     caption = base_caption
     if not fully_patched:
         caption += "\n\n⚠️ لم يتم تحديد موقع أحد السعرين بدقة في الصورة، راجعها يدوياً."
+    if prices.used_derived_basis:
+        caption += (
+            "\n\n⚠️ سعر الدرزن غير موجود أو غير واضح بالصورة الأصلية -- تم تقديره من "
+            "سعر المفرد×12 بدل الرقم المطبوع الحقيقي، راجعه قبل الاعتماد عليه."
+        )
     if prices.mismatch:
         caption += (
             f"\n\n🚫 تعارض بالأسعار: {prices.mismatch_detail}\n"

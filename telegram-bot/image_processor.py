@@ -83,6 +83,15 @@ def _grow_to_content(
     parenthesis (too generous), because Gemini's bbox error isn't
     proportional to the box's own size. Growth is capped per side so a
     genuinely light background (nothing left to grow into) stops quickly.
+
+    Deliberately does NOT tolerate gaps (stops at the very first light
+    pixel): tried bridging a small gap to also absorb a stray leftover
+    digit some supplier templates print just past the real price, but
+    checked live against a real photo it just as easily bridges the SAME
+    kind of gap between unrelated label text (e.g. "التعبئة" / "دينار")
+    and corrupts an otherwise-correct patch. A stray extra digit outside
+    Gemini's located price is a rare source-image glitch; consistently
+    not eating into neighboring labels on every normal photo matters more.
     """
     left, top, right, bottom = box
     width, height = image.size

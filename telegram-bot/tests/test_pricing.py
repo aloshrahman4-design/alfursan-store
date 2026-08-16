@@ -169,6 +169,11 @@ class PricingModeTests(unittest.TestCase):
         # basis = 4000*12 = 48000; +1000 = 49000; single = round(49000/12) = 4083
         self.assertEqual(prices.new_dozen_price, 49000)
         self.assertEqual(prices.new_single_price, 4083)
+        self.assertTrue(prices.used_derived_basis)
+
+    def test_used_derived_basis_false_when_dozen_price_present(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+15000"), PricingMode.CARTON)
+        self.assertFalse(prices.used_derived_basis)
 
 
 if __name__ == "__main__":
