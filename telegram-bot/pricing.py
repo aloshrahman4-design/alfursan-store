@@ -156,24 +156,56 @@ def parse_pack_quantity(raw: str) -> Tuple[int, Decimal]:
     return total_pieces, dozens_count
 
 
+def _is_pack_total_not_dozen(product: ProductData, total_pieces: int) -> bool:
+    """Some suppliers print the TOTAL price for the whole pack in the same
+    slot others use for a genuine per-dozen price -- e.g. a 15-piece pack
+    where the "big" number equals single_price*15 (the pack total), not
+    single_price*12 (a real dozen price). Checked live against real
+    photos from the same template family: one product's big number was
+    exactly 12x its single price (a real dozen price), another's was
+    exactly `total_pieces`x its single price with total_pieces=15 (a pack
+    total) -- no textual label distinguishes them in either image, so this
+    is detected mathematically: whichever multiplier (12, or total_pieces)
+    the ratio actually lands closest to. Only fires on a close match so it
+    doesn't misfire on an unrelated pair of numbers (which _check_price_mismatch
+    handles instead).
+    """
+    if product.dozen_price is None or not product.single_price:
+        return False
+    ratio = Decimal(product.dozen_price) / Decimal(product.single_price)
+    distance_to_pack_total = abs(ratio - total_pieces)
+    distance_to_dozen = abs(ratio - DOZEN)
+    return distance_to_pack_total < distance_to_dozen and distance_to_pack_total <= Decimal("0.5")
+
+
 def _supplier_carton_total(product: ProductData, total_pieces: int, dozens_count: Decimal) -> Decimal:
     """Prefer the dozen price (the wholesale unit) when it's known, and
     fall back to single_price * total_pieces when only the single price
     was legible. Extraction already guarantees at least one is present.
+
+    If dozen_price is actually a pack-total in disguise (see
+    _is_pack_total_not_dozen), it's already the carton total on its own --
+    using it directly instead of multiplying by dozens_count again, which
+    would double-count.
     """
     if product.dozen_price is not None:
+        if _is_pack_total_not_dozen(product, total_pieces):
+            return Decimal(product.dozen_price)
         return Decimal(product.dozen_price) * dozens_count
     if product.single_price is not None:
         return Decimal(product.single_price) * total_pieces
     raise PackQuantityError("لا يوجد أي سعر (مفرد أو درزن) لهذا المنتج.")
 
 
-def _supplier_dozen_basis(product: ProductData) -> Decimal:
+def _supplier_dozen_basis(product: ProductData, total_pieces: int) -> Decimal:
     """The supplier's dozen price to apply a DOZEN-mode markup to -- the
     printed dozen price if legible, or single_price*12 if only the single
-    price was legible. Extraction already guarantees at least one is present.
+    price was legible (or if the "dozen" field turned out to be a
+    pack-total in disguise, see _is_pack_total_not_dozen -- there's no
+    genuine per-dozen figure to use in that case either, so it's derived
+    the same way as if dozen_price had never been read).
     """
-    if product.dozen_price is not None:
+    if product.dozen_price is not None and not _is_pack_total_not_dozen(product, total_pieces):
         return Decimal(product.dozen_price)
     if product.single_price is not None:
         return Decimal(product.single_price) * DOZEN
@@ -185,19 +217,28 @@ def _check_price_mismatch(
 ) -> Tuple[bool, Optional[str]]:
     """When both prices were read, cross-check them against each other.
 
-    single_price * total_pieces should roughly equal dozen_price *
-    dozens_count -- they're two ways of pricing the same carton. A big gap
-    means Gemini almost certainly misread a digit in one of them, so the
-    item gets flagged instead of silently trusting one of two disagreeing
-    numbers. Doesn't raise: the caller still gets a usable PriceResult
-    (computed from the preferred dozen-price basis) so a preview can be
-    shown and corrected via reply, rather than blocking the whole item.
+    single_price * total_pieces should roughly equal the carton total
+    implied by the "dozen" field -- they're two ways of pricing the same
+    carton. A big gap means Gemini almost certainly misread a digit in one
+    of them, so the item gets flagged instead of silently trusting one of
+    two disagreeing numbers. Doesn't raise: the caller still gets a usable
+    PriceResult (computed from the preferred dozen-price basis) so a
+    preview can be shown and corrected via reply, rather than blocking the
+    whole item.
+
+    Uses the same pack-total-vs-real-dozen interpretation as
+    _supplier_carton_total (see _is_pack_total_not_dozen) so a supplier
+    who prints the whole pack's total instead of a genuine dozen price
+    isn't flagged as "mismatched" for a difference that was never real.
     """
     if product.dozen_price is None or product.single_price is None:
         return False, None
 
     from_single = Decimal(product.single_price) * total_pieces
-    from_dozen = Decimal(product.dozen_price) * dozens_count
+    if _is_pack_total_not_dozen(product, total_pieces):
+        from_dozen = Decimal(product.dozen_price)
+    else:
+        from_dozen = Decimal(product.dozen_price) * dozens_count
     bigger = max(from_single, from_dozen)
     if bigger == 0:
         return False, None
@@ -254,12 +295,19 @@ def compute_prices(
     """
     total_pieces, dozens_count = parse_pack_quantity(product.pack_quantity_raw)
     mismatch, mismatch_detail = _check_price_mismatch(product, total_pieces, dozens_count)
-    used_derived_basis = product.dozen_price is None
+    pack_total_not_dozen = _is_pack_total_not_dozen(product, total_pieces)
 
     if mode is PricingMode.DOZEN:
-        new_dozen_price = _round_int(_apply_markup(_supplier_dozen_basis(product), markup))
+        # A pack-total masquerading as "dozen_price" isn't a real per-dozen
+        # figure to mark up -- _supplier_dozen_basis already falls back to
+        # single_price*12 in that case, same as if dozen_price were missing.
+        used_derived_basis = product.dozen_price is None or pack_total_not_dozen
+        new_dozen_price = _round_int(_apply_markup(_supplier_dozen_basis(product, total_pieces), markup))
         new_single_price = _round_int(Decimal(new_dozen_price) / DOZEN)
     else:
+        # CARTON mode uses the pack-total correctly as-is (see
+        # _supplier_carton_total), so that's not a derived/estimated figure.
+        used_derived_basis = product.dozen_price is None
         supplier_carton_total = _supplier_carton_total(product, total_pieces, dozens_count)
         new_carton_total = _apply_markup(supplier_carton_total, markup)
         new_single_price = _round_int(new_carton_total / Decimal(total_pieces))

@@ -176,5 +176,46 @@ class PricingModeTests(unittest.TestCase):
         self.assertFalse(prices.used_derived_basis)
 
 
+class PackTotalDisguisedAsDozenTests(unittest.TestCase):
+    """Real sample: GHG-14723/GHG-14725, single=7069, pack=15, and the "big"
+    number printed (106035) is exactly single*15 -- the WHOLE PACK's total
+    price, not a genuine per-dozen price (which would be single*12=84828).
+    Same template family as GHG-15520 (pack=18, big number IS a genuine
+    dozen price, single*12 exactly) -- no textual label distinguishes them
+    in either source image, so this has to be inferred from the numbers.
+    """
+
+    PACK_TOTAL_PRODUCT = ProductData(
+        model_code="GHG-14723", sizes="41-45", pack_quantity_raw="15", dozen_price=106035, single_price=7069
+    )
+    GENUINE_DOZEN_PRODUCT = ProductData(
+        model_code="GHG-15520", sizes="25-30", pack_quantity_raw="18", dozen_price=84204, single_price=7017
+    )
+
+    def test_carton_mode_uses_pack_total_as_is_not_multiplied_again(self):
+        prices = compute_prices(self.PACK_TOTAL_PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        # correct: (106035 + 2000) / 15 = 7202.33 -> 7202
+        self.assertEqual(prices.new_single_price, 7202)
+        # bug this guards against: treating 106035 as a real dozen price
+        # would multiply by dozens_count (1.25) first, giving 8970 instead.
+        self.assertNotEqual(prices.new_single_price, 8970)
+        self.assertFalse(prices.mismatch)
+        self.assertFalse(prices.used_derived_basis)
+
+    def test_dozen_mode_falls_back_to_single_times_12(self):
+        prices = compute_prices(self.PACK_TOTAL_PRODUCT, parse_markup("+2000 درزن"), PricingMode.DOZEN)
+        # no genuine dozen figure exists here, so DOZEN mode derives one
+        # from single*12 (7069*12=84828) instead of marking up the
+        # pack-total (106035) as if it were a dozen price.
+        self.assertEqual(prices.new_dozen_price, 86828)
+        self.assertTrue(prices.used_derived_basis)
+
+    def test_genuine_dozen_case_is_unaffected(self):
+        prices = compute_prices(self.GENUINE_DOZEN_PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        # (84204*1.5 + 2000) / 18 = 7128.33 -> 7128, same as before this fix.
+        self.assertEqual(prices.new_single_price, 7128)
+        self.assertFalse(prices.mismatch)
+
+
 if __name__ == "__main__":
     unittest.main()
