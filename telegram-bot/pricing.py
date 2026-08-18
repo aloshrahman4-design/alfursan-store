@@ -169,7 +169,15 @@ def _is_pack_total_not_dozen(product: ProductData, total_pieces: int) -> bool:
     the ratio actually lands closest to. Only fires on a close match so it
     doesn't misfire on an unrelated pair of numbers (which _check_price_mismatch
     handles instead).
+
+    Gemini can also mark this explicitly via product.price_is_pack_total --
+    some suppliers show only ONE combined figure with no dozen/single
+    breakdown at all (e.g. "24 زوج 61,5 الف"), so there's no single_price to
+    compute a ratio against; that case is unambiguous from the layout alone
+    and doesn't need the numeric heuristic.
     """
+    if product.price_is_pack_total:
+        return True
     if product.dozen_price is None or not product.single_price:
         return False
     ratio = Decimal(product.dozen_price) / Decimal(product.single_price)
@@ -197,18 +205,25 @@ def _supplier_carton_total(product: ProductData, total_pieces: int, dozens_count
     raise PackQuantityError("لا يوجد أي سعر (مفرد أو درزن) لهذا المنتج.")
 
 
-def _supplier_dozen_basis(product: ProductData, total_pieces: int) -> Decimal:
+def _supplier_dozen_basis(product: ProductData, total_pieces: int, dozens_count: Decimal) -> Decimal:
     """The supplier's dozen price to apply a DOZEN-mode markup to -- the
     printed dozen price if legible, or single_price*12 if only the single
     price was legible (or if the "dozen" field turned out to be a
     pack-total in disguise, see _is_pack_total_not_dozen -- there's no
     genuine per-dozen figure to use in that case either, so it's derived
     the same way as if dozen_price had never been read).
+
+    Some pack-total layouts have no single_price at all (a single combined
+    figure like "24 زوج 61,5 الف", see product.price_is_pack_total) -- the
+    per-dozen basis is derived straight from that total instead:
+    pack_total / dozens_count (== per-piece price * 12).
     """
     if product.dozen_price is not None and not _is_pack_total_not_dozen(product, total_pieces):
         return Decimal(product.dozen_price)
     if product.single_price is not None:
         return Decimal(product.single_price) * DOZEN
+    if product.dozen_price is not None:
+        return Decimal(product.dozen_price) / dozens_count
     raise PackQuantityError("لا يوجد أي سعر (مفرد أو درزن) لهذا المنتج.")
 
 
@@ -302,7 +317,9 @@ def compute_prices(
         # figure to mark up -- _supplier_dozen_basis already falls back to
         # single_price*12 in that case, same as if dozen_price were missing.
         used_derived_basis = product.dozen_price is None or pack_total_not_dozen
-        new_dozen_price = _round_int(_apply_markup(_supplier_dozen_basis(product, total_pieces), markup))
+        new_dozen_price = _round_int(
+            _apply_markup(_supplier_dozen_basis(product, total_pieces, dozens_count), markup)
+        )
         new_single_price = _round_int(Decimal(new_dozen_price) / DOZEN)
     else:
         # CARTON mode uses the pack-total correctly as-is (see

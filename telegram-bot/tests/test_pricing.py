@@ -217,5 +217,37 @@ class PackTotalDisguisedAsDozenTests(unittest.TestCase):
         self.assertFalse(prices.mismatch)
 
 
+class CombinedPackTotalFormatTests(unittest.TestCase):
+    """Real sample: FQAK28592, a layout with no درزن/مفرد labels at all --
+    just one bold combined line "18 زوج 66,5 الف" (quantity + pack-total
+    price together, thousands-decimal notation). Gemini marks this via
+    product.price_is_pack_total instead of the numeric-ratio heuristic
+    (there's no single_price to compute a ratio against).
+    """
+
+    PRODUCT = ProductData(
+        model_code="FQAK28592", sizes="21/26", pack_quantity_raw="18",
+        dozen_price=66500, price_is_pack_total=True,
+    )
+
+    def test_carton_mode_uses_pack_total_as_is(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        # (66500 + 2000) / 18 = 3805.55 -> 3806
+        self.assertEqual(prices.new_single_price, 3806)
+        self.assertEqual(prices.carton_total, 68508)
+        self.assertFalse(prices.used_derived_basis)
+
+    def test_dozen_mode_derives_basis_from_pack_total(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000 درزن"), PricingMode.DOZEN)
+        # dozen basis = 66500 / 1.5 dozens = 44333.33; +2000 = 46333.33 -> 46333
+        self.assertEqual(prices.new_dozen_price, 46333)
+        self.assertEqual(prices.new_single_price, 3861)
+        self.assertTrue(prices.used_derived_basis)
+
+    def test_no_single_price_never_flagged_as_mismatch(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        self.assertFalse(prices.mismatch)
+
+
 if __name__ == "__main__":
     unittest.main()

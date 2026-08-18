@@ -97,7 +97,14 @@ def _grow_to_content(
     width, height = image.size
     pixels = image.load()
     dark_threshold = _luminance(bg_color) - 60
-    max_growth = max(6, int(max(right - left, bottom - top) * 0.35))
+    # Capped separately per axis (not by the box's largest dimension overall):
+    # a box widened to also cover enclosing parentheses can end up much wider
+    # than it is tall, and a shared cap based on the wider axis let vertical
+    # growth run far past the price's own line height -- checked live against
+    # a real photo, it bled downward into the very next price line (which
+    # sits only ~2% of the image away) and erased it.
+    max_growth_x = max(6, int((right - left) * 0.35))
+    max_growth_y = max(6, int((bottom - top) * 0.35))
 
     def col_is_dark(x: int) -> bool:
         if x < 0 or x >= width:
@@ -117,19 +124,19 @@ def _grow_to_content(
             _luminance(pixels[x, y]) < dark_threshold for x in range(max(left, 0), min(right, width))
         )
 
-    for _ in range(max_growth):
+    for _ in range(max_growth_x):
         if not col_is_dark(left - 1):
             break
         left -= 1
-    for _ in range(max_growth):
+    for _ in range(max_growth_x):
         if not col_is_dark(right):
             break
         right += 1
-    for _ in range(max_growth):
+    for _ in range(max_growth_y):
         if not row_is_dark(top - 1):
             break
         top -= 1
-    for _ in range(max_growth):
+    for _ in range(max_growth_y):
         if not row_is_dark(bottom):
             break
         bottom += 1
