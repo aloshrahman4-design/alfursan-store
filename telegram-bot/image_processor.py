@@ -84,14 +84,20 @@ def _grow_to_content(
     proportional to the box's own size. Growth is capped per side so a
     genuinely light background (nothing left to grow into) stops quickly.
 
-    Deliberately does NOT tolerate gaps (stops at the very first light
-    pixel): tried bridging a small gap to also absorb a stray leftover
-    digit some supplier templates print just past the real price, but
-    checked live against a real photo it just as easily bridges the SAME
-    kind of gap between unrelated label text (e.g. "التعبئة" / "دينار")
-    and corrupts an otherwise-correct patch. A stray extra digit outside
-    Gemini's located price is a rare source-image glitch; consistently
-    not eating into neighboring labels on every normal photo matters more.
+    Tolerates only a TINY gap (_MAX_GAP_PX) before giving up, not an
+    unbounded one: checked live against real photos, adjacent digit
+    strokes within the price's own number (e.g. between the "6" and "7" of
+    "667") can have a 1-2px anti-aliased gap that isn't itself dark enough
+    to cross, which used to stop growth right in the middle of the price
+    and leave a sliver of an original digit un-redacted. A larger,
+    unbounded gap tolerance was tried too (to also absorb a stray leftover
+    digit/paren some supplier templates print just past the real price),
+    but checked live against a real photo it just as easily bridged the
+    SAME kind of gap to unrelated label text (e.g. "التعبئة" / "دينار")
+    words a real word-space away (~15-26px in these photos) and corrupted
+    an otherwise-correct patch. _MAX_GAP_PX stays far below that word-space
+    distance on purpose -- comfortably closes a kerning gap, nowhere near
+    enough to reach the next word.
     """
     left, top, right, bottom = box
     width, height = image.size
@@ -105,6 +111,7 @@ def _grow_to_content(
     # sits only ~2% of the image away) and erased it.
     max_growth_x = max(6, int((right - left) * 0.35))
     max_growth_y = max(6, int((bottom - top) * 0.35))
+    _MAX_GAP_PX = 3
 
     def col_is_dark(x: int) -> bool:
         if x < 0 or x >= width:
@@ -124,22 +131,66 @@ def _grow_to_content(
             _luminance(pixels[x, y]) < dark_threshold for x in range(max(left, 0), min(right, width))
         )
 
-    for _ in range(max_growth_x):
-        if not col_is_dark(left - 1):
-            break
-        left -= 1
-    for _ in range(max_growth_x):
-        if not col_is_dark(right):
-            break
-        right += 1
-    for _ in range(max_growth_y):
-        if not row_is_dark(top - 1):
-            break
-        top -= 1
-    for _ in range(max_growth_y):
-        if not row_is_dark(bottom):
-            break
-        bottom += 1
+    def grow_left(edge: int, limit: int) -> int:
+        probe = edge
+        gap = 0
+        for _ in range(limit):
+            probe -= 1
+            if col_is_dark(probe):
+                edge = probe
+                gap = 0
+            else:
+                gap += 1
+                if gap > _MAX_GAP_PX:
+                    break
+        return edge
+
+    def grow_right(edge: int, limit: int) -> int:
+        probe = edge
+        gap = 0
+        for _ in range(limit):
+            if col_is_dark(probe):
+                edge = probe + 1
+                gap = 0
+            else:
+                gap += 1
+                if gap > _MAX_GAP_PX:
+                    break
+            probe += 1
+        return edge
+
+    def grow_up(edge: int, limit: int) -> int:
+        probe = edge
+        gap = 0
+        for _ in range(limit):
+            probe -= 1
+            if row_is_dark(probe):
+                edge = probe
+                gap = 0
+            else:
+                gap += 1
+                if gap > _MAX_GAP_PX:
+                    break
+        return edge
+
+    def grow_down(edge: int, limit: int) -> int:
+        probe = edge
+        gap = 0
+        for _ in range(limit):
+            if row_is_dark(probe):
+                edge = probe + 1
+                gap = 0
+            else:
+                gap += 1
+                if gap > _MAX_GAP_PX:
+                    break
+            probe += 1
+        return edge
+
+    left = grow_left(left, max_growth_x)
+    right = grow_right(right, max_growth_x)
+    top = grow_up(top, max_growth_y)
+    bottom = grow_down(bottom, max_growth_y)
 
     return max(left, 0), max(top, 0), min(right, width), min(bottom, height)
 
