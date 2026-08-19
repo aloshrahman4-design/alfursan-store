@@ -121,6 +121,19 @@ def _round_int(value: Decimal) -> int:
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
+# The carton total is the headline number a customer actually sees quoted in
+# bulk, so it's rounded to a clean denomination (nearest 500 دينار) instead
+# of landing on an arbitrary exact-to-the-dinar figure -- explicitly
+# requested: "70,000" reads as a real wholesale price, "70,317" reads as an
+# unrounded computation artifact. Only the carton total gets this treatment
+# (not single/dozen) -- that's the one figure the customer is quoted.
+_CARTON_ROUNDING_STEP = Decimal(500)
+
+
+def _round_to_step(value: Decimal, step: Decimal) -> int:
+    return int((value / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step)
+
+
 def parse_pack_quantity(raw: str) -> Tuple[int, Decimal]:
     """Interpret the supplier's "تعبئة/Packing" field.
 
@@ -284,15 +297,20 @@ def compute_prices(
     everything else from it -- so there is exactly one number the markup
     touches and no risk of the single/dozen/carton figures drifting apart.
 
-    PricingMode.CARTON (default, unchanged from the original design):
+    PricingMode.CARTON (default):
       1. supplier_carton_total = dozen_price * dozens_count (or, if only a
          single price was legible, single_price * total_pieces).
-      2. new_carton_total = supplier_carton_total (+ markup, flat or %).
-      3. new_single_price = round(new_carton_total / total_pieces).
-      4. new_dozen_price and carton_total are derived from that ROUNDED
-         single price (single*12, single*total_pieces) rather than rounded
-         independently, so single*12 always equals dozen and
-         single*total_pieces always equals carton_total.
+      2. new_carton_total = supplier_carton_total (+ markup, flat or %),
+         then rounded to the nearest _CARTON_ROUNDING_STEP (500 دينار) --
+         that's the number actually quoted to a customer in bulk, so it's
+         a clean denomination rather than an arbitrary exact-to-the-dinar
+         figure.
+      3. new_single_price = round(carton_total / total_pieces).
+      4. new_dozen_price is derived from that single price (single*12), so
+         single*12 always equals dozen. single*total_pieces is NOT forced
+         to equal carton_total exactly anymore -- it can drift by up to
+         total_pieces/2 دينار from the rounding in step 2, which is not
+         meaningful at these price levels.
 
     PricingMode.DOZEN (admin writes "درزن" in the caption):
       1. supplier_dozen_basis = dozen_price (or single_price*12 if only
@@ -321,16 +339,23 @@ def compute_prices(
             _apply_markup(_supplier_dozen_basis(product, total_pieces, dozens_count), markup)
         )
         new_single_price = _round_int(Decimal(new_dozen_price) / DOZEN)
+        carton_total = new_single_price * total_pieces
     else:
         # CARTON mode uses the pack-total correctly as-is (see
         # _supplier_carton_total), so that's not a derived/estimated figure.
         used_derived_basis = product.dozen_price is None
         supplier_carton_total = _supplier_carton_total(product, total_pieces, dozens_count)
         new_carton_total = _apply_markup(supplier_carton_total, markup)
-        new_single_price = _round_int(new_carton_total / Decimal(total_pieces))
+        # Rounded to a clean denomination -- this is the one number the
+        # customer is actually quoted in bulk, see _CARTON_ROUNDING_STEP.
+        # single/dozen are then derived from THIS rounded figure (not the
+        # raw one), so the patched photo and the caption both agree with
+        # the rounded total; single*total_pieces can drift from it by at
+        # most total_pieces/2 دينار (a single extra rounding step), which
+        # is invisible at these price levels.
+        carton_total = _round_to_step(new_carton_total, _CARTON_ROUNDING_STEP)
+        new_single_price = _round_int(Decimal(carton_total) / Decimal(total_pieces))
         new_dozen_price = new_single_price * 12
-
-    carton_total = new_single_price * total_pieces
 
     return PriceResult(
         total_pieces=total_pieces,

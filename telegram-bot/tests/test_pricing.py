@@ -87,8 +87,15 @@ class ComputePricesConsistencyTests(unittest.TestCase):
             product = ProductData(**sample)
             prices = compute_prices(product, markup)
             self.assertEqual(prices.new_single_price * 12, prices.new_dozen_price, sample["model_code"])
-            self.assertEqual(
-                prices.new_single_price * prices.total_pieces, prices.carton_total, sample["model_code"]
+            # carton_total is rounded to a clean 500-دينار denomination (the
+            # figure actually quoted to a customer), so it's no longer
+            # forced to equal single*pieces exactly -- only closely, within
+            # one extra rounding step (see pricing.compute_prices docstring).
+            self.assertEqual(prices.carton_total % 500, 0, sample["model_code"])
+            self.assertLessEqual(
+                abs(prices.new_single_price * prices.total_pieces - prices.carton_total),
+                prices.total_pieces,
+                sample["model_code"],
             )
             self.assertFalse(prices.mismatch, f"{sample['model_code']} unexpectedly flagged as mismatched")
 
@@ -143,7 +150,8 @@ class PricingModeTests(unittest.TestCase):
         markup = parse_markup("+15000")
         prices = compute_prices(self.PRODUCT, markup, PricingMode.CARTON)
         self.assertEqual(prices.new_single_price, 5313)
-        self.assertEqual(prices.carton_total, 127512)
+        # 56250*2 dozens + 15000 = 127500, already a clean 500-دينار figure.
+        self.assertEqual(prices.carton_total, 127500)
         caption = build_caption(self.PRODUCT, prices)
         self.assertIn("سعر المفرد", caption)
         self.assertIn("إجمالي سعر الكارتونة", caption)
@@ -194,10 +202,12 @@ class PackTotalDisguisedAsDozenTests(unittest.TestCase):
 
     def test_carton_mode_uses_pack_total_as_is_not_multiplied_again(self):
         prices = compute_prices(self.PACK_TOTAL_PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
-        # correct: (106035 + 2000) / 15 = 7202.33 -> 7202
-        self.assertEqual(prices.new_single_price, 7202)
+        # correct: 106035 + 2000 = 108035 -> rounded to nearest 500 = 108000
+        # -> single = round(108000/15) = 7200
+        self.assertEqual(prices.carton_total, 108000)
+        self.assertEqual(prices.new_single_price, 7200)
         # bug this guards against: treating 106035 as a real dozen price
-        # would multiply by dozens_count (1.25) first, giving 8970 instead.
+        # would multiply by dozens_count (1.25) first, giving ~8970 instead.
         self.assertNotEqual(prices.new_single_price, 8970)
         self.assertFalse(prices.mismatch)
         self.assertFalse(prices.used_derived_basis)
@@ -212,8 +222,10 @@ class PackTotalDisguisedAsDozenTests(unittest.TestCase):
 
     def test_genuine_dozen_case_is_unaffected(self):
         prices = compute_prices(self.GENUINE_DOZEN_PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
-        # (84204*1.5 + 2000) / 18 = 7128.33 -> 7128, same as before this fix.
-        self.assertEqual(prices.new_single_price, 7128)
+        # 84204*1.5 + 2000 = 128306 -> rounded to nearest 500 = 128500
+        # -> single = round(128500/18) = 7139
+        self.assertEqual(prices.carton_total, 128500)
+        self.assertEqual(prices.new_single_price, 7139)
         self.assertFalse(prices.mismatch)
 
 
@@ -232,9 +244,10 @@ class CombinedPackTotalFormatTests(unittest.TestCase):
 
     def test_carton_mode_uses_pack_total_as_is(self):
         prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
-        # (66500 + 2000) / 18 = 3805.55 -> 3806
+        # 66500 + 2000 = 68500, already a clean 500-دينار figure.
+        # single = round(68500/18) = 3806.
         self.assertEqual(prices.new_single_price, 3806)
-        self.assertEqual(prices.carton_total, 68508)
+        self.assertEqual(prices.carton_total, 68500)
         self.assertFalse(prices.used_derived_basis)
 
     def test_dozen_mode_derives_basis_from_pack_total(self):
@@ -247,6 +260,38 @@ class CombinedPackTotalFormatTests(unittest.TestCase):
     def test_no_single_price_never_flagged_as_mismatch(self):
         prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
         self.assertFalse(prices.mismatch)
+
+
+class CartonTotalRoundingTests(unittest.TestCase):
+    """Explicit request: the carton total is the number actually quoted to
+    a customer in bulk, so it must land on a clean 500-دينار figure
+    ("70,000") instead of an arbitrary exact-to-the-dinar one ("70,317").
+    Real sample: ZLUB76329, single=6667, pack=18 -- single*18=120006, a
+    pack-total printed in the dozen-price slot (same pattern as
+    PackTotalDisguisedAsDozenTests above).
+    """
+
+    PRODUCT = ProductData(
+        model_code="ZLUB76329", sizes="32/37", pack_quantity_raw="18",
+        dozen_price=120006, single_price=6667,
+    )
+
+    def test_carton_total_lands_on_a_clean_500_denar_figure(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        # 120006 + 2000 = 122006 -> nearest 500 = 122000.
+        self.assertEqual(prices.carton_total, 122000)
+        self.assertEqual(prices.carton_total % 500, 0)
+
+    def test_single_price_stays_within_half_pack_of_rounded_total(self):
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000"), PricingMode.CARTON)
+        drift = abs(prices.new_single_price * prices.total_pieces - prices.carton_total)
+        self.assertLessEqual(drift, prices.total_pieces)
+
+    def test_dozen_mode_headline_figure_is_not_rounded(self):
+        # Only the carton total gets the clean-number treatment -- DOZEN
+        # mode's headline figure (the dozen price) is untouched.
+        prices = compute_prices(self.PRODUCT, parse_markup("+2000 درزن"), PricingMode.DOZEN)
+        self.assertEqual(prices.new_dozen_price, 82004)
 
 
 if __name__ == "__main__":
