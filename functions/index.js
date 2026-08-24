@@ -6,3 +6,4 @@ exports.fbOAuthCallback = require("./fbOAuthCallback").fbOAuthCallback;
 exports.reportAutopostResult = require("./claimAutopostJob").reportAutopostResult;
 exports.checkRepPin = require("./checkRepPin").checkRepPin;
 exports.updateOrderStatus = require("./updateOrderStatus").updateOrderStatus;
+exports.getOrdersSummary = require("./assistantQuery").getOrdersSummary;
