@@ -1,0 +1,16 @@
+[Unit]
+Description=Range Harvester Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading_bot
+EnvironmentFile=/home/ubuntu/trading_bot/.env
+ExecStart=/home/ubuntu/trading_bot/venv/bin/python /home/ubuntu/trading_bot/range_harvester.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+metaapi-cloud-sdk
+python-telegram-bot
+anthropic>=1.0
+httpx
