@@ -32,6 +32,10 @@ WEEKEND_SAVER = os.environ.get("WEEKEND_SAVER", "1") not in ("0", "false", "no")
 WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # Friday
 WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
+ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # sleep when idle too
+IDLE_SLEEP_MINUTES = int(os.environ.get("IDLE_SLEEP_MINUTES", "20"))
+WAKE_GRACE_MINUTES = int(os.environ.get("WAKE_GRACE_MINUTES", "30"))
+WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
 SETTABLE_KEYS = {
     "META_API_TOKEN": "توكن MetaApi",
     "ANTHROPIC_API_KEY": "مفتاح Claude",
@@ -62,6 +66,12 @@ except Exception as _e:  # the trading engine must keep running even if intel is
     intel = None
     log.warning(f"intel module unavailable: {_e}")
 
+try:
+    import datafeed  # free prices, so analysis never keeps a billed account deployed
+except Exception as _e:
+    datafeed = None
+    log.warning(f"datafeed module unavailable: {_e}")
+
 bot = None
 api_instance = None
 account_instance = None
@@ -75,6 +85,8 @@ total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
 saver_sleeping = False
+slept_at = None
+wake_until = 0.0
 analysis_lock = asyncio.Lock()
 
 
@@ -196,7 +208,7 @@ async def handle_setkey(text, chat_id, message_id):
 
 def self_update():
     """Download the newest code, compile it, swap it in. Returns an error string or None."""
-    files = ("range_harvester.py", "intel.py", "requirements.txt")
+    files = ("range_harvester.py", "intel.py", "datafeed.py", "requirements.txt")
     tmpdir = os.path.join(BASE_DIR, ".update")
     os.makedirs(tmpdir, exist_ok=True)
     for name in files:
@@ -209,7 +221,8 @@ def self_update():
                          capture_output=True, text=True, timeout=900)
     if pip.returncode != 0:
         log.warning(f"pip update failed: {pip.stderr[-300:]}")
-    comp = subprocess.run([py, "-m", "py_compile", os.path.join(tmpdir, "range_harvester.py"), os.path.join(tmpdir, "intel.py")],
+    comp = subprocess.run([py, "-m", "py_compile", os.path.join(tmpdir, "range_harvester.py"), os.path.join(tmpdir, "intel.py"),
+                           os.path.join(tmpdir, "datafeed.py")],
                           capture_output=True, text=True, timeout=120)
     if comp.returncode != 0:
         return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
@@ -273,11 +286,19 @@ async def send_long(text: str, markup=None):
 
 
 async def fetch_candles(symbol, timeframe, limit=200):
-    if not account_instance:
-        raise RuntimeError("MetaApi account not ready")
-    return await asyncio.wait_for(
-        account_instance.get_historical_candles(symbol=symbol, timeframe=timeframe, limit=limit), timeout=25.0
-    )
+    """Broker candles when the account is already awake, free candles otherwise.
+    Analysis must never be a reason to keep a billed account deployed."""
+    if account_instance and not saver_sleeping:
+        try:
+            candles = await asyncio.wait_for(
+                account_instance.get_historical_candles(symbol=symbol, timeframe=timeframe, limit=limit), timeout=25.0)
+            if candles:
+                return candles
+        except Exception as e:
+            log.warning(f"broker candles failed ({symbol} {timeframe}), using free feed: {e}")
+    if datafeed is None:
+        raise RuntimeError("no candle source available")
+    return await datafeed.get_candles(symbol, timeframe, limit)
 
 
 def market_closed(now=None):
@@ -313,7 +334,16 @@ def save_saver_state(state):
 def savings_line():
     st = load_saver_state()
     h = st.get("saved_hours", 0.0)
-    return f"💰 وفّرنا `{round(h)}` ساعة تشغيل MetaApi ≈ `{round(h * METAAPI_HOURLY_USD, 2)}$` منذ {st.get('since','')}"
+    line = f"💰 وفّرنا `{round(h)}` ساعة تشغيل MetaApi ≈ `{round(h * METAAPI_HOURLY_USD, 2)}$` منذ {st.get('since','')}"
+    since = st.get("since", "")
+    try:
+        days = max((datetime.now(timezone.utc) - datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)).days, 1)
+        billed = max(days * 24 - h, 0)
+        line += (f"\n📉 الكلفة الفعلية ≈ `{round(billed * METAAPI_HOURLY_USD, 2)}$` بدل "
+                 f"`{round(days * 24 * METAAPI_HOURLY_USD, 2)}$` — أي `{round(h / (days * 24) * 100)}%` توفير")
+    except Exception:
+        pass
+    return line
 
 
 async def our_positions_open():
@@ -327,45 +357,113 @@ async def our_positions_open():
         return True  # unknown state -> stay awake, never risk an unwatched position
 
 
-async def weekend_saver():
-    """Undeploy the MetaApi account while the market is closed, redeploy before it opens."""
+async def work_pending():
+    """Is there anything that genuinely requires a live broker connection?
+    An armed anchor or an open position: yes. Idle watching: no — free data covers that."""
+    if buy_anchor is not None or sell_anchor is not None:
+        return True
+    return await our_positions_open()
+
+
+async def wake_for_execution(reason="أمر تنفيذ"):
+    """Bring the billed account back up on demand, and wait until it can actually trade."""
+    global saver_sleeping, wake_until
+    wake_until = time.time() + WAKE_GRACE_MINUTES * 60
+    if connection:
+        return True
+    saver_sleeping = False
+    await notify(f"⚡ *{reason}:* أشغّل حساب MetaApi الآن...")
+    for _ in range(int(WAKE_TIMEOUT_SECS / 2)):
+        if connection:
+            return True
+        await asyncio.sleep(2)
+    await notify("⚠️ ما قدرت أشغّل الحساب خلال الوقت المتوقع. جرب مرة ثانية بعد لحظات.")
+    return False
+
+
+async def go_to_sleep(message):
+    global saver_sleeping, slept_at
+    acct = account_instance
+    if not acct:
+        return False
+    await teardown_connection()
+    try:
+        await asyncio.wait_for(acct.undeploy(), timeout=60.0)
+    except Exception as e:
+        log.warning(f"undeploy failed: {e}")
+        return False
+    saver_sleeping = True
+    slept_at = time.time()
+    await notify(message)
+    return True
+
+
+async def wake_up(message):
+    global saver_sleeping, slept_at
+    saver_sleeping = False  # ensure_connection redeploys on its next pass
+    if slept_at:
+        st = load_saver_state()
+        st["saved_hours"] = round(st.get("saved_hours", 0.0) + (time.time() - slept_at) / 3600, 2)
+        save_saver_state(st)
+        slept_at = None
+    if message:
+        await notify(message)
+
+
+async def cost_governor():
+    """Keep the MetaApi account deployed only while it is actually needed.
+
+    Deployed hours are the whole MetaApi bill, and the account is only needed to send
+    and watch orders. So: asleep on weekends, asleep while idle, awake the moment an
+    anchor is armed, a position is open, or a button asks to trade."""
     global saver_sleeping
     if not WEEKEND_SAVER:
-        log.info("weekend_saver disabled")
+        log.info("cost governor disabled")
         return
     warned_positions = False
-    slept_at = None
+    idle_since = None
+    last_calibration = 0.0
     while True:
         try:
             closed = market_closed()
-            if closed and not saver_sleeping and account_instance:
-                if await our_positions_open():
-                    if not warned_positions:
-                        warned_positions = True
-                        await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فما دخلت وضع التوفير. سكّرها إذا تريد توفير الكلفة.")
+            needed = await work_pending() or time.time() < wake_until
+
+            if not saver_sleeping and account_instance:
+                if closed and not await our_positions_open():
+                    idle_since = None
+                    await go_to_sleep("😴 *توفير العطلة:* السوق مغلق، أوقفت حساب MetaApi.\n"
+                                      "راح أرجّعه تلقائياً قبل الفتح.")
+                elif closed and not warned_positions:
+                    warned_positions = True
+                    await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فبقيت شغّال. سكّرها إذا تريد توفير الكلفة.")
+                elif not closed and ONDEMAND and not needed:
+                    idle_since = idle_since or time.time()
+                    if time.time() - idle_since >= IDLE_SLEEP_MINUTES * 60:
+                        idle_since = None
+                        await go_to_sleep(
+                            f"💤 *توفير الخمول:* ماكو ارتكاز مسلّح ولا صفقة مفتوحة منذ {IDLE_SLEEP_MINUTES} دقيقة، "
+                            "فأوقفت حساب MetaApi.\nالتحليل والأخبار مستمرة بالمصدر المجاني، وأي زر تداول يرجّعه بثواني.")
                 else:
+                    idle_since = None
                     warned_positions = False
-                    acct = account_instance
-                    await teardown_connection()
-                    try:
-                        await asyncio.wait_for(acct.undeploy(), timeout=60.0)
-                        saver_sleeping = True
-                        slept_at = time.time()
-                        await notify("😴 *وضع توفير العطلة:* السوق مغلق، أوقفت حساب MetaApi حتى لا تُحتسب كلفته.\n"
-                                     "سأعيده تلقائياً قبل فتح السوق.")
-                    except Exception as e:
-                        log.warning(f"undeploy failed: {e}")
-            elif not closed and saver_sleeping:
-                saver_sleeping = False  # ensure_connection redeploys on its next pass
-                if slept_at:
-                    st = load_saver_state()
-                    st["saved_hours"] = round(st.get("saved_hours", 0.0) + (time.time() - slept_at) / 3600, 2)
-                    save_saver_state(st)
-                    slept_at = None
-                await notify("🌅 *السوق فتح:* أعدت تشغيل الحساب والاتصال جارٍ.\n" + savings_line())
+
+            elif saver_sleeping and (needed or (not closed and not ONDEMAND)):
+                await wake_up("🌅 *رجعت أشتغل:* الحساب يشتغل والاتصال جارٍ.\n" + savings_line())
+
+            # While awake, learn the gap between the broker's quote and the free feed,
+            # so levels computed from free data stay in the broker's price frame.
+            if connection and datafeed and time.time() - last_calibration > 1800:
+                last_calibration = time.time()
+                try:
+                    p = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=5.0)
+                    mid = (p.get("bid", 0) + p.get("ask", 0)) / 2
+                    free = await datafeed.get_candles(SYMBOL, "15m", 40, apply_offset=False)
+                    datafeed.note_broker_price(SYMBOL, mid, free[-1]["close"])
+                except Exception as e:
+                    log.info(f"calibration skipped: {e}")
         except Exception as e:
-            log.warning(f"weekend_saver error: {e}")
-        await asyncio.sleep(60)
+            log.warning(f"cost_governor error: {e}")
+        await asyncio.sleep(30)
 
 
 def billing_hint(err_text):
@@ -569,8 +667,8 @@ async def run_analysis(query, label, producer):
     if intel is None:
         await safe_reply(query.edit_message_text, text="⚠️ وحدة التحليل غير مثبتة على السيرفر.", reply_markup=keyboard(), parse_mode="Markdown")
         return
-    if not account_instance:
-        await safe_reply(query.edit_message_text, text="⚠️ جاري الاتصال...", reply_markup=keyboard(), parse_mode="Markdown")
+    if not account_instance and datafeed is None:
+        await safe_reply(query.edit_message_text, text="⚠️ لا يوجد مصدر أسعار متاح.", reply_markup=keyboard(), parse_mode="Markdown")
         return
     if analysis_lock.locked():
         await safe_reply(query.edit_message_text, text="⏳ تحليل آخر قيد التنفيذ، انتظر لحظة.", reply_markup=keyboard(), parse_mode="Markdown")
@@ -600,14 +698,15 @@ async def handle_callback(query):
             bot_active = not bot_active
             txt = "تم **تشغيل النظام** 🟢" if bot_active else "تم **إيقاف النظام** 🔴"
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
-        elif data == "anchor_buy":
-            await set_new_buy_anchor(manual=True)
-        elif data == "anchor_sell":
-            await set_new_sell_anchor(manual=True)
-        elif data == "anchor_dual":
-            await set_new_buy_anchor(manual=True)
-            await asyncio.sleep(0.5)
-            await set_new_sell_anchor(manual=True)
+        elif data in ("anchor_buy", "anchor_sell", "anchor_dual"):
+            if not await wake_for_execution("طلب ارتكاز"):
+                return
+            if data in ("anchor_buy", "anchor_dual"):
+                await set_new_buy_anchor(manual=True)
+            if data == "anchor_dual":
+                await asyncio.sleep(0.5)
+            if data in ("anchor_sell", "anchor_dual"):
+                await set_new_sell_anchor(manual=True)
         elif data == "status":
             if connection:
                 try:
@@ -637,6 +736,13 @@ async def handle_callback(query):
                     txt = f"🥇 **الذهب:** Ask: `{p.get('ask')}` | Bid: `{p.get('bid')}`"
                 except Exception:
                     txt = "🥇 جاري السعر..."
+            elif datafeed:
+                try:
+                    p = await datafeed.get_price(SYMBOL)
+                    txt = (f"🥇 **الذهب (تقريبي):** Ask: `{p['ask']}` | Bid: `{p['bid']}`\n"
+                           f"{datafeed.calibration_line()}\nالحساب المدفوع نائم — اضغط ارتكاز إذا تريد تنفيذ.")
+                except Exception as e:
+                    txt = f"⚠️ تعذّر جلب السعر المجاني: `{e}`"
             else:
                 txt = "⚠️ جاري الاتصال..."
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
@@ -647,6 +753,8 @@ async def handle_callback(query):
         elif data == "daily_trade":
             await run_analysis(query, "إعداد صفقة اليوم", lambda: intel.daily_trade_message(fetch_candles, SYMBOL))
         elif data == "close_all":
+            if not connection and saver_sleeping:
+                await wake_for_execution("طلب إغلاق الصفقات")
             if connection:
                 try:
                     all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
@@ -750,7 +858,7 @@ async def main():
         supervise("connection", ensure_connection),
         supervise("range_engine", range_engine),
         supervise("telegram_listener", telegram_listener),
-        supervise("weekend_saver", weekend_saver),
+        supervise("cost_governor", cost_governor),
     ]
     if intel is not None:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))

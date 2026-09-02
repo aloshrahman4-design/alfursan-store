@@ -12,15 +12,17 @@ cd "$DIR"
 echo "==> downloading from branch: $BRANCH"
 curl -fsSL "$RAW/range_harvester.py" -o range_harvester.py.new
 curl -fsSL "$RAW/intel.py" -o intel.py.new
+curl -fsSL "$RAW/datafeed.py" -o datafeed.py.new
 curl -fsSL "$RAW/requirements.txt" -o requirements.txt
 
 echo "==> installing/updating python packages"
 ./venv/bin/pip install -q --upgrade -r requirements.txt
 
 echo "==> compile check"
-./venv/bin/python -m py_compile range_harvester.py.new intel.py.new
+./venv/bin/python -m py_compile range_harvester.py.new intel.py.new datafeed.py.new
 mv range_harvester.py.new range_harvester.py
 mv intel.py.new intel.py
+mv datafeed.py.new datafeed.py
 echo "COMPILE_OK"
 
 echo "==> restarting service"

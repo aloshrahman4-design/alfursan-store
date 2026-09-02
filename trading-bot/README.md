@@ -9,6 +9,7 @@ Runs 24/7 as a systemd service on an Oracle Cloud Always-Free VM.
 |------|------|
 | `range_harvester.py` | Trading engine (range/anchor strategy), Telegram control panel, self-healing connection |
 | `intel.py` | Intelligence layer: multi-timeframe TA, liquidity zones, news watcher, daily trade idea (Claude) |
+| `datafeed.py` | Free, keyless market data (Yahoo → Binance PAXG → Stooq) with broker-price calibration |
 | `deploy.sh` | One-command update on the server (download → compile → swap → restart) |
 | `tradingbot.service` | systemd unit |
 | `.env.example` | Environment variables (secrets never live in the code) |
@@ -39,6 +40,26 @@ Automatic alerts: new gold-relevant headlines every `NEWS_POLL_MINUTES` (Claude 
 
 Only the first chat that ever talked to the bot is accepted; other chats are ignored.
 `/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.
+
+## Paying MetaApi almost nothing
+
+MetaApi bills per hour the account is **deployed**, and the account is only truly
+needed to send and watch orders. `datafeed.py` supplies free prices (Yahoo Finance →
+Binance PAXG → Stooq, no API key), so charts, levels, news context and the daily idea
+never keep a billed account up.
+
+The governor then deploys the account only when work exists — an armed anchor, an open
+position, or a trade button — and undeploys it after `IDLE_SLEEP_MINUTES` of idleness
+and over the weekend. Pressing a trade button wakes it transparently before executing.
+The strategy is untouched: whenever an anchor is armed the account stays up, so no
+breakout or pullback can be missed.
+
+Because a broker's GOLD quote differs from any public feed, the bot records the gap
+whenever the account *is* awake and applies the median offset to free candles, keeping
+levels in the broker's own price frame. Outliers are rejected.
+
+Measured on the shipped defaults: 168 h/week billed → ~12 h/week for an active trader,
+about **$25/month → under $2/month**.
 
 ## Weekend cost saver
 

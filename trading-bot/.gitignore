@@ -3,6 +3,7 @@ __pycache__/
 .env
 intel_state.json
 saver_state.json
+datafeed_state.json
 .env.bak
 .update/
 chat_id.txt
