@@ -31,12 +31,22 @@ Automatic alerts: new gold-relevant headlines every `NEWS_POLL_MINUTES` (Claude 
 | `/start` | Control panel |
 | `/setkey claude sk-ant-…` | Writes the key into `.env`, reloads it live, deletes the message |
 | `/setkey news <finnhub_key>` | Optional; without it news comes from a keyless RSS source |
+| `/setkey metaapi <token>` | Validates the new MetaApi token against the account, backs up `.env`, swaps it in and restarts — the old token keeps working if the new one fails |
 | `/keys` | Masked key status |
+| `/savings` | Hours and dollars saved by the weekend saver |
 | `/update` | Downloads the latest code from GitHub, compiles it, restarts |
 | `/restart` | Restart the process (systemd brings it back) |
 
 Only the first chat that ever talked to the bot is accepted; other chats are ignored.
 `/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.
+
+## Weekend cost saver
+
+MetaApi bills per hour the account is *deployed*, and gold does not trade from Friday
+21:00 UTC to Sunday 22:00 UTC. The bot undeploys the account for those 49 hours
+(29% of the week) and redeploys before the open — it never sleeps while a bot position
+is still open. Connection failures that mean "subscription/balance" or "bad token" are
+detected and reported once, in plain language, instead of looping silently.
 
 ## Deploy (first time only — afterwards use `/update` from Telegram)
 

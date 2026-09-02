@@ -1,10 +1,13 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
+
 from metaapi_cloud_sdk import MetaApi
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
@@ -24,7 +27,13 @@ CHAT_ID_PATH = os.path.join(BASE_DIR, "chat_id.txt")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "claude/range-harvester-stability-fix-kfz55i")
 RAW_BASE = f"https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/{UPDATE_BRANCH}/trading-bot"
+SAVER_STATE_PATH = os.path.join(BASE_DIR, "saver_state.json")
+WEEKEND_SAVER = os.environ.get("WEEKEND_SAVER", "1") not in ("0", "false", "no")
+WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # Friday
+WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
+METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
 SETTABLE_KEYS = {
+    "META_API_TOKEN": "توكن MetaApi",
     "ANTHROPIC_API_KEY": "مفتاح Claude",
     "FINNHUB_API_KEY": "مفتاح الأخبار",
     "CLAUDE_MODEL": "نموذج Claude",
@@ -34,6 +43,7 @@ SETTABLE_KEYS = {
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
 }
 KEY_ALIASES = {
+    "metaapi": "META_API_TOKEN", "token": "META_API_TOKEN", "meta": "META_API_TOKEN",
     "claude": "ANTHROPIC_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
     "news": "FINNHUB_API_KEY", "finnhub": "FINNHUB_API_KEY",
     "model": "CLAUDE_MODEL", "hour": "DAILY_TRADE_HOUR_UTC",
@@ -64,6 +74,7 @@ peak_buy_profit, peak_sell_profit = 0.0, 0.0
 total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
+saver_sleeping = False
 analysis_lock = asyncio.Lock()
 
 
@@ -117,6 +128,21 @@ def write_env_value(key, value):
     os.environ[key] = value
 
 
+async def validate_metaapi_token(candidate):
+    """Prove a new MetaApi token really opens this account before it replaces the old one."""
+    probe = MetaApi(token=candidate)
+    try:
+        acct = await asyncio.wait_for(probe.metatrader_account_api.get_account(ACCOUNT_ID), timeout=30.0)
+        return None, getattr(acct, "state", "?")
+    except Exception as e:
+        return str(e), None
+    finally:
+        try:
+            await asyncio.wait_for(probe.close(), timeout=5.0)
+        except Exception:
+            pass
+
+
 async def handle_setkey(text, chat_id, message_id):
     parts = text.split(maxsplit=2)
     if len(parts) < 3:
@@ -130,6 +156,32 @@ async def handle_setkey(text, chat_id, message_id):
     if not value or "\n" in value:
         await send_long("القيمة غير صالحة.")
         return
+
+    async def forget_message():
+        try:  # delete the message so the secret does not linger in the chat history
+            await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=message_id), timeout=5.0)
+        except Exception as e:
+            log.warning(f"could not delete key message: {e}")
+
+    if key == "META_API_TOKEN":
+        await send_long("⏳ أفحص التوكن الجديد قبل ما أستبدل القديم...")
+        err, state = await validate_metaapi_token(value)
+        if err:
+            await forget_message()
+            await send_long(f"❌ التوكن الجديد ما اشتغل، خليت القديم مثل ما هو.\n`{err[:300]}`", markup=keyboard())
+            return
+        try:
+            shutil.copy2(ENV_PATH, ENV_PATH + ".bak")
+        except Exception as e:
+            log.warning(f"env backup failed: {e}")
+        write_env_value(key, value)
+        await forget_message()
+        await send_long(
+            f"✅ التوكن الجديد صحيح (حالة الحساب: `{state}`) وتم حفظه.\n"
+            "♻️ أعيد التشغيل الآن بالتوكن الجديد.\n\n"
+            "🔒 بعد ما يرجع البوت ويكتب لك ✅ تم الاتصال، امسح التوكن القديم من لوحة MetaApi.")
+        os._exit(0)
+
     try:
         write_env_value(key, value)
         if intel is not None:
@@ -137,10 +189,7 @@ async def handle_setkey(text, chat_id, message_id):
     except Exception as e:
         await send_long(f"⚠️ فشل الحفظ: `{e}`")
         return
-    try:  # delete the message so the secret does not linger in the chat history
-        await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=message_id), timeout=5.0)
-    except Exception as e:
-        log.warning(f"could not delete key message: {e}")
+    await forget_message()
     status = intel.keys_status() if intel is not None else ""
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
 
@@ -173,6 +222,8 @@ HELP_TEXT = (
     "🤖 *أوامر البوت*\n"
     "• /start — لوحة التحكم\n"
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
+    "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
+    "• /savings — كم وفّرنا من كلفة MetaApi\n"
     "• `/setkey news <key>` — مفتاح Finnhub (اختياري)\n"
     "• /keys — حالة المفاتيح\n"
     "• /update — سحب آخر نسخة من GitHub وإعادة التشغيل\n"
@@ -229,6 +280,107 @@ async def fetch_candles(symbol, timeframe, limit=200):
     )
 
 
+def market_closed(now=None):
+    """Gold is shut from Friday close to Sunday open. MetaApi bills per deployed hour,
+    so those ~49 hours are pure waste unless we undeploy the account."""
+    now = now or datetime.now(timezone.utc)
+    wd, hour = now.weekday(), now.hour  # Mon=0 … Fri=4, Sat=5, Sun=6
+    if wd == 4 and hour >= WEEKEND_CLOSE_HOUR_UTC:
+        return True
+    if wd == 5:
+        return True
+    if wd == 6 and hour < WEEKEND_OPEN_HOUR_UTC:
+        return True
+    return False
+
+
+def load_saver_state():
+    try:
+        with open(SAVER_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"saved_hours": 0.0, "since": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+
+
+def save_saver_state(state):
+    try:
+        with open(SAVER_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.warning(f"saver state save failed: {e}")
+
+
+def savings_line():
+    st = load_saver_state()
+    h = st.get("saved_hours", 0.0)
+    return f"💰 وفّرنا `{round(h)}` ساعة تشغيل MetaApi ≈ `{round(h * METAAPI_HOURLY_USD, 2)}$` منذ {st.get('since','')}"
+
+
+async def our_positions_open():
+    if not connection:
+        return False
+    try:
+        pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
+        return any(p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL) for p in pos)
+    except Exception as e:
+        log.warning(f"position check before sleeping failed: {e}")
+        return True  # unknown state -> stay awake, never risk an unwatched position
+
+
+async def weekend_saver():
+    """Undeploy the MetaApi account while the market is closed, redeploy before it opens."""
+    global saver_sleeping
+    if not WEEKEND_SAVER:
+        log.info("weekend_saver disabled")
+        return
+    warned_positions = False
+    slept_at = None
+    while True:
+        try:
+            closed = market_closed()
+            if closed and not saver_sleeping and account_instance:
+                if await our_positions_open():
+                    if not warned_positions:
+                        warned_positions = True
+                        await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فما دخلت وضع التوفير. سكّرها إذا تريد توفير الكلفة.")
+                else:
+                    warned_positions = False
+                    acct = account_instance
+                    await teardown_connection()
+                    try:
+                        await asyncio.wait_for(acct.undeploy(), timeout=60.0)
+                        saver_sleeping = True
+                        slept_at = time.time()
+                        await notify("😴 *وضع توفير العطلة:* السوق مغلق، أوقفت حساب MetaApi حتى لا تُحتسب كلفته.\n"
+                                     "سأعيده تلقائياً قبل فتح السوق.")
+                    except Exception as e:
+                        log.warning(f"undeploy failed: {e}")
+            elif not closed and saver_sleeping:
+                saver_sleeping = False  # ensure_connection redeploys on its next pass
+                if slept_at:
+                    st = load_saver_state()
+                    st["saved_hours"] = round(st.get("saved_hours", 0.0) + (time.time() - slept_at) / 3600, 2)
+                    save_saver_state(st)
+                    slept_at = None
+                await notify("🌅 *السوق فتح:* أعدت تشغيل الحساب والاتصال جارٍ.\n" + savings_line())
+        except Exception as e:
+            log.warning(f"weekend_saver error: {e}")
+        await asyncio.sleep(60)
+
+
+def billing_hint(err_text):
+    """Turn an opaque MetaApi failure into the one sentence that tells the user what to do."""
+    t = err_text.lower()
+    if any(k in t for k in ("payment", "402", "insufficient", "balance", "subscription", "billing", "expired", "quota")):
+        return ("💳 *مشكلة اشتراك/رصيد MetaApi.* الحساب موقوف من طرفهم.\n"
+                "افتح app.metaapi.cloud → Billing واشحن الرصيد أو فعّل الشحن التلقائي (Auto top-up)، "
+                "وراح يرجع البوت لحاله بدون أي أمر منك.")
+    if any(k in t for k in ("unauthorized", "401", "invalid token", "forbidden", "403")):
+        return ("🔑 *التوكن مرفوض.* أرسل لي التوكن الجديد بالأمر:\n"
+                "`/setkey metaapi <التوكن>`\nراح أفحصه وأشغّل نفسي عليه.")
+    return None
+
+
 async def teardown_connection():
     global connection, account_instance, api_instance
     old_conn = connection
@@ -244,8 +396,12 @@ async def teardown_connection():
 
 async def ensure_connection():
     global connection, account_instance, api_instance, last_price_ok
+    fail_streak, hinted = 0, None
     while True:
         try:
+            if saver_sleeping:
+                await asyncio.sleep(5)
+                continue
             if connection:
                 if last_price_ok and (time.time() - last_price_ok) > CONNECTION_STALE_SECS:
                     log.warning("No successful price fetch recently -> connection considered stale, forcing reconnect")
@@ -269,12 +425,19 @@ async def ensure_connection():
                 pass
             connection = conn
             last_price_ok = time.time()
+            fail_streak, hinted = 0, None
             log.info("Connected MetaApi OK!")
             await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**")
         except Exception as e:
             log.error(f"Connection error: {e}", exc_info=True)
+            fail_streak += 1
+            hint = billing_hint(str(e))
+            # Say it once, only after retries have clearly failed: this is a wall, not a blip.
+            if hint and fail_streak >= 3 and hint != hinted:
+                hinted = hint
+                await notify(hint)
             await teardown_connection()
-            await asyncio.sleep(5)
+            await asyncio.sleep(min(5 * fail_streak, 60))
 
 
 async def safe_close_position(pos_id: str):
@@ -457,9 +620,13 @@ async def handle_callback(query):
                     b_txt = f"مفتوحة ({round(b_prof,2)}$)" if b_pos else ("انتظار" if buy_waiting else "جاهز")
                     s_txt = f"مفتوحة ({round(s_prof,2)}$)" if s_pos else ("انتظار" if sell_waiting else "جاهز")
                     bal, curr, eq = info.get("balance"), info.get("currency"), info.get("equity")
-                    txt = f"📊 **الحالة:**\n• الرصيد: `{bal} {curr}` | السيولة: `{eq}`\n• شراء: `{buy_anchor}` ({b_txt})\n• بيع: `{sell_anchor}` ({s_txt})\n• الأرباح: `{round(total_profit,2)}$`"
+                    txt = (f"📊 **الحالة:**\n• الرصيد: `{bal} {curr}` | السيولة: `{eq}`\n"
+                           f"• شراء: `{buy_anchor}` ({b_txt})\n• بيع: `{sell_anchor}` ({s_txt})\n"
+                           f"• الأرباح: `{round(total_profit,2)}$`\n{savings_line()}")
                 except Exception as e:
                     txt = f"⚠️ خطأ: `{e}`"
+            elif saver_sleeping:
+                txt = f"😴 **وضع توفير العطلة** — السوق مغلق وحساب MetaApi موقوف مؤقتاً.\n{savings_line()}"
             else:
                 txt = "⚠️ جاري الاتصال..."
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
@@ -510,6 +677,9 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/setkey"):
                 await handle_setkey(text, cid, update.message.message_id)
+            elif text.startswith("/savings"):
+                state = "😴 نائم الآن (توفير)" if saver_sleeping else ("🟢 السوق مفتوح" if not market_closed() else "⏳ بانتظار إغلاق الصفقات")
+                await send_long(f"{savings_line()}\n• الحالة: {state}", markup=keyboard())
             elif text.startswith("/keys"):
                 await send_long(intel.keys_status() if intel is not None else "⚠️ وحدة التحليل غير مثبتة.", markup=keyboard())
             elif text.startswith("/update"):
@@ -567,6 +737,7 @@ async def main():
         await bot.set_my_commands([
             BotCommand("start", "لوحة التحكم"),
             BotCommand("keys", "حالة المفاتيح"),
+            BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
             BotCommand("setkey", "حفظ مفتاح: /setkey claude sk-ant-..."),
             BotCommand("update", "تحديث الكود من GitHub"),
             BotCommand("restart", "إعادة تشغيل البوت"),
@@ -579,6 +750,7 @@ async def main():
         supervise("connection", ensure_connection),
         supervise("range_engine", range_engine),
         supervise("telegram_listener", telegram_listener),
+        supervise("weekend_saver", weekend_saver),
     ]
     if intel is not None:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))
