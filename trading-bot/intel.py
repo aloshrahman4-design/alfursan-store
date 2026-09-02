@@ -24,8 +24,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -261,10 +263,69 @@ def _save_state(state):
         log.warning(f"state save failed: {e}")
 
 
+GOOGLE_NEWS_FEEDS = (
+    "https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=federal+reserve+OR+inflation+OR+dollar+when:1d&hl=en-US&gl=US&ceid=US:en",
+)
+
+_RSS_ITEM = re.compile(r"<item>(.*?)</item>", re.S)
+_RSS_TITLE = re.compile(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", re.S)
+_RSS_DATE = re.compile(r"<pubDate>(.*?)</pubDate>", re.S)
+_RSS_LINK = re.compile(r"<link>(.*?)</link>", re.S)
+_RSS_SOURCE = re.compile(r"<source[^>]*>(.*?)</source>", re.S)
+
+
+def _unescape(text):
+    for a, b in (("&amp;", "&"), ("&quot;", '"'), ("&#39;", "'"), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " ")):
+        text = text.replace(a, b)
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+async def fetch_news_free(limit=40):
+    """Headlines with no API key at all (Google News RSS). Fallback when Finnhub is absent."""
+    items = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0 (compatible; RangeHarvester/1.0)"}) as client:
+        for url in GOOGLE_NEWS_FEEDS:
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                for raw in _RSS_ITEM.findall(r.text)[:40]:
+                    tm = _RSS_TITLE.search(raw)
+                    if not tm:
+                        continue
+                    headline = _unescape(tm.group(1))
+                    score = relevance(headline)
+                    if score < 2:
+                        continue
+                    ts = 0
+                    dm = _RSS_DATE.search(raw)
+                    if dm:
+                        try:
+                            ts = int(parsedate_to_datetime(dm.group(1).strip()).timestamp())
+                        except Exception:
+                            ts = 0
+                    sm = _RSS_SOURCE.search(raw)
+                    lm = _RSS_LINK.search(raw)
+                    items.append({
+                        "id": None,
+                        "ts": ts or int(time.time()),
+                        "headline": headline,
+                        "summary": "",
+                        "source": _unescape(sm.group(1)) if sm else "Google News",
+                        "url": lm.group(1).strip() if lm else "",
+                        "score": score,
+                    })
+            except Exception as e:
+                log.warning(f"free news feed failed: {e}")
+    uniq = {it["headline"]: it for it in items}
+    return sorted(uniq.values(), key=lambda x: -x["ts"])[:limit]
+
+
 async def fetch_news(limit=40):
     """Gold-relevant headlines from Finnhub (forex + general), newest first."""
     if not FINNHUB_API_KEY:
-        return []
+        return await fetch_news_free(limit)
     items = []
     async with httpx.AsyncClient(timeout=15) as client:
         for cat in ("forex", "general"):
@@ -285,6 +346,8 @@ async def fetch_news(limit=40):
                         })
             except Exception as e:
                 log.warning(f"finnhub {cat} failed: {e}")
+    if not items:
+        return await fetch_news_free(limit)
     uniq = {}
     for it in items:
         uniq[it["headline"]] = it
@@ -314,6 +377,27 @@ SYSTEM_PROMPT = (
 )
 
 _client = None
+
+
+def refresh_keys():
+    """Re-read keys from the environment (used after /setkey) and drop the cached client."""
+    global ANTHROPIC_API_KEY, FINNHUB_API_KEY, CLAUDE_MODEL, _client
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5").strip()
+    _client = None
+    return {"claude": claude_ready(), "news": True}
+
+
+def keys_status():
+    def mask(v):
+        return f"{v[:10]}…{v[-4:]}" if len(v) > 16 else ("مضبوط" if v else "غير مضبوط")
+    return (
+        f"🔑 *حالة المفاتيح*\n"
+        f"• Claude: {'✅ ' + mask(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else '❌ غير مضبوط'}\n"
+        f"• Finnhub: {'✅ ' + mask(FINNHUB_API_KEY) if FINNHUB_API_KEY else '⚪ غير مضبوط (الأخبار تشتغل من المصدر المجاني)'}\n"
+        f"• النموذج: `{CLAUDE_MODEL}`"
+    )
 
 
 def claude_ready():
@@ -437,9 +521,6 @@ def trade_to_arabic(t):
 
 async def news_watcher(get_candles, symbol, notify):
     """Poll Finnhub; when new gold-relevant headlines appear, alert + Claude impact."""
-    if not FINNHUB_API_KEY:
-        log.info("news_watcher disabled: FINNHUB_API_KEY missing")
-        return
     state = _load_state()
     first_run = True
     while True:

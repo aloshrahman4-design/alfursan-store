@@ -24,9 +24,16 @@ mv intel.py.new intel.py
 echo "COMPILE_OK"
 
 echo "==> restarting service"
-sudo systemctl restart tradingbot
-sleep 5
-sudo systemctl status tradingbot --no-pager | head -6
+# Passwordless sudo is the normal path; if it is not available, killing the process is
+# enough because the unit has Restart=always, so systemd brings it straight back.
+if sudo -n systemctl restart tradingbot 2>/dev/null; then
+  echo "restarted via systemctl"
+else
+  pkill -f range_harvester.py || true
+  echo "restarted by exiting the process (systemd Restart=always)"
+fi
+sleep 6
+systemctl status tradingbot --no-pager 2>/dev/null | head -6 || pgrep -af range_harvester.py || true
 echo "==> recent log"
-journalctl -u tradingbot -n 5 --no-pager | grep -i "intel enabled\|booting\|error" || true
+journalctl -u tradingbot -n 8 --no-pager 2>/dev/null | grep -i "intel enabled\|booting\|error" || true
 echo "DEPLOY_DONE"

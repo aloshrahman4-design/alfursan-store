@@ -1,9 +1,12 @@
 import asyncio
 import logging
-import time
 import os
+import shutil
+import subprocess
+import sys
+import time
 from metaapi_cloud_sdk import MetaApi
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
 
 META_API_TOKEN = os.environ["META_API_TOKEN"]
@@ -18,6 +21,24 @@ CONNECTION_STALE_SECS = 25  # if no successful price fetch in this window, force
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "bot.log")
 CHAT_ID_PATH = os.path.join(BASE_DIR, "chat_id.txt")
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "claude/range-harvester-stability-fix-kfz55i")
+RAW_BASE = f"https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/{UPDATE_BRANCH}/trading-bot"
+SETTABLE_KEYS = {
+    "ANTHROPIC_API_KEY": "مفتاح Claude",
+    "FINNHUB_API_KEY": "مفتاح الأخبار",
+    "CLAUDE_MODEL": "نموذج Claude",
+    "NEWS_POLL_MINUTES": "دقائق فحص الأخبار",
+    "NEWS_MAX_ANALYSES_DAY": "حد تحليلات الأخبار يومياً",
+    "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
+    "EXTRA_SYMBOLS": "الأسواق المرتبطة",
+}
+KEY_ALIASES = {
+    "claude": "ANTHROPIC_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
+    "news": "FINNHUB_API_KEY", "finnhub": "FINNHUB_API_KEY",
+    "model": "CLAUDE_MODEL", "hour": "DAILY_TRADE_HOUR_UTC",
+    "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
+}
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
@@ -68,6 +89,96 @@ def remember_chat_id(cid):
                 f.write(str(cid))
         except Exception as e:
             log.warning(f"could not persist chat id: {e}")
+
+
+def is_owner(cid):
+    """The first chat that ever talked to the bot owns it; later chats are ignored."""
+    return chat_id_active is None or cid == chat_id_active
+
+
+def write_env_value(key, value):
+    """Insert or replace KEY=VALUE in .env (systemd EnvironmentFile) and in this process."""
+    lines, replaced = [], False
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH) as f:
+            for line in f.read().splitlines():
+                if line.split("=", 1)[0].strip() == key:
+                    lines.append(f"{key}={value}")
+                    replaced = True
+                else:
+                    lines.append(line)
+    if not replaced:
+        lines.append(f"{key}={value}")
+    tmp = ENV_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+    os.replace(tmp, ENV_PATH)
+    os.chmod(ENV_PATH, 0o600)
+    os.environ[key] = value
+
+
+async def handle_setkey(text, chat_id, message_id):
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3:
+        await send_long("الصيغة: `/setkey claude sk-ant-...`\nأو: `/setkey news <finnhub_key>`")
+        return
+    name, value = parts[1].strip().lower(), parts[2].strip()
+    key = KEY_ALIASES.get(name, name.upper())
+    if key not in SETTABLE_KEYS:
+        await send_long("مفتاح غير معروف. المسموح: " + "، ".join(sorted(KEY_ALIASES)))
+        return
+    if not value or "\n" in value:
+        await send_long("القيمة غير صالحة.")
+        return
+    try:
+        write_env_value(key, value)
+        if intel is not None:
+            intel.refresh_keys()
+    except Exception as e:
+        await send_long(f"⚠️ فشل الحفظ: `{e}`")
+        return
+    try:  # delete the message so the secret does not linger in the chat history
+        await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=message_id), timeout=5.0)
+    except Exception as e:
+        log.warning(f"could not delete key message: {e}")
+    status = intel.keys_status() if intel is not None else ""
+    await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
+
+
+def self_update():
+    """Download the newest code, compile it, swap it in. Returns an error string or None."""
+    files = ("range_harvester.py", "intel.py", "requirements.txt")
+    tmpdir = os.path.join(BASE_DIR, ".update")
+    os.makedirs(tmpdir, exist_ok=True)
+    for name in files:
+        got = subprocess.run(["curl", "-fsSL", f"{RAW_BASE}/{name}", "-o", os.path.join(tmpdir, name)],
+                             capture_output=True, text=True, timeout=60)
+        if got.returncode != 0:
+            return f"⚠️ فشل التحميل ({name}): `{got.stderr.strip()[:200]}`"
+    py = sys.executable
+    pip = subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "-r", os.path.join(tmpdir, "requirements.txt")],
+                         capture_output=True, text=True, timeout=900)
+    if pip.returncode != 0:
+        log.warning(f"pip update failed: {pip.stderr[-300:]}")
+    comp = subprocess.run([py, "-m", "py_compile", os.path.join(tmpdir, "range_harvester.py"), os.path.join(tmpdir, "intel.py")],
+                          capture_output=True, text=True, timeout=120)
+    if comp.returncode != 0:
+        return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
+    for name in files:
+        shutil.copy2(os.path.join(tmpdir, name), os.path.join(BASE_DIR, name))
+    return None
+
+
+HELP_TEXT = (
+    "🤖 *أوامر البوت*\n"
+    "• /start — لوحة التحكم\n"
+    "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
+    "• `/setkey news <key>` — مفتاح Finnhub (اختياري)\n"
+    "• /keys — حالة المفاتيح\n"
+    "• /update — سحب آخر نسخة من GitHub وإعادة التشغيل\n"
+    "• /restart — إعادة تشغيل البوت\n"
+    "• /help — هذه القائمة"
+)
 
 
 def keyboard():
@@ -314,6 +425,9 @@ async def run_analysis(query, label, producer):
 async def handle_callback(query):
     global bot_active, connection
     try:
+        if not is_owner(query.message.chat_id):
+            log.warning("ignoring callback from a non-owner chat")
+            return
         remember_chat_id(query.message.chat_id)
         await asyncio.wait_for(query.answer(), timeout=2.0)
         data = query.data
@@ -386,9 +500,31 @@ async def handle_callback(query):
 async def process_update(update):
     try:
         if update.message and update.message.text:
-            remember_chat_id(update.message.chat_id)
-            if update.message.text.startswith("/start"):
+            cid = update.message.chat_id
+            if not is_owner(cid):
+                log.warning(f"ignoring message from non-owner chat {cid}")
+                return
+            remember_chat_id(cid)
+            text = update.message.text.strip()
+            if text.startswith("/start"):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
+            elif text.startswith("/setkey"):
+                await handle_setkey(text, cid, update.message.message_id)
+            elif text.startswith("/keys"):
+                await send_long(intel.keys_status() if intel is not None else "⚠️ وحدة التحليل غير مثبتة.", markup=keyboard())
+            elif text.startswith("/update"):
+                await send_long("⏳ جاري سحب آخر نسخة من GitHub...")
+                err = await asyncio.to_thread(self_update)
+                if err:
+                    await send_long(err, markup=keyboard())
+                else:
+                    await send_long("✅ تم التحديث. جاري إعادة التشغيل...")
+                    os._exit(0)
+            elif text.startswith("/restart"):
+                await send_long("♻️ إعادة التشغيل...")
+                os._exit(0)
+            elif text.startswith("/help"):
+                await send_long(HELP_TEXT, markup=keyboard())
         elif update.callback_query:
             asyncio.create_task(handle_callback(update.callback_query))
     except Exception as e:
@@ -427,6 +563,17 @@ async def main():
     request = HTTPXRequest(connection_pool_size=8, connect_timeout=5.0, read_timeout=15.0, write_timeout=10.0, pool_timeout=5.0)
     bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
     await bot.initialize()
+    try:
+        await bot.set_my_commands([
+            BotCommand("start", "لوحة التحكم"),
+            BotCommand("keys", "حالة المفاتيح"),
+            BotCommand("setkey", "حفظ مفتاح: /setkey claude sk-ant-..."),
+            BotCommand("update", "تحديث الكود من GitHub"),
+            BotCommand("restart", "إعادة تشغيل البوت"),
+            BotCommand("help", "قائمة الأوامر"),
+        ])
+    except Exception as e:
+        log.warning(f"set_my_commands failed: {e}")
     log.info("Bot booting up (supervised mode)")
     tasks = [
         supervise("connection", ensure_connection),

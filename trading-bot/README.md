@@ -24,7 +24,21 @@ Runs 24/7 as a systemd service on an Oracle Cloud Always-Free VM.
 
 Automatic alerts: new gold-relevant headlines every `NEWS_POLL_MINUTES` (Claude analysis capped by `NEWS_MAX_ANALYSES_DAY`), daily trade idea at `DAILY_TRADE_HOUR_UTC`.
 
-## Deploy / update
+## Telegram commands
+
+| Command | Effect |
+|---------|--------|
+| `/start` | Control panel |
+| `/setkey claude sk-ant-…` | Writes the key into `.env`, reloads it live, deletes the message |
+| `/setkey news <finnhub_key>` | Optional; without it news comes from a keyless RSS source |
+| `/keys` | Masked key status |
+| `/update` | Downloads the latest code from GitHub, compiles it, restarts |
+| `/restart` | Restart the process (systemd brings it back) |
+
+Only the first chat that ever talked to the bot is accepted; other chats are ignored.
+`/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.
+
+## Deploy (first time only — afterwards use `/update` from Telegram)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/claude/range-harvester-stability-fix-kfz55i/trading-bot/deploy.sh | bash
@@ -32,8 +46,9 @@ curl -fsSL https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/
 
 ## Keys
 
+Preferred: send `/setkey claude sk-ant-…` to the bot. Manual alternative:
+
 ```bash
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/trading_bot/.env
-echo 'FINNHUB_API_KEY=...' >> ~/trading_bot/.env
 sudo systemctl restart tradingbot
 ```
