@@ -32,7 +32,9 @@ WEEKEND_SAVER = os.environ.get("WEEKEND_SAVER", "1") not in ("0", "false", "no")
 WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # Friday
 WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
-ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # sleep when idle too
+ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # allow idle sleeping at all
+DEFAULT_EXEC_MODE = os.environ.get("EXEC_MODE", "fast")                       # fast = instant orders, save = cheapest
+SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
 IDLE_SLEEP_MINUTES = int(os.environ.get("IDLE_SLEEP_MINUTES", "20"))
 WAKE_GRACE_MINUTES = int(os.environ.get("WAKE_GRACE_MINUTES", "30"))
 WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
@@ -87,7 +89,15 @@ last_price_ok = 0.0
 saver_sleeping = False
 slept_at = None
 wake_until = 0.0
+last_connection_error = ""
+exec_mode = DEFAULT_EXEC_MODE   # "fast" = account stays hot, orders are instant; "save" = cheapest
+session_until = 0.0             # temporary fast window started from Telegram
 analysis_lock = asyncio.Lock()
+
+
+def load_exec_mode():
+    global exec_mode
+    exec_mode = load_saver_state().get("mode", DEFAULT_EXEC_MODE)
 
 
 def load_chat_id():
@@ -237,6 +247,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
     "• /savings — كم وفّرنا من كلفة MetaApi\n"
+    "• `/session 3` — جلسة تداول ٣ ساعات بتنفيذ فوري ثم رجوع للتوفير\n"
     "• `/setkey news <key>` — مفتاح Finnhub (اختياري)\n"
     "• /keys — حالة المفاتيح\n"
     "• /update — سحب آخر نسخة من GitHub وإعادة التشغيل\n"
@@ -253,6 +264,7 @@ def keyboard():
         [InlineKeyboardButton("⚔️ ارتكاز مزدوج (شراء + بيع)", callback_data="anchor_dual")],
         [InlineKeyboardButton("🧠 استشارة السوق", callback_data="advisory"), InlineKeyboardButton("📰 آخر الأخبار", callback_data="news")],
         [InlineKeyboardButton("🎯 صفقة اليوم", callback_data="daily_trade")],
+        [InlineKeyboardButton(mode_label(), callback_data="toggle_mode")],
         [InlineKeyboardButton(status, callback_data="toggle_bot")],
         [InlineKeyboardButton("🚨 إغلاق جميع صفقات البوت", callback_data="close_all")]
     ])
@@ -357,6 +369,26 @@ async def our_positions_open():
         return True  # unknown state -> stay awake, never risk an unwatched position
 
 
+def fast_now():
+    """True while orders must be instant: fast mode, or a trading session the user opened."""
+    return exec_mode == "fast" or time.time() < session_until
+
+
+def mode_label():
+    if time.time() < session_until:
+        mins = int((session_until - time.time()) / 60)
+        return f"⚡ جلسة تداول ({mins} دقيقة متبقية)"
+    return "⚡ التنفيذ: فوري" if exec_mode == "fast" else "💤 التنفيذ: اقتصادي"
+
+
+def set_exec_mode(mode):
+    global exec_mode
+    exec_mode = mode
+    st = load_saver_state()
+    st["mode"] = mode
+    save_saver_state(st)
+
+
 async def work_pending():
     """Is there anything that genuinely requires a live broker connection?
     An armed anchor or an open position: yes. Idle watching: no — free data covers that."""
@@ -377,7 +409,8 @@ async def wake_for_execution(reason="أمر تنفيذ"):
         if connection:
             return True
         await asyncio.sleep(2)
-    await notify("⚠️ ما قدرت أشغّل الحساب خلال الوقت المتوقع. جرب مرة ثانية بعد لحظات.")
+    hint = billing_hint(last_connection_error) if last_connection_error else None
+    await notify(hint or "⚠️ ما قدرت أشغّل الحساب خلال الوقت المتوقع. جرب مرة ثانية بعد لحظات.")
     return False
 
 
@@ -436,7 +469,7 @@ async def cost_governor():
                 elif closed and not warned_positions:
                     warned_positions = True
                     await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فبقيت شغّال. سكّرها إذا تريد توفير الكلفة.")
-                elif not closed and ONDEMAND and not needed:
+                elif not closed and ONDEMAND and not fast_now() and not needed:
                     idle_since = idle_since or time.time()
                     if time.time() - idle_since >= IDLE_SLEEP_MINUTES * 60:
                         idle_since = None
@@ -447,7 +480,7 @@ async def cost_governor():
                     idle_since = None
                     warned_positions = False
 
-            elif saver_sleeping and (needed or (not closed and not ONDEMAND)):
+            elif saver_sleeping and (needed or (not closed and (fast_now() or not ONDEMAND))):
                 await wake_up("🌅 *رجعت أشتغل:* الحساب يشتغل والاتصال جارٍ.\n" + savings_line())
 
             # While awake, learn the gap between the broker's quote and the free feed,
@@ -469,7 +502,9 @@ async def cost_governor():
 def billing_hint(err_text):
     """Turn an opaque MetaApi failure into the one sentence that tells the user what to do."""
     t = err_text.lower()
-    if any(k in t for k in ("payment", "402", "insufficient", "balance", "subscription", "billing", "expired", "quota")):
+    # "please top up your account" is what MetaApi actually returns when the balance runs out.
+    if any(k in t for k in ("top up", "top-up", "topup", "payment", "402", "insufficient",
+                            "balance", "subscription", "billing", "expired", "quota")):
         return ("💳 *مشكلة اشتراك/رصيد MetaApi.* الحساب موقوف من طرفهم.\n"
                 "افتح app.metaapi.cloud → Billing واشحن الرصيد أو فعّل الشحن التلقائي (Auto top-up)، "
                 "وراح يرجع البوت لحاله بدون أي أمر منك.")
@@ -527,7 +562,9 @@ async def ensure_connection():
             log.info("Connected MetaApi OK!")
             await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**")
         except Exception as e:
+            global last_connection_error
             log.error(f"Connection error: {e}", exc_info=True)
+            last_connection_error = str(e)
             fail_streak += 1
             hint = billing_hint(str(e))
             # Say it once, only after retries have clearly failed: this is a wall, not a blip.
@@ -694,7 +731,19 @@ async def handle_callback(query):
         data = query.data
         log.info(f"Telegram action: {data}")
 
-        if data == "toggle_bot":
+        if data == "toggle_mode":
+            global session_until
+            session_until = 0.0
+            set_exec_mode("save" if exec_mode == "fast" else "fast")
+            if exec_mode == "fast":
+                txt = ("⚡ **وضع التنفيذ الفوري**\nالحساب يبقى جاهز طول ساعات السوق، فالارتكاز ينفتح فوراً "
+                       "بدون انتظار.\nالكلفة أعلى — استخدم الاقتصادي لما ما تكون متابع.")
+                asyncio.create_task(wake_for_execution("تشغيل الوضع الفوري"))
+            else:
+                txt = ("💤 **وضع التوفير**\nالحساب ينام وقت الخمول، وأول ارتكاز بعد النوم ياخذ نص دقيقة تقريباً "
+                       "لين يجهز.\nالتحليل والأخبار يبقون شغالين مجاناً.")
+            await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
+        elif data == "toggle_bot":
             bot_active = not bot_active
             txt = "تم **تشغيل النظام** 🟢" if bot_active else "تم **إيقاف النظام** 🔴"
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
@@ -785,9 +834,21 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/setkey"):
                 await handle_setkey(text, cid, update.message.message_id)
+            elif text.startswith("/session"):
+                global session_until
+                parts = text.split()
+                try:
+                    hours = float(parts[1]) if len(parts) > 1 else SESSION_HOURS_DEFAULT
+                except ValueError:
+                    hours = SESSION_HOURS_DEFAULT
+                hours = max(0.25, min(hours, 24))
+                session_until = time.time() + hours * 3600
+                await send_long(f"⚡ فتحت جلسة تداول لمدة `{hours}` ساعة — التنفيذ فوري خلالها، "
+                                "وبعدها يرجع للتوفير تلقائياً.", markup=keyboard())
+                asyncio.create_task(wake_for_execution("بداية جلسة التداول"))
             elif text.startswith("/savings"):
                 state = "😴 نائم الآن (توفير)" if saver_sleeping else ("🟢 السوق مفتوح" if not market_closed() else "⏳ بانتظار إغلاق الصفقات")
-                await send_long(f"{savings_line()}\n• الحالة: {state}", markup=keyboard())
+                await send_long(f"{savings_line()}\n• الحالة: {state}\n• الوضع: {mode_label()}", markup=keyboard())
             elif text.startswith("/keys"):
                 await send_long(intel.keys_status() if intel is not None else "⚠️ وحدة التحليل غير مثبتة.", markup=keyboard())
             elif text.startswith("/update"):
@@ -838,6 +899,7 @@ async def supervise(name, coro_func):
 async def main():
     global bot
     load_chat_id()
+    load_exec_mode()
     request = HTTPXRequest(connection_pool_size=8, connect_timeout=5.0, read_timeout=15.0, write_timeout=10.0, pool_timeout=5.0)
     bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
     await bot.initialize()
@@ -846,6 +908,7 @@ async def main():
             BotCommand("start", "لوحة التحكم"),
             BotCommand("keys", "حالة المفاتيح"),
             BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
+            BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("setkey", "حفظ مفتاح: /setkey claude sk-ant-..."),
             BotCommand("update", "تحديث الكود من GitHub"),
             BotCommand("restart", "إعادة تشغيل البوت"),
