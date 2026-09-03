@@ -12,8 +12,8 @@ from metaapi_cloud_sdk import MetaApi
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
 
-META_API_TOKEN = os.environ["META_API_TOKEN"]
-ACCOUNT_ID = os.environ["ACCOUNT_ID"]
+META_API_TOKEN = os.environ.get("META_API_TOKEN", "")
+ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SYMBOL = os.environ.get("SYMBOL", "GOLD")
 MAGIC_BUY, MAGIC_SELL = 777111, 777222
@@ -32,6 +32,7 @@ WEEKEND_SAVER = os.environ.get("WEEKEND_SAVER", "1") not in ("0", "false", "no")
 WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # Friday
 WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
+BROKER = os.environ.get("BROKER", "metaapi").strip().lower()   # metaapi | capital
 ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # allow idle sleeping at all
 DEFAULT_EXEC_MODE = os.environ.get("EXEC_MODE", "fast")                       # fast = instant orders, save = cheapest
 SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
@@ -47,6 +48,14 @@ SETTABLE_KEYS = {
     "NEWS_MAX_ANALYSES_DAY": "حد تحليلات الأخبار يومياً",
     "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
+    "BROKER": "منصة التنفيذ (metaapi أو capital)",
+    "CAPITAL_API_KEY": "مفتاح Capital.com",
+    "CAPITAL_EMAIL": "إيميل Capital.com",
+    "CAPITAL_PASSWORD": "كلمة سر Capital.com",
+    "CAPITAL_DEMO": "حساب تجريبي (1) أو حقيقي (0)",
+    "CAPITAL_TRADE_SIZE": "حجم الصفقة عند Capital.com",
+    "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
+    "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
 KEY_ALIASES = {
     "metaapi": "META_API_TOKEN", "token": "META_API_TOKEN", "meta": "META_API_TOKEN",
@@ -54,6 +63,9 @@ KEY_ALIASES = {
     "news": "FINNHUB_API_KEY", "finnhub": "FINNHUB_API_KEY",
     "model": "CLAUDE_MODEL", "hour": "DAILY_TRADE_HOUR_UTC",
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
+    "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
+    "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
+    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -67,6 +79,12 @@ try:
 except Exception as _e:  # the trading engine must keep running even if intel is broken
     intel = None
     log.warning(f"intel module unavailable: {_e}")
+
+try:
+    import broker_capital  # free direct execution, no paid bridge
+except Exception as _e:
+    broker_capital = None
+    log.warning(f"broker_capital unavailable: {_e}")
 
 try:
     import datafeed  # free prices, so analysis never keeps a billed account deployed
@@ -208,17 +226,22 @@ async def handle_setkey(text, chat_id, message_id):
         write_env_value(key, value)
         if intel is not None:
             intel.refresh_keys()
+        if broker_capital is not None:
+            broker_capital.refresh_keys()
     except Exception as e:
         await send_long(f"⚠️ فشل الحفظ: `{e}`")
         return
     await forget_message()
+    if key == "BROKER":
+        await send_long(f"🔁 تم ضبط منصة التنفيذ على `{value}`. أعيد التشغيل الآن...")
+        os._exit(0)
     status = intel.keys_status() if intel is not None else ""
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
 
 
 def self_update():
     """Download the newest code, compile it, swap it in. Returns an error string or None."""
-    files = ("range_harvester.py", "intel.py", "datafeed.py", "requirements.txt")
+    files = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py", "requirements.txt")
     tmpdir = os.path.join(BASE_DIR, ".update")
     os.makedirs(tmpdir, exist_ok=True)
     for name in files:
@@ -232,7 +255,7 @@ def self_update():
     if pip.returncode != 0:
         log.warning(f"pip update failed: {pip.stderr[-300:]}")
     comp = subprocess.run([py, "-m", "py_compile", os.path.join(tmpdir, "range_harvester.py"), os.path.join(tmpdir, "intel.py"),
-                           os.path.join(tmpdir, "datafeed.py")],
+                           os.path.join(tmpdir, "datafeed.py"), os.path.join(tmpdir, "broker_capital.py")],
                           capture_output=True, text=True, timeout=120)
     if comp.returncode != 0:
         return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
@@ -300,6 +323,13 @@ async def send_long(text: str, markup=None):
 async def fetch_candles(symbol, timeframe, limit=200):
     """Broker candles when the account is already awake, free candles otherwise.
     Analysis must never be a reason to keep a billed account deployed."""
+    if connection is not None and hasattr(connection, "get_candles"):
+        try:
+            candles = await asyncio.wait_for(connection.get_candles(symbol, timeframe, limit), timeout=25.0)
+            if candles and len(candles) >= 30:
+                return candles
+        except Exception as e:
+            log.warning(f"broker candles failed ({symbol} {timeframe}), using free feed: {e}")
     if account_instance and not saver_sleeping:
         try:
             candles = await asyncio.wait_for(
@@ -400,6 +430,8 @@ async def work_pending():
 async def wake_for_execution(reason="أمر تنفيذ"):
     """Bring the billed account back up on demand, and wait until it can actually trade."""
     global saver_sleeping, wake_until
+    if BROKER != "metaapi":
+        return connection is not None
     wake_until = time.time() + WAKE_GRACE_MINUTES * 60
     if connection:
         return True
@@ -450,6 +482,9 @@ async def cost_governor():
     and watch orders. So: asleep on weekends, asleep while idle, awake the moment an
     anchor is armed, a position is open, or a button asks to trade."""
     global saver_sleeping
+    if BROKER != "metaapi":
+        log.info("cost governor off: this broker has no deployed-hours bill")
+        return
     if not WEEKEND_SAVER:
         log.info("cost governor disabled")
         return
@@ -541,6 +576,19 @@ async def ensure_connection():
                     await teardown_connection()
                     continue
                 await asyncio.sleep(3)
+                continue
+
+            if BROKER == "capital":
+                if broker_capital is None or not broker_capital.configured():
+                    await asyncio.sleep(10)
+                    continue
+                log.info("Connecting Capital.com...")
+                conn = broker_capital.CapitalBroker()
+                await asyncio.wait_for(conn.connect(), timeout=45)
+                connection = conn
+                last_price_ok = time.time()
+                fail_streak, hinted = 0, None
+                await notify("✅ **تم الاتصال بحساب Capital.com بنجاح.**")
                 continue
 
             log.info("Connecting MetaApi...")
@@ -926,7 +974,7 @@ async def main():
     if intel is not None:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))
         tasks.append(supervise("daily_scheduler", lambda: intel.daily_scheduler(fetch_candles, SYMBOL, notify)))
-        log.info(f"intel enabled: claude={'yes' if intel.claude_ready() else 'no'} news={'yes' if intel.FINNHUB_API_KEY else 'no'}")
+        log.info(f"broker={BROKER} | intel enabled: claude={'yes' if intel.claude_ready() else 'no'} news={'yes' if intel.FINNHUB_API_KEY else 'no'}")
     await asyncio.gather(*tasks)
 
 

@@ -10,6 +10,7 @@ Runs 24/7 as a systemd service on an Oracle Cloud Always-Free VM.
 | `range_harvester.py` | Trading engine (range/anchor strategy), Telegram control panel, self-healing connection |
 | `intel.py` | Intelligence layer: multi-timeframe TA, liquidity zones, news watcher, daily trade idea (Claude) |
 | `datafeed.py` | Free, keyless market data (Yahoo → Binance PAXG → Stooq) with broker-price calibration |
+| `broker_capital.py` | Free direct execution via Capital.com's REST API — no paid bridge, real broker-side stops |
 | `deploy.sh` | One-command update on the server (download → compile → swap → restart) |
 | `tradingbot.service` | systemd unit |
 | `.env.example` | Environment variables (secrets never live in the code) |
@@ -40,6 +41,27 @@ Automatic alerts: new gold-relevant headlines every `NEWS_POLL_MINUTES` (Claude 
 
 Only the first chat that ever talked to the bot is accepted; other chats are ignored.
 `/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.
+
+## Execution platform
+
+`BROKER=metaapi` (default) keeps the paid MetaApi bridge. `BROKER=capital` executes
+directly against Capital.com's free REST API instead: no bridge, no deployed-hours
+bill, and orders carry a real broker-side stop loss (`STOP_LOSS_DIST`) that survives
+the bot being closed. A demo account uses the same code path as a live one.
+
+`broker_capital.py` mirrors the method names of the MetaApi RPC connection, so the
+trading engine is unchanged. Capital.com has no magic numbers, so every deal the bot
+opens is recorded locally and the magic is attached on read — the engine still only
+ever touches its own positions. Run `python broker_capital.py` for a connection check.
+
+Set it up from Telegram, no SSH:
+
+```
+/setkey capkey <api key>
+/setkey capmail <email>
+/setkey cappass <api password>
+/setkey broker capital
+```
 
 ## Paying MetaApi almost nothing
 

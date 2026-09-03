@@ -7,3 +7,4 @@ datafeed_state.json
 .env.bak
 .update/
 chat_id.txt
+capital_deals.json
