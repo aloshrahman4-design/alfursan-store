@@ -16,6 +16,7 @@ Runs as a systemd service on an Oracle Cloud Always-Free VM.
 | `intel.py` | Intelligence layer: multi-timeframe TA, liquidity zones, news watcher, daily trade idea (Claude) |
 | `datafeed.py` | Free, keyless market data (Yahoo → Binance PAXG → Stooq) with broker-price calibration |
 | `broker_capital.py` | Free direct execution via Capital.com's REST API — no paid bridge, real broker-side stops |
+| `broker_paper.py` | Virtual account on real live prices — no broker, no verification, no cost |
 | `deploy.sh` | One-command update on the server (download → compile → swap → restart) |
 | `tradingbot.service` | systemd unit |
 | `.env.example` | Environment variables (secrets never live in the code) |
@@ -48,6 +49,12 @@ Only the first chat that ever talked to the bot is accepted; other chats are ign
 `/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.
 
 ## Execution platform
+
+`BROKER=paper` needs nothing at all: the bot runs the same anchor strategy against real
+live gold prices and keeps a virtual account in `paper_state.json`. Real execution needs
+a broker and every regulated broker needs identity verification, so this is the way to
+find out whether the strategy actually makes money before paying for anything. `/paper`
+switches to it, `/report` gives the verdict — net P/L, win rate, best and worst trade.
 
 `BROKER=metaapi` (default) keeps the paid MetaApi bridge. `BROKER=capital` executes
 directly against Capital.com's free REST API instead: no bridge, no deployed-hours

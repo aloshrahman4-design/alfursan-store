@@ -32,7 +32,7 @@ WEEKEND_SAVER = os.environ.get("WEEKEND_SAVER", "1") not in ("0", "false", "no")
 WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # Friday
 WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
-BROKER = os.environ.get("BROKER", "metaapi").strip().lower()   # metaapi | capital
+BROKER = os.environ.get("BROKER", "metaapi").strip().lower()   # metaapi | capital | paper
 ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # allow idle sleeping at all
 DEFAULT_EXEC_MODE = os.environ.get("EXEC_MODE", "fast")                       # fast = instant orders, save = cheapest
 SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
@@ -48,7 +48,7 @@ SETTABLE_KEYS = {
     "NEWS_MAX_ANALYSES_DAY": "حد تحليلات الأخبار يومياً",
     "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
-    "BROKER": "منصة التنفيذ (metaapi أو capital)",
+    "BROKER": "منصة التنفيذ (metaapi أو capital أو paper)",
     "CAPITAL_API_KEY": "مفتاح Capital.com",
     "CAPITAL_EMAIL": "إيميل Capital.com",
     "CAPITAL_PASSWORD": "كلمة سر Capital.com",
@@ -80,6 +80,12 @@ try:
 except Exception as _e:  # the trading engine must keep running even if intel is broken
     intel = None
     log.warning(f"intel module unavailable: {_e}")
+
+try:
+    import broker_paper  # virtual account on real prices: no broker, no KYC, no cost
+except Exception as _e:
+    broker_paper = None
+    log.warning(f"broker_paper unavailable: {_e}")
 
 try:
     import broker_capital  # free direct execution, no paid bridge
@@ -336,7 +342,7 @@ async def handle_setkey(text, chat_id, message_id):
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
 
 
-CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py")
+CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py", "broker_paper.py")
 
 
 def self_update():
@@ -388,6 +394,8 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /paper — تشغيل حساب تجريبي داخلي بدون وسيط ولا كلفة\n"
+    "• /report — أداء الحساب التجريبي (ربح/خسارة، نسبة نجاح)\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
     "• /savings — كم وفّرنا من كلفة MetaApi\n"
     "• `/session 3` — جلسة تداول ٣ ساعات بتنفيذ فوري ثم رجوع للتوفير\n"
@@ -704,6 +712,20 @@ async def ensure_connection():
                 await asyncio.sleep(3)
                 continue
 
+            if BROKER == "paper":
+                if broker_paper is None:
+                    await asyncio.sleep(10)
+                    continue
+                conn = broker_paper.PaperBroker()
+                await asyncio.wait_for(conn.connect(), timeout=30)
+                connection = conn
+                last_price_ok = time.time()
+                fail_streak, hinted = 0, None
+                acc = await conn.get_account_information()
+                await notify(f"📄 **الحساب التجريبي الداخلي جاهز** — الرصيد `{acc['balance']}$`.\n"
+                             "نفس الاستراتيجية، أسعار ذهب حقيقية، بدون أي وسيط.")
+                continue
+
             if BROKER == "capital":
                 if broker_capital is None or not broker_capital.configured():
                     await asyncio.sleep(10)
@@ -1010,6 +1032,15 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/paper"):
+                write_env_value("BROKER", "paper")
+                await send_long("📄 *تحويل إلى الحساب التجريبي الداخلي*\n"
+                                "نفس الاستراتيجية بأسعار حقيقية، بدون وسيط ولا كلفة.\n"
+                                "♻️ أعيد التشغيل الآن...")
+                os._exit(0)
+            elif text.startswith("/report"):
+                await send_long(broker_paper.report() if broker_paper else "⚠️ الوحدة غير موجودة، أرسل /update أولاً.",
+                                markup=keyboard())
             elif text.startswith("/check"):
                 await send_long(await broker_check(), markup=keyboard())
             elif text.startswith("/setkey"):
@@ -1095,6 +1126,8 @@ async def main():
             BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("check", "فحص الاتصال والحساب"),
+            BotCommand("paper", "حساب تجريبي داخلي بدون وسيط"),
+            BotCommand("report", "أداء الحساب التجريبي"),
             BotCommand("capital", "ربط Capital.com: /capital <مفتاح> <إيميل> <كلمة سر>"),
             BotCommand("setkey", "حفظ مفتاح: /setkey claude sk-ant-..."),
             BotCommand("update", "تحديث الكود من GitHub"),
