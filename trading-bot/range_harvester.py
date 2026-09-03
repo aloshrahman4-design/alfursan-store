@@ -555,6 +555,12 @@ async def wake_for_execution(reason="أمر تنفيذ"):
     wake_until = time.time() + WAKE_GRACE_MINUTES * 60
     if connection:
         return True
+    # No point making the user wait two minutes for a platform we already know is refusing us.
+    blocked = billing_hint(last_connection_error) if last_connection_error else None
+    if blocked:
+        await notify("🚫 *التنفيذ متوقف* — منصة التداول رافضة الاتصال.\n\n" + blocked +
+                     "\n\nأو بدّل لمنصة مجانية بأمر واحد:\n`/capital <مفتاح> <إيميل> <كلمة سر>`")
+        return False
     saver_sleeping = False
     await notify(f"⚡ *{reason}:* أشغّل حساب MetaApi الآن...")
     for _ in range(int(WAKE_TIMEOUT_SECS / 2)):
