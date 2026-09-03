@@ -281,6 +281,26 @@ class CapitalBroker:
                         "close": c, "tickVolume": p.get("lastTradedVolume", 0) or 0})
         return out
 
+    async def dealing_rules(self):
+        """Minimum order size and step, so the bot can configure itself instead of guessing."""
+        data = await self._req("GET", f"/markets/{self._epic}")
+        rules = data.get("dealingRules", {}) or {}
+
+        def val(name, default=None):
+            node = rules.get(name) or {}
+            v = node.get("value", node if isinstance(node, (int, float)) else None)
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "epic": self._epic,
+            "name": (data.get("instrument", {}) or {}).get("name", self._epic),
+            "min_size": val("minDealSize", 1.0),
+            "min_stop_distance": val("minStopOrProfitDistance"),
+        }
+
     # methods the engine calls on a MetaApi connection that have no counterpart here
     async def wait_synchronized(self, **kw):
         return True

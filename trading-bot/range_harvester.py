@@ -183,6 +183,102 @@ async def validate_metaapi_token(candidate):
             pass
 
 
+async def broker_check():
+    """One place that answers 'is the bot actually able to trade right now?'"""
+    lines = [f"🔎 *فحص الاتصال* — المنصة: `{BROKER}`"]
+    if connection is None:
+        lines.append("❌ ماكو اتصال حالياً.")
+        if last_connection_error:
+            # the MetaApi billing advice only makes sense while MetaApi is the platform
+            hint = billing_hint(last_connection_error) if BROKER == "metaapi" else None
+            lines.append(hint or f"آخر خطأ: `{last_connection_error[:250]}`")
+        elif BROKER == "capital" and (broker_capital is None or not broker_capital.configured()):
+            lines.append("لسه ما ربطت الحساب. أرسل:\n`/capital <مفتاح> <إيميل> <كلمة سر>`")
+        elif saver_sleeping:
+            lines.append("😴 الحساب نائم لتوفير الكلفة — أي زر تداول يرجّعه.")
+        return "\n".join(lines)
+    try:
+        acc = await asyncio.wait_for(connection.get_account_information(), timeout=10)
+        price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=10)
+        pos = await asyncio.wait_for(connection.get_positions(), timeout=10)
+        ours = [p for p in pos if p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
+        floating = round(float(acc.get("equity", 0)) - float(acc.get("balance", 0)), 2)
+        lines += [
+            "✅ الاتصال شغال",
+            f"• الرصيد: `{acc.get('balance')} {acc.get('currency','')}` | السيولة: `{acc.get('equity')}`",
+            f"• الربح/الخسارة العائمة: `{floating}$`",
+            f"• السعر: bid `{price.get('bid')}` / ask `{price.get('ask')}`",
+            f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` للبوت",
+            f"• الوضع: {mode_label()}",
+        ]
+        if datafeed:
+            lines.append(f"• {datafeed.calibration_line()}")
+        if intel:
+            lines.append(f"• Claude: {'✅' if intel.claude_ready() else '❌ غير مضبوط'}")
+    except Exception as e:
+        lines.append(f"⚠️ الاتصال موجود بس الاستعلام فشل: `{str(e)[:250]}`")
+    return "\n".join(lines)
+
+
+async def handle_capital_setup(text, chat_id, message_id):
+    """/capital <api_key> <email> <password> - verify, self-configure, switch over, restart."""
+    parts = text.split()
+    if len(parts) < 4:
+        await send_long("الصيغة:\n`/capital <المفتاح> <الإيميل> <كلمة سر الـ API>`\n\n"
+                        "المفتاح من capital.com ← Settings ← API integrations.")
+        return
+    api_key, email, password = parts[1], parts[2], " ".join(parts[3:])
+    try:  # the credentials must not survive in the chat, whatever happens next
+        await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=message_id), timeout=5.0)
+    except Exception as e:
+        log.warning(f"could not delete credentials message: {e}")
+
+    if broker_capital is None:
+        await send_long("⚠️ وحدة Capital.com غير موجودة. أرسل /update أولاً.")
+        return
+
+    await send_long("⏳ أفحص الحساب وأضبط كل شي تلقائياً...")
+    os.environ.update({"CAPITAL_API_KEY": api_key, "CAPITAL_EMAIL": email,
+                       "CAPITAL_PASSWORD": password, "CAPITAL_DEMO": os.environ.get("CAPITAL_DEMO", "1")})
+    broker_capital.refresh_keys()
+
+    probe = broker_capital.CapitalBroker()
+    try:
+        await asyncio.wait_for(probe.connect(), timeout=45)
+        acc = await probe.get_account_information()
+        price = await probe.get_symbol_price()
+        rules = await probe.dealing_rules()
+        candles = await probe.get_candles(SYMBOL, "15m", 50)
+    except Exception as e:
+        await send_long(f"❌ ما نجح الاتصال، وما غيّرت شي.\n`{str(e)[:400]}`\n\n"
+                        "تأكد من: المفتاح، الإيميل، وكلمة سر الـ API (مو كلمة سر الدخول).", markup=keyboard())
+        return
+    finally:
+        try:
+            await probe.close()
+        except Exception:
+            pass
+
+    size = max(rules["min_size"], 0.0) or 1.0
+    for key, value in (("CAPITAL_API_KEY", api_key), ("CAPITAL_EMAIL", email),
+                       ("CAPITAL_PASSWORD", password), ("CAPITAL_EPIC", rules["epic"]),
+                       ("CAPITAL_TRADE_SIZE", str(size)), ("CAPITAL_DEMO", os.environ.get("CAPITAL_DEMO", "1")),
+                       ("BROKER", "capital")):
+        write_env_value(key, value)
+
+    demo = os.environ.get("CAPITAL_DEMO", "1") not in ("0", "false", "no")
+    await send_long(
+        f"✅ *تم الربط بنجاح* ({'حساب تجريبي' if demo else 'حساب حقيقي'})\n\n"
+        f"• الأداة: `{rules['epic']}` — {rules['name']}\n"
+        f"• الرصيد: `{acc['balance']} {acc['currency']}` | السيولة: `{acc['equity']}`\n"
+        f"• السعر الآن: bid `{price['bid']}` / ask `{price['ask']}`\n"
+        f"• الشموع: `{len(candles)}` شمعة ١٥ دقيقة ✓\n"
+        f"• حجم الصفقة: `{size}` (الحد الأدنى المسموح، ضبطته تلقائياً)\n"
+        + (f"• أقل مسافة ستوب مسموحة: `{rules['min_stop_distance']}`\n" if rules.get("min_stop_distance") else "")
+        + "\n♻️ أعيد التشغيل الآن على Capital.com — انتظر رسالة تأكيد الاتصال.")
+    os._exit(0)
+
+
 async def handle_setkey(text, chat_id, message_id):
     parts = text.split(maxsplit=2)
     if len(parts) < 3:
@@ -268,6 +364,8 @@ HELP_TEXT = (
     "🤖 *أوامر البوت*\n"
     "• /start — لوحة التحكم\n"
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
+    "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
+    "• /check — فحص الاتصال والحساب والسعر\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
     "• /savings — كم وفّرنا من كلفة MetaApi\n"
     "• `/session 3` — جلسة تداول ٣ ساعات بتنفيذ فوري ثم رجوع للتوفير\n"
@@ -880,6 +978,10 @@ async def process_update(update):
             text = update.message.text.strip()
             if text.startswith("/start"):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
+            elif text.startswith("/capital"):
+                await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/check"):
+                await send_long(await broker_check(), markup=keyboard())
             elif text.startswith("/setkey"):
                 await handle_setkey(text, cid, update.message.message_id)
             elif text.startswith("/session"):
@@ -957,6 +1059,8 @@ async def main():
             BotCommand("keys", "حالة المفاتيح"),
             BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
+            BotCommand("check", "فحص الاتصال والحساب"),
+            BotCommand("capital", "ربط Capital.com: /capital <مفتاح> <إيميل> <كلمة سر>"),
             BotCommand("setkey", "حفظ مفتاح: /setkey claude sk-ant-..."),
             BotCommand("update", "تحديث الكود من GitHub"),
             BotCommand("restart", "إعادة تشغيل البوت"),
