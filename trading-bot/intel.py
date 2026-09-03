@@ -284,7 +284,7 @@ def _unescape(text):
 async def fetch_news_free(limit=40):
     """Headlines with no API key at all (Google News RSS). Fallback when Finnhub is absent."""
     items = []
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, transport=_transport(),
                                  headers={"User-Agent": "Mozilla/5.0 (compatible; RangeHarvester/1.0)"}) as client:
         for url in GOOGLE_NEWS_FEEDS:
             try:
@@ -327,7 +327,7 @@ async def fetch_news(limit=40):
     if not FINNHUB_API_KEY:
         return await fetch_news_free(limit)
     items = []
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, transport=_transport()) as client:
         for cat in ("forex", "general"):
             try:
                 r = await client.get("https://finnhub.io/api/v1/news", params={"category": cat, "token": FINNHUB_API_KEY})
@@ -379,6 +379,15 @@ SYSTEM_PROMPT = (
 _client = None
 
 
+# Some hosts (Oracle Cloud among them) resolve API names to IPv6 addresses they cannot
+# actually route, which fails as a connection error rather than anything readable.
+# FORCE_IPV4=1 binds outgoing connections to the IPv4 stack.
+def _transport():
+    if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+        return httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    return None
+
+
 def refresh_keys():
     """Re-read keys from the environment (used after /setkey) and drop the cached client."""
     global ANTHROPIC_API_KEY, FINNHUB_API_KEY, CLAUDE_MODEL, _client
@@ -409,7 +418,8 @@ def _client_or_none():
     if not claude_ready():
         return None
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=2, timeout=120.0)
+        _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=2, timeout=120.0,
+                                       http_client=httpx.AsyncClient(timeout=120.0, transport=_transport()))
     return _client
 
 

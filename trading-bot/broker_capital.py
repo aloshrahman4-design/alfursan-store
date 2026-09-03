@@ -77,6 +77,15 @@ def refresh_keys():
             else "https://api-capital.backend-capital.com/api/v1")
 
 
+# Some hosts (Oracle Cloud among them) resolve API names to IPv6 addresses they cannot
+# actually route, which fails as a connection error rather than anything readable.
+# FORCE_IPV4=1 binds outgoing connections to the IPv4 stack.
+def _transport():
+    if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+        return httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    return None
+
+
 def _load_deals():
     try:
         with open(DEALS_PATH) as f:
@@ -113,7 +122,7 @@ class CapitalBroker:
 
     async def _http(self):
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=20, base_url=BASE)
+            self._client = httpx.AsyncClient(timeout=20, base_url=BASE, transport=_transport())
         return self._client
 
     async def _login(self):

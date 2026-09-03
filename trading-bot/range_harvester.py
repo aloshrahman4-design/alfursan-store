@@ -54,6 +54,7 @@ SETTABLE_KEYS = {
     "CAPITAL_PASSWORD": "كلمة سر Capital.com",
     "CAPITAL_DEMO": "حساب تجريبي (1) أو حقيقي (0)",
     "CAPITAL_TRADE_SIZE": "حجم الصفقة عند Capital.com",
+    "FORCE_IPV4": "إجبار الاتصال على IPv4 (1 أو 0)",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -65,7 +66,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST",
+    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -328,8 +329,8 @@ async def handle_setkey(text, chat_id, message_id):
         await send_long(f"⚠️ فشل الحفظ: `{e}`")
         return
     await forget_message()
-    if key == "BROKER":
-        await send_long(f"🔁 تم ضبط منصة التنفيذ على `{value}`. أعيد التشغيل الآن...")
+    if key in ("BROKER", "FORCE_IPV4"):
+        await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())

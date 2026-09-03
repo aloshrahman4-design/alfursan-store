@@ -55,6 +55,15 @@ BINANCE_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4
 _cache = {}
 
 
+# Some hosts (Oracle Cloud among them) resolve API names to IPv6 addresses they cannot
+# actually route, which fails as a connection error rather than anything readable.
+# FORCE_IPV4=1 binds outgoing connections to the IPv4 stack.
+def _transport():
+    if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+        return httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    return None
+
+
 def _load_state():
     try:
         with open(STATE_PATH) as f:
@@ -174,7 +183,7 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
     sym = symbol.upper()
     is_gold = sym in GOLD_SYMBOLS or sym.startswith("XAU")
     errors = []
-    async with httpx.AsyncClient(timeout=15, headers=UA, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15, headers=UA, follow_redirects=True, transport=_transport()) as client:
         attempts = []
         if sym in YAHOO:
             attempts.append(("yahoo", lambda: _yahoo(client, YAHOO[sym], timeframe, limit)))
