@@ -8,14 +8,16 @@ BRANCH="${BRANCH:-claude/range-harvester-stability-fix-kfz55i}"
 RAW="https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/${BRANCH}/trading-bot"
 DIR="${HOME}/trading_bot"
 cd "$DIR"
+# prefer IPv4 when the host is configured for it: unroutable IPv6 makes curl hang
+grep -qs "^FORCE_IPV4=1" "$DIR/.env" && CURL4="-4" || CURL4=""
 
 echo "==> downloading from branch: $BRANCH"
-curl -fsSL "$RAW/range_harvester.py" -o range_harvester.py.new
-curl -fsSL "$RAW/intel.py" -o intel.py.new
-curl -fsSL "$RAW/datafeed.py" -o datafeed.py.new
-curl -fsSL "$RAW/broker_capital.py" -o broker_capital.py.new
-curl -fsSL "$RAW/broker_paper.py" -o broker_paper.py.new
-curl -fsSL "$RAW/requirements.txt" -o requirements.txt
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/range_harvester.py" -o range_harvester.py.new
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/intel.py" -o intel.py.new
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/datafeed.py" -o datafeed.py.new
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/broker_capital.py" -o broker_capital.py.new
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/broker_paper.py" -o broker_paper.py.new
+curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/requirements.txt" -o requirements.txt
 
 echo "==> installing/updating python packages"
 ./venv/bin/pip install -q -r requirements.txt

@@ -354,9 +354,18 @@ def self_update():
     tmpdir = os.path.join(BASE_DIR, ".update")
     try:
         os.makedirs(tmpdir, exist_ok=True)
+        # Same IPv6 trap as the API calls: GitHub resolves to an address this host cannot
+        # route, and curl then hangs until the timeout instead of failing fast.
+        curl = ["curl", "-fsSL", "--connect-timeout", "15", "--retry", "2", "--retry-delay", "2"]
+        if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+            curl.append("-4")
         for name in files:
-            got = subprocess.run(["curl", "-fsSL", f"{RAW_BASE}/{name}", "-o", os.path.join(tmpdir, name)],
-                                 capture_output=True, text=True, timeout=90)
+            try:
+                got = subprocess.run(curl + [f"{RAW_BASE}/{name}", "-o", os.path.join(tmpdir, name)],
+                                     capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                return (f"⚠️ تحميل `{name}` تجاوز الوقت — الاتصال بـ GitHub بطيء أو محجوب.\n"
+                        "جرب `/setkey ipv4 1` ثم `/update` مرة ثانية.")
             if got.returncode != 0:
                 return f"⚠️ فشل التحميل ({name}): `{got.stderr.strip()[:200]}`"
 
