@@ -17,7 +17,7 @@ curl -fsSL "$RAW/broker_capital.py" -o broker_capital.py.new
 curl -fsSL "$RAW/requirements.txt" -o requirements.txt
 
 echo "==> installing/updating python packages"
-./venv/bin/pip install -q --upgrade -r requirements.txt
+./venv/bin/pip install -q -r requirements.txt
 
 echo "==> compile check"
 ./venv/bin/python -m py_compile range_harvester.py.new intel.py.new datafeed.py.new broker_capital.py.new

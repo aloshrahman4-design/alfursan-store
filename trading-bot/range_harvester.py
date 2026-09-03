@@ -335,29 +335,50 @@ async def handle_setkey(text, chat_id, message_id):
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
 
 
+CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py")
+
+
 def self_update():
-    """Download the newest code, compile it, swap it in. Returns an error string or None."""
-    files = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py", "requirements.txt")
+    """Download the newest code, compile it, swap it in. Returns an error string or None.
+
+    Every failure has to come back as a message: an update that dies quietly leaves the
+    user staring at '⏳ downloading…' forever, which is exactly what used to happen."""
+    files = CODE_FILES + ("requirements.txt",)
     tmpdir = os.path.join(BASE_DIR, ".update")
-    os.makedirs(tmpdir, exist_ok=True)
-    for name in files:
-        got = subprocess.run(["curl", "-fsSL", f"{RAW_BASE}/{name}", "-o", os.path.join(tmpdir, name)],
-                             capture_output=True, text=True, timeout=60)
-        if got.returncode != 0:
-            return f"⚠️ فشل التحميل ({name}): `{got.stderr.strip()[:200]}`"
-    py = sys.executable
-    pip = subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "-r", os.path.join(tmpdir, "requirements.txt")],
-                         capture_output=True, text=True, timeout=900)
-    if pip.returncode != 0:
-        log.warning(f"pip update failed: {pip.stderr[-300:]}")
-    comp = subprocess.run([py, "-m", "py_compile", os.path.join(tmpdir, "range_harvester.py"), os.path.join(tmpdir, "intel.py"),
-                           os.path.join(tmpdir, "datafeed.py"), os.path.join(tmpdir, "broker_capital.py")],
-                          capture_output=True, text=True, timeout=120)
-    if comp.returncode != 0:
-        return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
-    for name in files:
-        shutil.copy2(os.path.join(tmpdir, name), os.path.join(BASE_DIR, name))
-    return None
+    try:
+        os.makedirs(tmpdir, exist_ok=True)
+        for name in files:
+            got = subprocess.run(["curl", "-fsSL", f"{RAW_BASE}/{name}", "-o", os.path.join(tmpdir, name)],
+                                 capture_output=True, text=True, timeout=90)
+            if got.returncode != 0:
+                return f"⚠️ فشل التحميل ({name}): `{got.stderr.strip()[:200]}`"
+
+        py = sys.executable
+        new_req = os.path.join(tmpdir, "requirements.txt")
+        old_req = os.path.join(BASE_DIR, "requirements.txt")
+        # Installing packages is the slow part, and it is pointless when nothing changed.
+        needs_pip = not os.path.exists(old_req) or open(new_req).read() != open(old_req).read()
+        if needs_pip:
+            try:
+                pip = subprocess.run([py, "-m", "pip", "install", "-q", "-r", new_req],
+                                     capture_output=True, text=True, timeout=600)
+                if pip.returncode != 0:
+                    log.warning(f"pip install failed: {pip.stderr[-300:]}")
+            except subprocess.TimeoutExpired:
+                log.warning("pip install timed out; continuing with the packages already installed")
+
+        comp = subprocess.run([py, "-m", "py_compile"] + [os.path.join(tmpdir, n) for n in CODE_FILES],
+                              capture_output=True, text=True, timeout=180)
+        if comp.returncode != 0:
+            return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
+        for name in files:
+            shutil.copy2(os.path.join(tmpdir, name), os.path.join(BASE_DIR, name))
+        return None
+    except subprocess.TimeoutExpired as e:
+        return f"⚠️ التحديث تجاوز الوقت المسموح عند: `{str(e)[:150]}`\nجرب مرة ثانية."
+    except Exception as e:
+        log.error(f"self_update failed: {e}", exc_info=True)
+        return f"⚠️ فشل التحديث: `{str(e)[:300]}`\nالبوت مستمر بالنسخة الحالية."
 
 
 HELP_TEXT = (
@@ -1002,8 +1023,13 @@ async def process_update(update):
             elif text.startswith("/keys"):
                 await send_long(intel.keys_status() if intel is not None else "⚠️ وحدة التحليل غير مثبتة.", markup=keyboard())
             elif text.startswith("/update"):
-                await send_long("⏳ جاري سحب آخر نسخة من GitHub...")
-                err = await asyncio.to_thread(self_update)
+                await send_long("⏳ جاري سحب آخر نسخة من GitHub... (لحد دقيقتين)")
+                try:
+                    err = await asyncio.wait_for(asyncio.to_thread(self_update), timeout=900)
+                except asyncio.TimeoutError:
+                    err = "⚠️ التحديث طوّل أكثر من اللازم وتوقف. البوت مستمر بالنسخة الحالية — جرب `/update` مرة ثانية."
+                except Exception as e:
+                    err = f"⚠️ فشل التحديث: `{str(e)[:300]}`"
                 if err:
                     await send_long(err, markup=keyboard())
                 else:
