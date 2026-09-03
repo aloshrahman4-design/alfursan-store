@@ -740,7 +740,9 @@ async def ensure_connection():
                 hinted = hint
                 await notify(hint)
             await teardown_connection()
-            await asyncio.sleep(min(5 * fail_streak, 60))
+            # An empty balance or a rejected token is a wall, not a blip: retrying every few
+            # seconds cannot fix it and only buries the user in repeats of the same message.
+            await asyncio.sleep(600 if hint else min(5 * fail_streak, 60))
 
 
 async def safe_close_position(pos_id: str):
