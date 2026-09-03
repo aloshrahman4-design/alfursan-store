@@ -8,3 +8,5 @@ datafeed_state.json
 .update/
 chat_id.txt
 capital_deals.json
+bot.log
+*.log

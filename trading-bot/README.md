@@ -1,7 +1,12 @@
 # Range Harvester — GOLD trading bot
 
-Python bot that trades GOLD (XAUUSD) through MetaApi and is controlled from Telegram.
-Runs 24/7 as a systemd service on an Oracle Cloud Always-Free VM.
+Python bot that trades GOLD (XAUUSD) and is controlled entirely from Telegram — keys,
+updates, broker setup and diagnostics all happen in chat, with no SSH.
+
+Execution runs either through MetaApi or, with `BROKER=capital`, directly against
+Capital.com's free REST API. Market data, news and analysis need no paid service at
+all, so everything except order placement keeps working even with no broker connected.
+Runs as a systemd service on an Oracle Cloud Always-Free VM.
 
 ## Files
 
