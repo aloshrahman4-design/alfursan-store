@@ -11,3 +11,4 @@ capital_deals.json
 bot.log
 *.log
 paper_state.json
+bot.lock

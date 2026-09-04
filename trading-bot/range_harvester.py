@@ -1097,13 +1097,26 @@ async def process_update(update):
 
 async def telegram_listener():
     offset = None
+    conflicts = 0
     while True:
         try:
             updates = await asyncio.wait_for(bot.get_updates(offset=offset, timeout=10), timeout=20)
+            conflicts = 0
             for u in updates:
                 offset = u.update_id + 1
                 asyncio.create_task(process_update(u))
         except Exception as e:
+            # A 409 means someone else is polling this token: the bot can still send, but
+            # commands never arrive. Say so instead of failing silently forever.
+            if "Conflict" in str(e) or "409" in str(e):
+                conflicts += 1
+                log.error(f"telegram conflict ({conflicts}): another poller holds this token")
+                if conflicts == 5:
+                    await notify("⚠️ *في نسخة ثانية من البوت شغالة* على نفس التوكن، فأوامرك ما تصلني.\n"
+                                 "شغّل هذا مرة وحدة من Termux:\n"
+                                 "`sudo systemctl stop tradingbot; pkill -f range_harvester.py; sudo systemctl start tradingbot`")
+                await asyncio.sleep(min(5 * conflicts, 60))
+                continue
             log.warning(f"telegram poll error: {e}")
             await asyncio.sleep(2)
 
@@ -1121,8 +1134,27 @@ async def supervise(name, coro_func):
             await asyncio.sleep(3)
 
 
+def claim_single_instance():
+    """Only one process may poll Telegram. Two pollers on one token means getUpdates
+    returns 409 and the bot silently stops receiving commands while still able to send —
+    which looks exactly like 'it just stopped'. An old process lingering after a restart
+    is the usual cause, so refuse to start rather than become the second one."""
+    import fcntl
+    lock_path = os.path.join(BASE_DIR, "bot.lock")
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error("another instance already holds the lock; exiting so it keeps the token")
+        raise SystemExit(0)
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle          # held for the life of the process
+
+
 async def main():
     global bot
+    _lock = claim_single_instance()
     load_chat_id()
     load_exec_mode()
     request = HTTPXRequest(connection_pool_size=8, connect_timeout=5.0, read_timeout=15.0, write_timeout=10.0, pool_timeout=5.0)
