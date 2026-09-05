@@ -33,6 +33,7 @@ WEEKEND_CLOSE_HOUR_UTC = int(os.environ.get("WEEKEND_CLOSE_HOUR_UTC", "21"))  # 
 WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # Sunday
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
 BROKER = os.environ.get("BROKER", "metaapi").strip().lower()   # metaapi | capital | paper
+LEAN = os.environ.get("LEAN", "0") in ("1", "true", "yes")   # trading only: no news, no analysis
 ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # allow idle sleeping at all
 DEFAULT_EXEC_MODE = os.environ.get("EXEC_MODE", "fast")                       # fast = instant orders, save = cheapest
 SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
@@ -55,6 +56,7 @@ SETTABLE_KEYS = {
     "CAPITAL_DEMO": "حساب تجريبي (1) أو حقيقي (0)",
     "CAPITAL_TRADE_SIZE": "حجم الصفقة عند Capital.com",
     "FORCE_IPV4": "إجبار الاتصال على IPv4 (1 أو 0)",
+    "LEAN": "وضع التداول فقط بدون أخبار وتحليل (1 أو 0)",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -66,7 +68,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4",
+    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -418,16 +420,23 @@ HELP_TEXT = (
 
 def keyboard():
     status = "🟢 النظام: شغال" if bot_active else "🔴 النظام: متوقف"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📊 حالة النطاق والأرباح", callback_data="status"), InlineKeyboardButton("🥇 السعر اللحظي", callback_data="price")],
         [InlineKeyboardButton("🟢 ارتكاز شراء جديد", callback_data="anchor_buy"), InlineKeyboardButton("🔴 ارتكاز بيع جديد", callback_data="anchor_sell")],
         [InlineKeyboardButton("⚔️ ارتكاز مزدوج (شراء + بيع)", callback_data="anchor_dual")],
-        [InlineKeyboardButton("🧠 استشارة السوق", callback_data="advisory"), InlineKeyboardButton("📰 آخر الأخبار", callback_data="news")],
-        [InlineKeyboardButton("🎯 صفقة اليوم", callback_data="daily_trade")],
+    ]
+    if not LEAN:   # trading-only mode hides everything that is not an order
+        rows += [
+            [InlineKeyboardButton("🧠 استشارة السوق", callback_data="advisory"),
+             InlineKeyboardButton("📰 آخر الأخبار", callback_data="news")],
+            [InlineKeyboardButton("🎯 صفقة اليوم", callback_data="daily_trade")],
+        ]
+    rows += [
         [InlineKeyboardButton(mode_label(), callback_data="toggle_mode")],
         [InlineKeyboardButton(status, callback_data="toggle_bot")],
-        [InlineKeyboardButton("🚨 إغلاق جميع صفقات البوت", callback_data="close_all")]
-    ])
+        [InlineKeyboardButton("🚨 إغلاق جميع صفقات البوت", callback_data="close_all")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 async def safe_reply(coro_func, **kwargs):
@@ -1050,6 +1059,14 @@ async def process_update(update):
             elif text.startswith("/report"):
                 await send_long(broker_paper.report() if broker_paper else "⚠️ الوحدة غير موجودة، أرسل /update أولاً.",
                                 markup=keyboard())
+            elif text.startswith("/lean"):
+                on = "off" not in text.lower()
+                write_env_value("LEAN", "1" if on else "0")
+                await send_long(("🧹 *وضع التداول فقط*\nألغيت الأخبار والتحليل والصفقة اليومية. "
+                                 "أزرار التداول فقط.\nترجعها بأمر `/lean off`."
+                                 if on else
+                                 "🔄 *رجعت الأخبار والتحليل*."))
+                os._exit(0)
             elif text.startswith("/check"):
                 await send_long(await broker_check(), markup=keyboard())
             elif text.startswith("/setkey"):
@@ -1184,7 +1201,7 @@ async def main():
         supervise("telegram_listener", telegram_listener),
         supervise("cost_governor", cost_governor),
     ]
-    if intel is not None:
+    if intel is not None and not LEAN:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))
         tasks.append(supervise("daily_scheduler", lambda: intel.daily_scheduler(fetch_candles, SYMBOL, notify)))
         log.info(f"broker={BROKER} | intel enabled: claude={'yes' if intel.claude_ready() else 'no'} news={'yes' if intel.FINNHUB_API_KEY else 'no'}")
