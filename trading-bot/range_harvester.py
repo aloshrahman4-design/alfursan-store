@@ -18,7 +18,15 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SYMBOL = os.environ.get("SYMBOL", "GOLD")
 MAGIC_BUY, MAGIC_SELL = 777111, 777222
 TRADE_LOT = float(os.environ.get("TRADE_LOT", "0.03"))
-MIN_CASH_PROFIT, PULLBACK_CASH, BREAKOUT_DIST = 2.00, 0.80, 4.50
+# The harvest thresholds are money, but the strategy is really about price distance:
+# +2.00$ on 0.03 lot is a ~6.7$ move in gold. Shrink the lot without shrinking these and
+# the same 2.00$ would need a 20$ move, so the bot would almost never harvest. Scale them
+# with the lot instead, and the behaviour in price terms stays identical.
+REF_LOT = 0.03
+_scale = TRADE_LOT / REF_LOT if REF_LOT else 1.0
+MIN_CASH_PROFIT = round(float(os.environ.get("MIN_CASH_PROFIT", 2.00 * _scale)), 2)
+PULLBACK_CASH = round(float(os.environ.get("PULLBACK_CASH", 0.80 * _scale)), 2)
+BREAKOUT_DIST = float(os.environ.get("BREAKOUT_DIST", "4.50"))   # a price distance: never scaled
 CONNECTION_STALE_SECS = 25  # if no successful price fetch in this window, force a reconnect
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +67,10 @@ SETTABLE_KEYS = {
     "FORCE_IPV4": "إجبار الاتصال على IPv4 (1 أو 0)",
     "LEAN": "وضع التداول فقط بدون أخبار وتحليل (1 أو 0)",
     "SIGNAL": "وضع الإشارات: البوت ينبّه وأنت تنفّذ (1 أو 0)",
+    "TRADE_LOT": "حجم اللوت",
+    "MIN_CASH_PROFIT": "حد الحصاد بالدولار",
+    "PULLBACK_CASH": "الارتداد المسموح من القمة",
+    "BREAKOUT_DIST": "مسافة الاختراق للارتكاز الجديد",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -70,7 +82,8 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL",
+    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -407,6 +420,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
     "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
     "• /paper — تشغيل حساب تجريبي داخلي بدون وسيط ولا كلفة\n"
@@ -1078,6 +1092,32 @@ async def process_update(update):
             elif text.startswith("/report"):
                 await send_long(broker_paper.report() if broker_paper else "⚠️ الوحدة غير موجودة، أرسل /update أولاً.",
                                 markup=keyboard())
+            elif text.startswith("/lot"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await send_long(f"اللوت الحالي: `{TRADE_LOT}`\nللتغيير: `/lot 0.01`", markup=keyboard())
+                else:
+                    try:
+                        lot = float(parts[1])
+                    except ValueError:
+                        lot = 0
+                    if not 0 < lot <= 10:
+                        await send_long("حجم غير صالح.")
+                    else:
+                        sc = lot / REF_LOT
+                        write_env_value("TRADE_LOT", str(lot))
+                        # clear any pinned thresholds so they follow the new lot
+                        for k in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
+                            os.environ.pop(k, None)
+                            write_env_value(k, str(round((2.00 if k == "MIN_CASH_PROFIT" else 0.80) * sc, 2)))
+                        await send_long(
+                            f"✅ *اللوت صار* `{lot}`\n\n"
+                            f"وعدّلت الحدود معه حتى تبقى نفس مسافات السعر:\n"
+                            f"• حد الحصاد: `{round(2.00 * sc, 2)}$` (كان 2.00$)\n"
+                            f"• الارتداد: `{round(0.80 * sc, 2)}$` (كان 0.80$)\n"
+                            f"• الاختراق: `{BREAKOUT_DIST}$` (ما يتغير — مسافة سعر)\n\n"
+                            "♻️ أعيد التشغيل...")
+                        os._exit(0)
             elif text.startswith("/signal"):
                 on = "off" not in text.lower()
                 write_env_value("SIGNAL", "1" if on else "0")
@@ -1238,6 +1278,7 @@ async def main():
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("check", "فحص الاتصال والحساب"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
+            BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
             BotCommand("paper", "حساب تجريبي داخلي بدون وسيط"),
             BotCommand("report", "أداء الحساب التجريبي"),
