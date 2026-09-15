@@ -34,6 +34,7 @@ WEEKEND_OPEN_HOUR_UTC = int(os.environ.get("WEEKEND_OPEN_HOUR_UTC", "22"))    # 
 METAAPI_HOURLY_USD = float(os.environ.get("METAAPI_HOURLY_USD", "0.035"))     # ≈ $5.94 / 168h
 BROKER = os.environ.get("BROKER", "metaapi").strip().lower()   # metaapi | capital | paper
 LEAN = os.environ.get("LEAN", "0") in ("1", "true", "yes")   # trading only: no news, no analysis
+SIGNAL = os.environ.get("SIGNAL", "0") in ("1", "true", "yes")  # bot watches and alerts, user taps in MT5
 ONDEMAND = os.environ.get("ONDEMAND", "1") not in ("0", "false", "no")        # allow idle sleeping at all
 DEFAULT_EXEC_MODE = os.environ.get("EXEC_MODE", "fast")                       # fast = instant orders, save = cheapest
 SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
@@ -57,6 +58,7 @@ SETTABLE_KEYS = {
     "CAPITAL_TRADE_SIZE": "حجم الصفقة عند Capital.com",
     "FORCE_IPV4": "إجبار الاتصال على IPv4 (1 أو 0)",
     "LEAN": "وضع التداول فقط بدون أخبار وتحليل (1 أو 0)",
+    "SIGNAL": "وضع الإشارات: البوت ينبّه وأنت تنفّذ (1 أو 0)",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -68,7 +70,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN",
+    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -405,6 +407,8 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
+    "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
     "• /paper — تشغيل حساب تجريبي داخلي بدون وسيط ولا كلفة\n"
     "• /report — أداء الحساب التجريبي (ربح/خسارة، نسبة نجاح)\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
@@ -447,6 +451,15 @@ async def safe_reply(coro_func, **kwargs):
             log.warning(f"reply attempt {attempt+1} failed: {e}")
             await asyncio.sleep(0.4)
     return None
+
+
+def act(action, detail=""):
+    """In signal mode the bot has no hands: it tells the user exactly what to tap in MT5."""
+    if not SIGNAL:
+        return None
+    return (f"🔔🔔 *نفّذ الآن بالمنصة*\n\n*{action}*\n{detail}\n\n"
+            f"• الأداة: `{SYMBOL}`  • اللوت: `{TRADE_LOT}`\n"
+            f"⏱ نفّذها بسرعة — السعر يتحرك.")
 
 
 async def notify(msg: str):
@@ -814,7 +827,8 @@ async def set_new_buy_anchor(manual=False):
         buy_anchor, buy_waiting, peak_buy_profit = ask, False, 0.0
         await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 🚀"
-        await notify(f"🟢 **ارتكاز شراء جديد ({src}):**\n• السعر: `{buy_anchor}`")
+        await notify(act("🟢 افتح صفقة شراء (BUY)", f"• السعر التقريبي: `{buy_anchor}`")
+                     or f"🟢 **ارتكاز شراء جديد ({src}):**\n• السعر: `{buy_anchor}`")
     except Exception as e:
         log.error(f"Buy err: {e}", exc_info=True)
 
@@ -831,7 +845,8 @@ async def set_new_sell_anchor(manual=False):
         sell_anchor, sell_waiting, peak_sell_profit = bid, False, 0.0
         await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 📉"
-        await notify(f"🔴 **ارتكاز بيع جديد ({src}):**\n• السعر: `{sell_anchor}`")
+        await notify(act("🔴 افتح صفقة بيع (SELL)", f"• السعر التقريبي: `{sell_anchor}`")
+                     or f"🔴 **ارتكاز بيع جديد ({src}):**\n• السعر: `{sell_anchor}`")
     except Exception as e:
         log.error(f"Sell err: {e}", exc_info=True)
 
@@ -871,7 +886,8 @@ async def range_engine():
                             buy_waiting = True
                             captured = peak_buy_profit
                             peak_buy_profit = 0.0
-                            await notify(f"🟢 **حصد قمة الشراء!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
+                            await notify(act("🟢 اغلق صفقة الشراء الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
+                                         or f"🟢 **حصد قمة الشراء!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
                             await asyncio.sleep(1.5)
             elif buy_anchor is not None and buy_waiting:
                 if ask >= (buy_anchor + BREAKOUT_DIST):
@@ -880,7 +896,8 @@ async def range_engine():
                 elif ask <= (buy_anchor + 0.25):
                     buy_waiting, peak_buy_profit = False, 0.0
                     await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
-                    await notify(f"🟢 **فتح شراء جديد لعودة السعر لارتكاز (`{buy_anchor}`)**")
+                    await notify(act("🟢 افتح شراء (عودة للارتكاز)", f"• الارتكاز: `{buy_anchor}`")
+                                 or f"🟢 **فتح شراء جديد لعودة السعر لارتكاز (`{buy_anchor}`)**")
                     await asyncio.sleep(2.0)
 
             if len(sell_pos) > 0:
@@ -898,7 +915,8 @@ async def range_engine():
                             sell_waiting = True
                             captured = peak_sell_profit
                             peak_sell_profit = 0.0
-                            await notify(f"🔴 **حصد قاع البيع!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
+                            await notify(act("🔴 اغلق صفقة البيع الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
+                                         or f"🔴 **حصد قاع البيع!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
                             await asyncio.sleep(1.5)
             elif sell_anchor is not None and sell_waiting:
                 if bid <= (sell_anchor - BREAKOUT_DIST):
@@ -907,7 +925,8 @@ async def range_engine():
                 elif bid >= (sell_anchor - 0.25):
                     sell_waiting, peak_sell_profit = False, 0.0
                     await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
-                    await notify(f"🔴 **فتح بيع جديد لعودة السعر لارتكاز (`{sell_anchor}`)**")
+                    await notify(act("🔴 افتح بيع (عودة للارتكاز)", f"• الارتكاز: `{sell_anchor}`")
+                                 or f"🔴 **فتح بيع جديد لعودة السعر لارتكاز (`{sell_anchor}`)**")
                     await asyncio.sleep(2.0)
         except Exception as e:
             log.warning(f"Engine iteration error: {e}", exc_info=True)
@@ -1059,6 +1078,40 @@ async def process_update(update):
             elif text.startswith("/report"):
                 await send_long(broker_paper.report() if broker_paper else "⚠️ الوحدة غير موجودة، أرسل /update أولاً.",
                                 markup=keyboard())
+            elif text.startswith("/signal"):
+                on = "off" not in text.lower()
+                write_env_value("SIGNAL", "1" if on else "0")
+                if on:
+                    # the bookkeeping runs on free prices; the human is the one who executes
+                    write_env_value("BROKER", "paper")
+                    await send_long(
+                        "🔔 *وضع الإشارات مفعّل*\n\n"
+                        "البوت يراقب الذهب بأسعار حقيقية وبنفس استراتيجيتك، ويرسل لك أمر تنفيذ واضح:\n"
+                        "«افتح شراء الآن» / «اغلق الآن، الربح +2.2$»\n"
+                        "وأنت تنفّذ بضغطتين بتطبيق MT5.\n\n"
+                        "✅ بدون MetaApi · بدون اشتراك · بدون توثيق هوية\n"
+                        "♻️ أعيد التشغيل الآن...")
+                else:
+                    await send_long("🔄 أطفيت وضع الإشارات. ♻️ أعيد التشغيل...")
+                os._exit(0)
+            elif text.startswith("/entry"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await send_long("الصيغة: `/entry 4468.5` — سعر دخولك الحقيقي من المنصة.")
+                else:
+                    try:
+                        price = float(parts[1])
+                    except ValueError:
+                        await send_long("السعر غير صالح.")
+                    else:
+                        global buy_anchor, sell_anchor
+                        which = "buy" if "sell" not in text.lower() else "sell"
+                        if which == "buy":
+                            buy_anchor = price
+                        else:
+                            sell_anchor = price
+                        await send_long(f"✅ ضبطت سعر دخول *{'الشراء' if which == 'buy' else 'البيع'}* على `{price}`.\n"
+                                        "الأرباح تُحسب من هذا السعر الآن.", markup=keyboard())
             elif text.startswith("/lean"):
                 on = "off" not in text.lower()
                 write_env_value("LEAN", "1" if on else "0")
@@ -1184,6 +1237,8 @@ async def main():
             BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("check", "فحص الاتصال والحساب"),
+            BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
+            BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
             BotCommand("paper", "حساب تجريبي داخلي بدون وسيط"),
             BotCommand("report", "أداء الحساب التجريبي"),
             BotCommand("capital", "ربط Capital.com: /capital <مفتاح> <إيميل> <كلمة سر>"),
