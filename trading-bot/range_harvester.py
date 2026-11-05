@@ -506,7 +506,10 @@ async def handle_setkey(text, chat_id, message_id):
         await send_long(f"⚠️ فشل الحفظ: `{e}`")
         return
     await forget_message()
-    if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL"):
+    # These are read once at import into module-level constants, so writing .env alone would
+    # save the value and change nothing until the next restart. Restart now instead.
+    if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
+               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "BREAKOUT_DIST"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
