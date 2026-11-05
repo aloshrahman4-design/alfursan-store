@@ -26,6 +26,9 @@ REF_LOT = 0.03
 _scale = TRADE_LOT / REF_LOT if REF_LOT else 1.0
 MIN_CASH_PROFIT = round(float(os.environ.get("MIN_CASH_PROFIT", 2.00 * _scale)), 2)
 PULLBACK_CASH = round(float(os.environ.get("PULLBACK_CASH", 0.80 * _scale)), 2)
+# Give-back as a share of the peak profit rather than a fixed sum: a trade that ran to +40$
+# should be allowed to breathe more than one sitting at +6$. Set to 0 to use PULLBACK_CASH.
+PULLBACK_PCT = float(os.environ.get("PULLBACK_PCT", "10"))
 BREAKOUT_DIST = float(os.environ.get("BREAKOUT_DIST", "4.50"))   # a price distance: never scaled
 CONNECTION_STALE_SECS = 25  # if no successful price fetch in this window, force a reconnect
 
@@ -75,7 +78,8 @@ SETTABLE_KEYS = {
     "SIGNAL": "وضع الإشارات: البوت ينبّه وأنت تنفّذ (1 أو 0)",
     "TRADE_LOT": "حجم اللوت",
     "MIN_CASH_PROFIT": "حد الحصاد بالدولار",
-    "PULLBACK_CASH": "الارتداد المسموح من القمة",
+    "PULLBACK_CASH": "الارتداد المسموح من القمة بالدولار",
+    "PULLBACK_PCT": "الارتداد المسموح كنسبة % من القمة (0 = استخدم الدولار)",
     "BREAKOUT_DIST": "مسافة الاختراق للارتكاز الجديد",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
@@ -92,6 +96,7 @@ KEY_ALIASES = {
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
     "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
+    "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -332,6 +337,7 @@ async def broker_check():
             f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` للبوت"
             + (f" — `{sum(1 for p in ours if user_took_over(p))}` سلّمتها لك" if any(user_took_over(p) for p in ours) else ""),
             f"• الوضع: {mode_label()}",
+            f"• قاعدة الحصاد: ما يغلق قبل `{MIN_CASH_PROFIT}$`، وبعدها يغلق إذا رجع {trail_rule_line()}",
         ]
         if datafeed:
             lines.append(f"• {datafeed.calibration_line()}")
@@ -551,6 +557,9 @@ async def handle_setkey(text, chat_id, message_id):
 
     try:
         write_env_value(key, value)
+        if key in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
+            # Remember that this number was chosen, so /lot does not rescale it away later.
+            write_env_value("PROFIT_PINNED", "1")
         if intel is not None:
             intel.refresh_keys()
         if broker_capital is not None:
@@ -562,7 +571,7 @@ async def handle_setkey(text, chat_id, message_id):
     # These are read once at import into module-level constants, so writing .env alone would
     # save the value and change nothing until the next restart. Restart now instead.
     if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
-               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "BREAKOUT_DIST"):
+               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
@@ -1083,6 +1092,27 @@ async def set_new_sell_anchor(manual=False):
         log.error(f"Sell err: {e}", exc_info=True)
 
 
+def give_back_limit(peak):
+    """How much of the peak profit a trade may surrender before it is harvested.
+
+    A share of the peak, not a fixed sum: a trade that ran to +40$ deserves more room than
+    one sitting at +6$, and a fixed give-back would either strangle the big move or let the
+    small one round-trip. MIN_CASH_PROFIT still gates the close, so the bot never harvests
+    below the floor however small the give-back works out to be.
+    """
+    if PULLBACK_PCT > 0:
+        return round(peak * PULLBACK_PCT / 100.0, 2)
+    return PULLBACK_CASH
+
+
+def trail_rule_line():
+    """One line that states the harvest rule exactly as it will behave."""
+    if PULLBACK_PCT > 0:
+        return (f"`{round(PULLBACK_PCT, 2)}%` من أعلى ربح توصله الصفقة "
+                f"(مثلاً قمة `20$` ← يغلق عند `{round(20 * (1 - PULLBACK_PCT / 100.0), 2)}$`)")
+    return f"`{PULLBACK_CASH}$` من أعلى ربح توصله الصفقة"
+
+
 def user_took_over(p):
     """A take profit on a bot trade can only have come from the user.
 
@@ -1158,7 +1188,7 @@ async def range_engine():
                 if curr_profit >= MIN_CASH_PROFIT:
                     if curr_profit > peak_buy_profit:
                         peak_buy_profit = curr_profit
-                    if curr_profit <= (peak_buy_profit - PULLBACK_CASH):
+                    if curr_profit <= (peak_buy_profit - give_back_limit(peak_buy_profit)):
                         if await safe_close_position(b["id"]):
                             total_profit += curr_profit
                             buy_count += 1
@@ -1187,7 +1217,7 @@ async def range_engine():
                 if curr_profit >= MIN_CASH_PROFIT:
                     if curr_profit > peak_sell_profit:
                         peak_sell_profit = curr_profit
-                    if curr_profit <= (peak_sell_profit - PULLBACK_CASH):
+                    if curr_profit <= (peak_sell_profit - give_back_limit(peak_sell_profit)):
                         if await safe_close_position(s["id"]):
                             total_profit += curr_profit
                             sell_count += 1
@@ -1382,15 +1412,21 @@ async def process_update(update):
                     else:
                         sc = lot / REF_LOT
                         write_env_value("TRADE_LOT", str(lot))
-                        # clear any pinned thresholds so they follow the new lot
-                        for k in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
-                            os.environ.pop(k, None)
-                            write_env_value(k, str(round((2.00 if k == "MIN_CASH_PROFIT" else 0.80) * sc, 2)))
+                        # A threshold the user chose himself is a decision, not a default:
+                        # silently rescaling it here once wiped a deliberate 5$ harvest.
+                        pinned = os.environ.get("PROFIT_PINNED", "0") in ("1", "true", "yes")
+                        if pinned:
+                            limits = (f"• حد الحصاد: `{MIN_CASH_PROFIT}$` — خليته مثل ما ضبطته بنفسك\n"
+                                      f"• الارتداد: {trail_rule_line()}\n")
+                        else:
+                            for k in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
+                                os.environ.pop(k, None)
+                                write_env_value(k, str(round((2.00 if k == "MIN_CASH_PROFIT" else 0.80) * sc, 2)))
+                            limits = (f"• حد الحصاد: `{round(2.00 * sc, 2)}$` (كان 2.00$)\n"
+                                      f"• الارتداد: {trail_rule_line()}\n")
                         await send_long(
                             f"✅ *اللوت صار* `{lot}`\n\n"
-                            f"وعدّلت الحدود معه حتى تبقى نفس مسافات السعر:\n"
-                            f"• حد الحصاد: `{round(2.00 * sc, 2)}$` (كان 2.00$)\n"
-                            f"• الارتداد: `{round(0.80 * sc, 2)}$` (كان 0.80$)\n"
+                            f"والحدود:\n{limits}"
                             f"• الاختراق: `{BREAKOUT_DIST}$` (ما يتغير — مسافة سعر)\n\n"
                             "♻️ أعيد التشغيل...")
                         os._exit(0)

@@ -134,3 +134,19 @@ position is how a trade gets closed at the wrong moment, so the bot reads a TP a
 this one": it stops harvesting that position, leaves it out of the panic-close button, and
 lets that side go idle instead of re-entering at the anchor. Removing the TP hands it back.
 Both transitions are announced once, and `/check` counts them.
+
+## Harvest rule
+
+Two gates close a position, and both must hold: profit is at or above `MIN_CASH_PROFIT`,
+and it has given back `PULLBACK_PCT`% of the highest profit that trade reached. A share of
+the peak rather than a fixed sum, because a trade that ran to +40$ deserves more room than
+one sitting at +6$ — a fixed give-back either strangles the big move or lets the small one
+round-trip. Set `PULLBACK_PCT=0` to go back to the fixed `PULLBACK_CASH`.
+
+The floor is absolute: with a 5$ floor and a 10% give-back, a peak of 5.50$ has a give-back
+line of 4.95$, which the floor refuses, so the trade is held rather than harvested below 5$.
+
+`/lot` rescales the thresholds with the lot so the behaviour in price terms stays the same,
+but it leaves alone any threshold the user set himself — writing one through `/setkey` pins
+it (`PROFIT_PINNED=1`). Rescaling a deliberate number is how a chosen 5$ harvest silently
+became 3.33$.
