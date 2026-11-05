@@ -133,6 +133,8 @@ chat_id_active = None
 buy_anchor, sell_anchor = None, None
 buy_waiting, sell_waiting = False, False
 peak_buy_profit, peak_sell_profit = 0.0, 0.0
+# Trades the user has taken over by attaching his own take profit in the platform.
+handed_over_ids = set()
 total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
@@ -327,7 +329,8 @@ async def broker_check():
             f"• الرصيد: `{acc.get('balance')} {acc.get('currency','')}` | السيولة: `{acc.get('equity')}`",
             f"• الربح/الخسارة العائمة: `{floating}$`",
             f"• السعر: bid `{price.get('bid')}` / ask `{price.get('ask')}`",
-            f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` للبوت",
+            f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` للبوت"
+            + (f" — `{sum(1 for p in ours if user_took_over(p))}` سلّمتها لك" if any(user_took_over(p) for p in ours) else ""),
             f"• الوضع: {mode_label()}",
         ]
         if datafeed:
@@ -633,6 +636,7 @@ HELP_TEXT = (
     "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
     "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
+    "• 🤝 *تسليم صفقة:* حط هدف (TP) على أي صفقة للبوت من المنصة وهو يرفع يده عنها نهائياً — شيل الهدف ويرجع لها\n"
     "• /paper — تشغيل حساب تجريبي داخلي بدون وسيط ولا كلفة\n"
     "• /report — أداء الحساب التجريبي (ربح/خسارة، نسبة نجاح)\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
@@ -1079,6 +1083,49 @@ async def set_new_sell_anchor(manual=False):
         log.error(f"Sell err: {e}", exc_info=True)
 
 
+def user_took_over(p):
+    """A take profit on a bot trade can only have come from the user.
+
+    The bot opens every position bare — magic number only, no TP — so a TP showing up on
+    one means the user set a target by hand in MT5. Two owners closing the same trade is
+    how a position gets closed at the wrong moment, so the bot steps off instead.
+    """
+    tp = p.get("takeProfit")
+    try:
+        return tp is not None and float(tp) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+async def review_handovers(mine):
+    """Announce a trade the user has taken over, and one he has handed back."""
+    global handed_over_ids, buy_anchor, sell_anchor
+    global buy_waiting, sell_waiting, peak_buy_profit, peak_sell_profit
+    for p in mine:
+        pid = p.get("id")
+        is_buy = p.get("magic") == MAGIC_BUY
+        side = "الشراء" if is_buy else "البيع"
+        if user_took_over(p):
+            if pid in handed_over_ids:
+                continue
+            handed_over_ids.add(pid)
+            # The side goes idle rather than re-entering: the user is driving this one now.
+            if is_buy:
+                buy_anchor, buy_waiting, peak_buy_profit = None, False, 0.0
+            else:
+                sell_anchor, sell_waiting, peak_sell_profit = None, False, 0.0
+            await notify(
+                f"🤝 *سلّمتك الصفقة* — {side} `{p.get('volume')}`\n\n"
+                f"• حطّيت عليها هدف `{p.get('takeProfit')}` بنفسك، فرفعت يدي عنها تماماً.\n"
+                "• ما أغلقها ولا أحصدها، ولا يشملها زر «إغلاق جميع صفقات البوت».\n"
+                f"• جانب {side} صار فاضي — اضغط ارتكاز جديد وقت ما تريد.\n\n"
+                "تريدني أرجع أتحكم بيها؟ شيل الهدف من المنصة وأرجع لها فوراً.")
+        elif pid in handed_over_ids:
+            handed_over_ids.discard(pid)
+            await notify(f"↩️ *رجعت أتحكم بصفقة {side}* — شلت الهدف عنها، فرجعت تحت إدارتي بنفس الحدود.")
+    handed_over_ids &= {p.get("id") for p in mine}   # a closed trade must not linger here
+
+
 async def range_engine():
     global bot_active, connection, buy_anchor, sell_anchor, buy_waiting, sell_waiting
     global peak_buy_profit, peak_sell_profit, total_profit, buy_count, sell_count, last_price_ok
@@ -1096,8 +1143,12 @@ async def range_engine():
             last_price_ok = time.time()
 
             all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
-            buy_pos = [p for p in all_pos if p.get("symbol") == SYMBOL and p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY]
-            sell_pos = [p for p in all_pos if p.get("symbol") == SYMBOL and p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL]
+            mine = [p for p in all_pos if p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
+            await review_handovers(mine)
+            buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
+                       and not user_took_over(p)]
+            sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL
+                        and not user_took_over(p)]
 
             if len(buy_pos) > 0:
                 b = buy_pos[-1]
@@ -1270,13 +1321,20 @@ async def handle_callback(query):
             if connection:
                 try:
                     all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
+                    closed, skipped = 0, 0
                     for p in all_pos:
                         if p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL):
+                            if user_took_over(p):   # the user owns this one now
+                                skipped += 1
+                                continue
                             try:
                                 await asyncio.wait_for(connection.close_position(p["id"]), timeout=5.0)
+                                closed += 1
                             except Exception as e:
                                 log.warning(f"failed closing {p.get('id')}: {e}")
-                    txt = "🚨 **تم إغلاق صفقات الذهب.**"
+                    txt = f"🚨 **تم إغلاق `{closed}` من صفقات البوت.**"
+                    if skipped:
+                        txt += f"\n🤝 تركت `{skipped}` صفقة حاطط عليها هدف بنفسك — هي تحت إدارتك."
                 except Exception as e:
                     txt = f"⚠️ `{e}`"
                 await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")

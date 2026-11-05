@@ -125,3 +125,12 @@ Preferred: send `/setkey claude sk-ant-…` to the bot. Manual alternative:
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/trading_bot/.env
 sudo systemctl restart tradingbot
 ```
+
+## Handing a trade back to the user
+
+The bot opens every position bare — magic number only, no take profit — so a TP appearing
+on one of its trades can only have been set by the user in MT5. Two owners closing the same
+position is how a trade gets closed at the wrong moment, so the bot reads a TP as "you have
+this one": it stops harvesting that position, leaves it out of the panic-close button, and
+lets that side go idle instead of re-entering at the anchor. Removing the TP hands it back.
+Both transitions are announced once, and `/check` counts them.
