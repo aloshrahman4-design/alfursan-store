@@ -39,11 +39,19 @@ Automatic alerts: new gold-relevant headlines every `NEWS_POLL_MINUTES` (Claude 
 | `/start` | Control panel |
 | `/setkey claude sk-ant-…` | Writes the key into `.env`, reloads it live, deletes the message |
 | `/setkey news <finnhub_key>` | Optional; without it news comes from a keyless RSS source |
-| `/setkey metaapi <token>` | Validates the new MetaApi token against the account, backs up `.env`, swaps it in and restarts — the old token keeps working if the new one fails |
+| `/setkey metaapi <token>` | Validates the new MetaApi token, backs up `.env`, swaps it in and restarts — the old token keeps working if the new one fails. When the token opens exactly one trading account its ID is adopted automatically; when it opens several, the bot lists them with a ready-to-send `/setkey account …` line for each |
+| `/live` | Back to automatic execution: resolves the account from the token, turns signal mode off, sets `BROKER=metaapi`, restarts |
+| `/gold` | Asks the broker what gold is called on this account (`GOLD`, `XAUUSD`, `XAUUSD.r`, …), verifies it quotes a price, and stores it as `SYMBOL` |
+| `/setkey account <id>` | Sets `ACCOUNT_ID` — needed after changing broker |
 | `/keys` | Masked key status |
 | `/savings` | Hours and dollars saved by the weekend saver |
 | `/update` | Downloads the latest code from GitHub, compiles it, restarts |
 | `/restart` | Restart the process (systemd brings it back) |
+
+Settings are written to `.env`, which systemd reads as an `EnvironmentFile`. systemd keeps
+the **last** assignment of a key, so a write that only replaced the first occurrence left a
+stale duplicate below it silently winning — `/setkey broker metaapi` would appear to succeed
+while `BROKER=paper` further down still decided the behaviour. Writes now drop the extras.
 
 Only the first chat that ever talked to the bot is accepted; other chats are ignored.
 `/update` swaps files only after the new code compiles, so a broken push cannot take the bot down.

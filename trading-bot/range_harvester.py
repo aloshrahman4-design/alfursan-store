@@ -51,6 +51,8 @@ WAKE_GRACE_MINUTES = int(os.environ.get("WAKE_GRACE_MINUTES", "30"))
 WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
 SETTABLE_KEYS = {
     "META_API_TOKEN": "توكن MetaApi",
+    "ACCOUNT_ID": "رقم الحساب في MetaApi",
+    "SYMBOL": "اسم أداة الذهب عند الوسيط",
     "ANTHROPIC_API_KEY": "مفتاح Claude",
     "FINNHUB_API_KEY": "مفتاح الأخبار",
     "CLAUDE_MODEL": "نموذج Claude",
@@ -76,6 +78,8 @@ SETTABLE_KEYS = {
 }
 KEY_ALIASES = {
     "metaapi": "META_API_TOKEN", "token": "META_API_TOKEN", "meta": "META_API_TOKEN",
+    "account": "ACCOUNT_ID", "acc": "ACCOUNT_ID", "id": "ACCOUNT_ID",
+    "gold": "SYMBOL", "symbol": "SYMBOL", "asset": "SYMBOL",
     "claude": "ANTHROPIC_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
     "news": "FINNHUB_API_KEY", "finnhub": "FINNHUB_API_KEY",
     "model": "CLAUDE_MODEL", "hour": "DAILY_TRADE_HOUR_UTC",
@@ -178,6 +182,10 @@ def write_env_value(key, value):
         with open(ENV_PATH) as f:
             for line in f.read().splitlines():
                 if line.split("=", 1)[0].strip() == key:
+                    # systemd reads the LAST assignment, so a leftover duplicate below would
+                    # silently win and the new value would never take effect. Drop the extras.
+                    if replaced:
+                        continue
                     lines.append(f"{key}={value}")
                     replaced = True
                 else:
@@ -192,11 +200,12 @@ def write_env_value(key, value):
     os.environ[key] = value
 
 
-async def validate_metaapi_token(candidate):
+async def validate_metaapi_token(candidate, account_id=None):
     """Prove a new MetaApi token really opens this account before it replaces the old one."""
+    account_id = account_id if account_id is not None else ACCOUNT_ID
     probe = MetaApi(token=candidate)
     try:
-        acct = await asyncio.wait_for(probe.metatrader_account_api.get_account(ACCOUNT_ID), timeout=30.0)
+        acct = await asyncio.wait_for(probe.metatrader_account_api.get_account(account_id), timeout=30.0)
         return None, getattr(acct, "state", "?")
     except Exception as e:
         return str(e), None
@@ -205,6 +214,42 @@ async def validate_metaapi_token(candidate):
             await asyncio.wait_for(probe.close(), timeout=5.0)
         except Exception:
             pass
+
+
+async def list_metaapi_accounts(token):
+    """Every trading account this token can open.
+
+    Changing broker means a new account ID, and copying that ID off the MetaApi site on a
+    phone is exactly where this setup used to stall. The token already knows the answer,
+    so ask it instead of asking the user.
+    """
+    probe = MetaApi(token=token)
+    try:
+        accounts = await asyncio.wait_for(
+            probe.metatrader_account_api.get_accounts_with_infinite_scroll_pagination(), timeout=45.0)
+        return None, [{
+            "id": a.id,
+            "name": getattr(a, "name", "") or "",
+            "state": getattr(a, "state", "?"),
+            "server": getattr(a, "server", "") or "",
+            "login": getattr(a, "login", "") or "",
+        } for a in accounts]
+    except Exception as e:
+        return str(e), []
+    finally:
+        try:
+            await asyncio.wait_for(probe.close(), timeout=5.0)
+        except Exception:
+            pass
+
+
+def accounts_block(accounts):
+    """Render discovered accounts so the user can tap-copy the one he wants."""
+    out = []
+    for a in accounts:
+        label = a["name"] or a["login"] or "حساب"
+        out.append(f"• *{label}* — `{a['server']}`\n  `/setkey account {a['id']}`")
+    return "\n".join(out)
 
 
 async def broker_check():
@@ -242,6 +287,95 @@ async def broker_check():
     except Exception as e:
         lines.append(f"⚠️ الاتصال موجود بس الاستعلام فشل: `{str(e)[:250]}`")
     return "\n".join(lines)
+
+
+async def handle_go_live():
+    """/live — one command that puts the bot back on automatic execution through MetaApi.
+
+    Switching broker used to mean editing .env over SSH: new account ID, new symbol name,
+    SIGNAL off, BROKER back to metaapi. All of that is decided here from the token itself.
+    """
+    token = os.environ.get("META_API_TOKEN", "")
+    if not token:
+        await send_long("🔑 ناقص توكن MetaApi.\nأرسل: `/setkey metaapi <التوكن>`\n"
+                        "وأنا أجيب رقم الحساب لوحدي بعدها.", markup=keyboard())
+        return
+    await send_long("⏳ أتأكد من الحساب قبل ما أحوّل للتنفيذ الآلي...")
+    err, accounts = await list_metaapi_accounts(token)
+    if err:
+        await send_long(f"❌ ما كدرت أوصل MetaApi: `{err[:300]}`\n\n"
+                        "إذا التوكن قديم أرسل: `/setkey metaapi <التوكن الجديد>`", markup=keyboard())
+        return
+    if not accounts:
+        await send_long("⚠️ التوكن شغال بس ماكو أي حساب تداول مربوط بيه.\n"
+                        "افتح MetaApi ← Accounts ← Add account واربط حساب MT5 الجديد، ثم أرسل /live.",
+                        markup=keyboard())
+        return
+    chosen = next((a for a in accounts if a["id"] == ACCOUNT_ID), None)
+    if chosen is None and len(accounts) == 1:
+        chosen = accounts[0]
+    if chosen is None:
+        await send_long(f"عندك `{len(accounts)}` حسابات — اختر واحد وأرسل سطره، وبعدها أرسل /live:\n\n"
+                        + accounts_block(accounts), markup=keyboard())
+        return
+    write_env_value("ACCOUNT_ID", chosen["id"])
+    write_env_value("SIGNAL", "0")
+    write_env_value("BROKER", "metaapi")
+    label = chosen["name"] or chosen["login"] or chosen["id"]
+    await send_long(
+        "⚡ *رجعنا للتنفيذ الآلي*\n\n"
+        f"• الحساب: *{label}* (`{chosen['server']}`)\n"
+        f"• حالته: `{chosen['state']}`\n"
+        f"• اللوت: `{TRADE_LOT}`\n"
+        f"• أداة الذهب: `{SYMBOL}`\n\n"
+        "البوت يفتح ويغلق الصفقات بنفسه من الآن — ما تحتاج تلمس المنصة.\n"
+        "إذا اسم أداة الذهب مختلف عند وسيطك الجديد، أرسل `/gold` بعد ما يرجع وأنا أضبطه.\n\n"
+        "♻️ أعيد التشغيل الآن...")
+    os._exit(0)
+
+
+GOLD_CROSSES = ("EUR", "GBP", "AUD", "JPY", "CHF", "CNH", "SGD", "HKD", "CAD", "NZD")
+
+
+async def handle_gold_symbol():
+    """/gold — ask the broker what gold is called here, instead of guessing the name."""
+    if connection is None:
+        await send_long("ماكو اتصال بالحساب حالياً — أرسل /check وشوف السبب.", markup=keyboard())
+        return
+    if not hasattr(connection, "get_symbols"):
+        await send_long("هذا الأمر يشتغل بوضع MetaApi فقط. أرسل /live أول.", markup=keyboard())
+        return
+    await send_long("⏳ أدوّر على أداة الذهب بحسابك...")
+    try:
+        symbols = await asyncio.wait_for(connection.get_symbols(), timeout=30)
+    except Exception as e:
+        await send_long(f"⚠️ ما كدرت أجيب قائمة الأدوات: `{str(e)[:250]}`", markup=keyboard())
+        return
+    matches = [s for s in symbols if "XAU" in s.upper() or "GOLD" in s.upper()]
+    if not matches:
+        await send_long("⚠️ ما لكيت أي أداة ذهب بهذا الحساب. تأكد إن الذهب مفعّل عند الوسيط.",
+                        markup=keyboard())
+        return
+    # XAUEUR and friends are gold too, but not the one we trade.
+    best = [s for s in matches if not any(c in s.upper().replace("XAU", "") for c in GOLD_CROSSES)] or matches
+    if len(best) > 1:
+        lines = "\n".join(f"• `/setkey gold {s}`" for s in best[:12])
+        await send_long(f"لكيت أكثر من أداة ذهب — اختر واحدة وأرسل سطرها:\n\n{lines}", markup=keyboard())
+        return
+    found = best[0]
+    try:  # a name that does not quote is the wrong name, however right it looks
+        price = await asyncio.wait_for(connection.get_symbol_price(symbol=found), timeout=15)
+    except Exception as e:
+        await send_long(f"⚠️ لكيت `{found}` بس ما طلّع سعر: `{str(e)[:200]}`", markup=keyboard())
+        return
+    if found == SYMBOL:
+        await send_long(f"✅ اسم أداة الذهب صحيح أصلاً: `{SYMBOL}` — السعر `{price.get('bid')}`.",
+                        markup=keyboard())
+        return
+    write_env_value("SYMBOL", found)
+    await send_long(f"✅ أداة الذهب عند وسيطك اسمها `{found}` (السعر `{price.get('bid')}`) — ضبطتها.\n"
+                    "♻️ أعيد التشغيل الآن...")
+    os._exit(0)
 
 
 async def handle_capital_setup(text, chat_id, message_id):
@@ -324,11 +458,17 @@ async def handle_setkey(text, chat_id, message_id):
             log.warning(f"could not delete key message: {e}")
 
     if key == "META_API_TOKEN":
-        await send_long("⏳ أفحص التوكن الجديد قبل ما أستبدل القديم...")
-        err, state = await validate_metaapi_token(value)
+        await send_long("⏳ أفحص التوكن الجديد وأدوّر على حساباتك قبل ما أستبدل القديم...")
+        err, accounts = await list_metaapi_accounts(value)
         if err:
             await forget_message()
             await send_long(f"❌ التوكن الجديد ما اشتغل، خليت القديم مثل ما هو.\n`{err[:300]}`", markup=keyboard())
+            return
+        if not accounts:
+            await forget_message()
+            await send_long("⚠️ التوكن صحيح بس ماكو أي حساب تداول مربوط بيه.\n"
+                            "افتح MetaApi ← Accounts ← Add account واربط حساب MT5، ثم أعد الأمر.",
+                            markup=keyboard())
             return
         try:
             shutil.copy2(ENV_PATH, ENV_PATH + ".bak")
@@ -336,9 +476,23 @@ async def handle_setkey(text, chat_id, message_id):
             log.warning(f"env backup failed: {e}")
         write_env_value(key, value)
         await forget_message()
+        # A new broker means a new account ID. Pick it automatically when the answer is
+        # unambiguous, and only ask when the token really does open more than one account.
+        chosen = next((a for a in accounts if a["id"] == ACCOUNT_ID), None)
+        if chosen is None and len(accounts) == 1:
+            chosen = accounts[0]
+        if chosen is None:
+            await send_long(
+                "✅ التوكن صحيح وانحفظ.\n\n"
+                f"لكن عندك `{len(accounts)}` حسابات — اختر واحد وأرسل سطره:\n\n"
+                + accounts_block(accounts), markup=keyboard())
+            return
+        write_env_value("ACCOUNT_ID", chosen["id"])
+        label = chosen["name"] or chosen["login"] or chosen["id"]
         await send_long(
-            f"✅ التوكن الجديد صحيح (حالة الحساب: `{state}`) وتم حفظه.\n"
-            "♻️ أعيد التشغيل الآن بالتوكن الجديد.\n\n"
+            f"✅ التوكن صحيح وانحفظ، وربطته بحسابك *{label}* (`{chosen['server']}`).\n"
+            f"حالة الحساب: `{chosen['state']}`\n"
+            "♻️ أعيد التشغيل الآن.\n\n"
             "🔒 بعد ما يرجع البوت ويكتب لك ✅ تم الاتصال، امسح التوكن القديم من لوحة MetaApi.")
         os._exit(0)
 
@@ -352,7 +506,7 @@ async def handle_setkey(text, chat_id, message_id):
         await send_long(f"⚠️ فشل الحفظ: `{e}`")
         return
     await forget_message()
-    if key in ("BROKER", "FORCE_IPV4"):
+    if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
@@ -420,6 +574,9 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
+    "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
+    "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
     "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
@@ -1083,6 +1240,10 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/live"):
+                await handle_go_live()
+            elif text.startswith("/gold"):
+                await handle_gold_symbol()
             elif text.startswith("/paper"):
                 write_env_value("BROKER", "paper")
                 await send_long("📄 *تحويل إلى الحساب التجريبي الداخلي*\n"
@@ -1277,6 +1438,8 @@ async def main():
             BotCommand("savings", "كم وفّرنا من كلفة MetaApi"),
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("check", "فحص الاتصال والحساب"),
+            BotCommand("live", "تنفيذ آلي على MetaApi (البوت ينفّذ بنفسه)"),
+            BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
