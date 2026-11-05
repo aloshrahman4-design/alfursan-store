@@ -49,6 +49,10 @@ SESSION_HOURS_DEFAULT = float(os.environ.get("SESSION_HOURS", "3"))
 IDLE_SLEEP_MINUTES = int(os.environ.get("IDLE_SLEEP_MINUTES", "20"))
 WAKE_GRACE_MINUTES = int(os.environ.get("WAKE_GRACE_MINUTES", "30"))
 WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
+# A never-deployed account has to be provisioned on MetaApi's side and then log in to the
+# broker before it can quote anything. That is minutes on the first run, so a 30s wait made
+# a perfectly healthy new account report "Timed out waiting for MetaApi to synchronize".
+DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
 SETTABLE_KEYS = {
     "META_API_TOKEN": "توكن MetaApi",
     "ACCOUNT_ID": "رقم الحساب في MetaApi",
@@ -252,6 +256,46 @@ def accounts_block(accounts):
     return "\n".join(out)
 
 
+ACCOUNT_STATE_AR = {
+    "UNDEPLOYED": "مطفي عند MetaApi",
+    "DEPLOYING": "قيد التجهيز الآن",
+    "DEPLOYED": "مجهّز وشغال",
+    "UNDEPLOYING": "يُطفأ الآن",
+    "DRAFT": "ناقص إعدادات عند MetaApi",
+}
+BROKER_LINK_AR = {
+    "CONNECTED": "✅ متصل بالوسيط",
+    "DISCONNECTED": "❌ غير متصل بالوسيط",
+    "DISCONNECTED_FROM_BROKER": "❌ الوسيط رافض الدخول — تأكد من رقم الحساب وكلمة السر والسيرفر",
+}
+
+
+async def metaapi_account_line():
+    """What MetaApi itself says about the account.
+
+    When the bot cannot connect, the only question that matters is whether the account is
+    still waking up or whether the broker is refusing it. Those need very different answers
+    from the user, and the timeout message alone does not tell them apart.
+    """
+    token = os.environ.get("META_API_TOKEN", "")
+    if not token or not ACCOUNT_ID:
+        return None
+    probe = MetaApi(token=token)
+    try:
+        acct = await asyncio.wait_for(probe.metatrader_account_api.get_account(ACCOUNT_ID), timeout=30.0)
+        state = getattr(acct, "state", "?")
+        status = getattr(acct, "connection_status", "?")
+        return (f"• حالة الحساب: `{state}` — {ACCOUNT_STATE_AR.get(state, state)}\n"
+                f"• الربط بالوسيط: {BROKER_LINK_AR.get(status, status)}")
+    except Exception as e:
+        return f"• ما كدرت أقرأ حالة الحساب: `{str(e)[:150]}`"
+    finally:
+        try:
+            await asyncio.wait_for(probe.close(), timeout=5.0)
+        except Exception:
+            pass
+
+
 async def broker_check():
     """One place that answers 'is the bot actually able to trade right now?'"""
     lines = [f"🔎 *فحص الاتصال* — المنصة: `{BROKER}`"]
@@ -265,6 +309,12 @@ async def broker_check():
             lines.append("لسه ما ربطت الحساب. أرسل:\n`/capital <مفتاح> <إيميل> <كلمة سر>`")
         elif saver_sleeping:
             lines.append("😴 الحساب نائم لتوفير الكلفة — أي زر تداول يرجّعه.")
+        if BROKER == "metaapi":
+            state_line = await metaapi_account_line()
+            if state_line:
+                lines.append(state_line)
+                if "DEPLOYING" in state_line:
+                    lines.append("⏳ خليه يكمّل التجهيز — ممكن ياخذ لحد ١٠ دقائق بأول مرة.")
         return "\n".join(lines)
     try:
         acc = await asyncio.wait_for(connection.get_account_information(), timeout=10)
@@ -947,12 +997,16 @@ async def ensure_connection():
             log.info("Connecting MetaApi...")
             api_instance = MetaApi(token=META_API_TOKEN)
             account_instance = await api_instance.metatrader_account_api.get_account(ACCOUNT_ID)
-            if account_instance.state != "DEPLOYED":
+            cold = account_instance.state != "DEPLOYED"
+            if cold:
                 await account_instance.deploy()
-            await account_instance.wait_connected(timeout_in_seconds=30)
+                await notify("⏳ **الحساب يجهّز عند MetaApi لأول مرة** — ياخذ لحد ١٠ دقائق.\n"
+                             "خليه وأنا أكتب لك أول ما يخلص.")
+                await account_instance.wait_deployed(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
+            await account_instance.wait_connected(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
             conn = account_instance.get_rpc_connection()
             await conn.connect()
-            await conn.wait_synchronized(timeout_in_seconds=30)
+            await conn.wait_synchronized(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
             try:
                 await conn.subscribe_to_market_data(symbol=SYMBOL)
             except Exception:
