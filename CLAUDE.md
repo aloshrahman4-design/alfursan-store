@@ -23,7 +23,12 @@ Customers order via WhatsApp; no payment processing on-site.
 - `mods/alfursan-mods/` — Claude Code mod (function hooks): dashboard pane (`/alfursan`, `/task`),
   role team (`/team`, `/send`), automatic model tiering (`/saver`). Check with `claude plugin validate`/`test`.
 
+## Project skills (`.claude/skills/`)
+`pricing-change` (any price/markup fix), `store-security-review` (before merge/deploy),
+`iraqi-copy` (customer text), `pre-deploy` (before `firebase deploy`).
+
 ## Commands
+- Everything at once: `scripts/check.sh` (also runs in CI: `.github/workflows/check.yml`)
 - Bot tests: `cd telegram-bot && pip install -r requirements.txt pytest && python -m pytest -q tests`
 - Functions load check: `cd functions && npm ci && GCLOUD_PROJECT=test node -e 'require("./index.js")'`
 - Deploy functions: `firebase deploy --only functions:store`
