@@ -38,9 +38,10 @@ exports.createOrder = onRequest({ region: "europe-west1", cors: true }, async (r
   }
 
   const cleanItems = items
+    .slice(0, 100)
     .map((it) => ({
       name: String(it?.name || "").slice(0, 200),
-      qty: Math.max(1, Number(it?.qty) || 1),
+      qty: Math.min(999, Math.max(1, Math.floor(Number(it?.qty)) || 1)),
     }))
     .filter((it) => it.name);
 
@@ -54,7 +55,9 @@ exports.createOrder = onRequest({ region: "europe-west1", cors: true }, async (r
       orderNumber,
       page: String(page || "").slice(0, 50),
       items: cleanItems,
-      total: Number(total) || 0,
+      // المجموع يحسبه المتصفح، فممكن يتلاعب بيه — نخزنه كرقم مرجعي بس، والسعر
+      // النهائي يتأكد منه بالواتساب. نرفض القيم السالبة/غير المنطقية.
+      total: Number.isFinite(Number(total)) && Number(total) > 0 ? Math.min(Number(total), 1e9) : 0,
       status: "تجهيز",
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),

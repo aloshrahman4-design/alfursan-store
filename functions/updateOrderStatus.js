@@ -7,6 +7,7 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { safeEqual } = require("./safeEqual");
 
 if (!getApps().length) initializeApp();
 const db = getFirestore();
@@ -22,7 +23,7 @@ exports.updateOrderStatus = onRequest(
     }
 
     const { secret, orderNumber, status } = req.body || {};
-    if (secret !== ORDER_STATUS_SECRET.value()) {
+    if (!safeEqual(secret, ORDER_STATUS_SECRET.value())) {
       return res.status(401).json({ success: false, error: "unauthorized" });
     }
     if (!VALID_STATUSES.includes(status)) {

@@ -429,6 +429,11 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 def main() -> None:
     config.validate()
+    if not config.ALLOWED_USER_IDS:
+        logger.warning(
+            "ALLOWED_USER_IDS is empty: ANY Telegram user can use this bot and "
+            "spend the Gemini quota. Set ALLOWED_USER_IDS in .env for production."
+        )
 
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 

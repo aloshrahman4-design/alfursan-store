@@ -9,6 +9,7 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { safeEqual } = require("./safeEqual");
 
 if (!getApps().length) initializeApp();
 const db = getFirestore();
@@ -21,7 +22,7 @@ exports.claimAutopostJob = onRequest(
     if (req.method !== "POST") {
       return res.status(405).json({ success: false, error: "method_not_allowed" });
     }
-    if (req.body?.secret !== AUTOPOST_SECRET.value()) {
+    if (!safeEqual(req.body?.secret, AUTOPOST_SECRET.value())) {
       return res.status(401).json({ success: false, error: "unauthorized" });
     }
 
@@ -55,7 +56,7 @@ exports.reportAutopostResult = onRequest(
     if (req.method !== "POST") {
       return res.status(405).json({ success: false, error: "method_not_allowed" });
     }
-    if (req.body?.secret !== AUTOPOST_SECRET.value()) {
+    if (!safeEqual(req.body?.secret, AUTOPOST_SECRET.value())) {
       return res.status(401).json({ success: false, error: "unauthorized" });
     }
 

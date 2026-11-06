@@ -28,6 +28,10 @@ const TARGET_PAGES = {
 
 const REDIRECT_URI = "https://europe-west1-alfursan-market.cloudfunctions.net/fbOAuthCallback";
 
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
 function htmlPage(body) {
   return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
   <title>توكنات صفحات فيسبوك</title>
@@ -59,7 +63,7 @@ exports.fbOAuthCallback = onRequest(
     const code = req.query.code;
     const oauthError = req.query.error_description || req.query.error;
     if (oauthError) {
-      return res.status(400).send(htmlPage(`<div class="err">رفضتِ الطلب أو صار خطأ: ${oauthError}</div>`));
+      return res.status(400).send(htmlPage(`<div class="err">رفضتِ الطلب أو صار خطأ: ${escHtml(oauthError)}</div>`));
     }
     if (!code) {
       return res.status(400).send(htmlPage(`<div class="err">ماكو code بالرابط — افتحي رابط تسجيل الدخول من جديد.</div>`));
@@ -72,7 +76,7 @@ exports.fbOAuthCallback = onRequest(
       const shortRes = await fetch(
         `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token` +
           `?client_id=${FB_APP_ID.value()}&client_secret=${FB_APP_SECRET.value()}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}&code=${code}`
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&code=${encodeURIComponent(String(code))}`
       );
       const shortData = await shortRes.json();
       if (!shortRes.ok || !shortData.access_token) {
@@ -109,7 +113,7 @@ exports.fbOAuthCallback = onRequest(
 
       for (const [id, info] of Object.entries(found)) {
         const envKey = { "112226891773568": "FB_TOKEN_KANARI", "607377785783244": "FB_TOKEN_ALSHEKHA", "277922022078817": "FB_TOKEN_ALAMEERAT", "1174723282380393": "FB_TOKEN_DIJLA" }[id];
-        body += `<div class="token-box"><b>${info.name}</b> — <code>${envKey}</code><textarea rows="2" readonly onclick="this.select()">${info.token}</textarea></div>`;
+        body += `<div class="token-box"><b>${escHtml(info.name)}</b> — <code>${envKey}</code><textarea rows="2" readonly onclick="this.select()">${escHtml(info.token)}</textarea></div>`;
       }
       if (missing.length) {
         body += `<div class="err">ماكو توكن لهاي الصفحات: ${missing.map(([, n]) => n).join("، ")} — تأكدي انتي أدمن بيهم بفيسبوك، وإنك وافقتِ على كل الصلاحيات بصفحة تسجيل الدخول.</div>`;
@@ -117,7 +121,7 @@ exports.fbOAuthCallback = onRequest(
 
       return res.status(200).send(htmlPage(body));
     } catch (err) {
-      return res.status(500).send(htmlPage(`<div class="err">صار خطأ: ${err.message}</div>`));
+      return res.status(500).send(htmlPage(`<div class="err">صار خطأ: ${escHtml(err.message)}</div>`));
     }
   }
 );

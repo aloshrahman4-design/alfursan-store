@@ -9,6 +9,7 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { safeEqual } = require("./safeEqual");
 
 if (!getApps().length) initializeApp();
 const db = getFirestore();
@@ -27,7 +28,10 @@ exports.checkRepPin = onRequest(
     }
 
     const pin = String(req.body?.pin || "").trim();
-    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "unknown";
+    // أول قيمة بـ X-Forwarded-For يكتبها الزائر نفسه، فلو اعتمدنا عليها يگدر
+    // يغيرها كل محاولة ويتجاوز القفل. آخر قيمة تضيفها بنية Google فما تنزور.
+    const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const ip = xff[xff.length - 1] || req.ip || "unknown";
     const attemptRef = db.collection("rep_login_attempts").doc(ip);
 
     const snap = await attemptRef.get();
@@ -42,7 +46,7 @@ exports.checkRepPin = onRequest(
       });
     }
 
-    if (!pin || pin !== REP_PIN.value()) {
+    if (!pin || !safeEqual(pin, REP_PIN.value())) {
       const prevCount = data.lockedUntil && now >= data.lockedUntil ? 0 : (data.count || 0);
       const count = prevCount + 1;
       const locked = count >= MAX_ATTEMPTS;
