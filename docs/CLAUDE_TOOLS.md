@@ -80,6 +80,48 @@ strix --target ./
 
 ---
 
+---
+
+# الفيديو الثاني: 5 إضافات مجانية (تم التحقق منها من صفحاتها الرسمية)
+
+## 6) Agent Skills — يبرمج مثل مبرمج senior
+حزمة 25 مهارة من Addy Osmani (مدير سابق بجوجل)، تغطي كل مراحل المشروع: تحديد المتطلبات، التخطيط، البرمجة، الاختبار (TDD)، المراجعة، والنشر.
+
+```
+/plugin marketplace add addyosmani/agent-skills
+/plugin install agent-skills@addy-agent-skills
+```
+أو `npx skills add addyosmani/agent-skills --list` لتشوف المهارات قبل التثبيت وتختار منها.
+أنفع شي لنا: مراجعة الكود قبل الدمج، وTDD لملف `pricing.py`.
+
+## 7) Context7 — توثيق المكتبات بأحدث إصدار
+يعطي Claude توثيق حديث لأي مكتبة، فما يكتب كود بدوال قديمة. مفيد لنا مع `firebase-functions` و`python-telegram-bot` و`google-genai` (اللي تتغير واجهاتها كثير).
+
+```
+npx ctx7 setup
+```
+للحذف: `npx ctx7 remove`. المصدر: https://github.com/upstash/context7
+
+## 8) Graphify — يحوّل الكود لخريطة معرفة
+يقرأ ملفات المشروع ويبني خريطة تربط الأجزاء ببعض، فClaude يفهم المشروع بدون ما يقرأ كل الملفات (يوفر استهلاك).
+
+```
+pip install graphifyy && graphify install
+```
+(الاسم بحرفين y بالنهاية. إذا طلع خطأ externally-managed استخدم `pipx install graphifyy`.) ثم اكتب `/graphify` داخل Claude Code.
+المصدر: https://github.com/safishamsi/graphify
+
+## 9) 21st MCP — واجهات وتصاميم جاهزة
+مكتبة آلاف مكونات الواجهات (React) يستدعيها Claude بطلب واحد، مثل «سوي صفحة أسعار احترافية». تنفع لتحسين تصميم `index.html`.
+
+```
+npx @21st-dev/cli@latest init --client claude
+```
+يحتاج مفتاح API من https://21st.dev/mcp (لا تكتبه بالمحادثة أو بملفات المشروع). ملاحظة: المكونات بصيغة React وصفحاتنا HTML عادي، فتحتاج تحويل.
+
+## 10) Strix
+نفس الأداة الموجودة بالأعلى (رقم 3): تهاجم تطبيقك مثل هاكر محترف وتلقى الثغرات وتصلحها. الفيديو يعتبرها أهم إضافة، وفعلاً أنصح تشغلها على دوال الطلبات قبل أي إطلاق.
+
 ### ترتيب مقترح
 
 1. `claude-code-setup` أولاً (رسمية وآمنة) ← خله يقترح الباقي.
