@@ -20,6 +20,8 @@ Customers order via WhatsApp; no payment processing on-site.
 - `telegram-bot/` — Python bot: supplier product photo → Gemini Vision extracts prices →
   `pricing.py` applies markup with `Decimal` → Pillow patches the new price into the image.
   See `telegram-bot/README.md` (Arabic, detailed design notes and rejected approaches).
+- `mods/alfursan-mods/` — Claude Code mod (function hooks): dashboard pane (`/alfursan`, `/task`),
+  role team (`/team`, `/send`), automatic model tiering (`/saver`). Check with `claude plugin validate`/`test`.
 
 ## Commands
 - Bot tests: `cd telegram-bot && pip install -r requirements.txt pytest && python -m pytest -q tests`

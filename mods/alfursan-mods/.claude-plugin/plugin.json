@@ -1,0 +1,6 @@
+{
+  "name": "alfursan-mods",
+  "version": "0.1.0",
+  "description": "Dashboard pane with tasks and team messages, a role team that talks to each other, and automatic model picking to save usage.",
+  "types": "./types/index.d.ts"
+}
