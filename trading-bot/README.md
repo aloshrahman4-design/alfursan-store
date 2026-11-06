@@ -150,3 +150,18 @@ line of 4.95$, which the floor refuses, so the trade is held rather than harvest
 but it leaves alone any threshold the user set himself — writing one through `/setkey` pins
 it (`PROFIT_PINNED=1`). Rescaling a deliberate number is how a chosen 5$ harvest silently
 became 3.33$.
+
+## Stop loss
+
+A stop loss attached by the user is deliberately **not** a handover. A stop and the harvest
+rule do not compete — the stop decides how much a trade may lose, the harvest decides when
+a winner is taken — so the bot goes on managing a position the user has protected. Only a
+take profit hands a trade over, because that one does compete.
+
+What a stop does need is for the bot to notice when it fires. The close happens at the
+broker, so without `note_external_closes` the position would simply vanish: no message, no
+tally, and that side left holding an anchor it never re-enters — the bot would look alive
+while doing nothing. A bot position that disappears on two consecutive reads (one empty read
+can be a resync) is reported with its last seen result, and that side is cleared rather than
+re-entered: re-entry after a stop-out would fire immediately, since price sits on the wrong
+side of the anchor by definition. The user starts the next anchor himself.

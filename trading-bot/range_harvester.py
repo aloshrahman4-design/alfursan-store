@@ -140,6 +140,8 @@ buy_waiting, sell_waiting = False, False
 peak_buy_profit, peak_sell_profit = 0.0, 0.0
 # Trades the user has taken over by attaching his own take profit in the platform.
 handed_over_ids = set()
+# Last seen state of every bot position, so a close done at the broker is noticed.
+tracked_positions = {}
 total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
@@ -339,6 +341,9 @@ async def broker_check():
             f"• الوضع: {mode_label()}",
             f"• قاعدة الحصاد: ما يغلق قبل `{MIN_CASH_PROFIT}$`، وبعدها يغلق إذا رجع {trail_rule_line()}",
         ]
+        guarded = sum(1 for p in ours if has_stop_loss(p) and not user_took_over(p))
+        if guarded:
+            lines.append(f"• `{guarded}` صفقة عليها ستوب لوز منك — لسه تحت إدارتي عادي 🛡")
         if datafeed:
             lines.append(f"• {datafeed.calibration_line()}")
         if intel:
@@ -646,6 +651,7 @@ HELP_TEXT = (
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
     "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
     "• 🤝 *تسليم صفقة:* حط هدف (TP) على أي صفقة للبوت من المنصة وهو يرفع يده عنها نهائياً — شيل الهدف ويرجع لها\n"
+    "• 🛡 *ستوب لوز:* حطه بحرية — البوت يبقى يتحكم بالصفقة عادي، وإذا ضرب الستوب يخبرك ويوقف ذاك الجانب\n"
     "• /paper — تشغيل حساب تجريبي داخلي بدون وسيط ولا كلفة\n"
     "• /report — أداء الحساب التجريبي (ربح/خسارة، نسبة نجاح)\n"
     "• `/setkey metaapi <token>` — تبديل توكن MetaApi بعد فحصه\n"
@@ -1119,12 +1125,64 @@ def user_took_over(p):
     The bot opens every position bare — magic number only, no TP — so a TP showing up on
     one means the user set a target by hand in MT5. Two owners closing the same trade is
     how a position gets closed at the wrong moment, so the bot steps off instead.
+
+    A stop loss deliberately does NOT count. A stop and the harvest rule do not compete:
+    the stop only decides how much the trade may lose, the harvest only when a winner is
+    taken, so the bot goes on managing a trade the user has protected.
     """
     tp = p.get("takeProfit")
     try:
         return tp is not None and float(tp) > 0
     except (TypeError, ValueError):
         return False
+
+
+def has_stop_loss(p):
+    sl = p.get("stopLoss")
+    try:
+        return sl is not None and float(sl) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+async def note_external_closes(mine):
+    """Report a bot trade that disappeared without the bot closing it.
+
+    A stop loss the user attached fires at the broker, not here. Without this the position
+    would simply vanish: no message, no tally, and the side left holding an anchor it never
+    re-enters — the bot would look alive while doing nothing at all.
+    """
+    global tracked_positions, buy_anchor, sell_anchor
+    global buy_waiting, sell_waiting, peak_buy_profit, peak_sell_profit
+    live = {p.get("id") for p in mine}
+    for pid, info in list(tracked_positions.items()):
+        if pid in live:
+            info["missing"] = 0
+            continue
+        # One empty read can be a resync, not a close. Confirm it before saying anything.
+        info["missing"] = info.get("missing", 0) + 1
+        if info["missing"] < 2:
+            continue
+        tracked_positions.pop(pid, None)
+        is_buy, side = info["buy"], ("الشراء" if info["buy"] else "البيع")
+        if is_buy:
+            buy_anchor, buy_waiting, peak_buy_profit = None, False, 0.0
+        else:
+            sell_anchor, sell_waiting, peak_sell_profit = None, False, 0.0
+        await notify(
+            f"🛑 *صفقة {side} انغلقت من المنصة مو مني*\n\n"
+            f"• غالباً الستوب لوز اللي حاططه عليها، أو أغلقتها بيدك.\n"
+            f"• آخر نتيجة شفتها عليها: `{round(info['profit'], 2)}$` — تقريبية، الرقم الدقيق بكشف حسابك.\n"
+            f"• ما أعيد الدخول تلقائياً بعد ستوب، فجانب {side} صار فاضي.\n\n"
+            "اضغط ارتكاز جديد لما تريد تكمل.")
+    for p in mine:
+        pid = p.get("id")
+        entry = tracked_positions.setdefault(pid, {"buy": p.get("magic") == MAGIC_BUY, "profit": 0.0})
+        entry["missing"] = 0
+        try:
+            entry["profit"] = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
 
 
 async def review_handovers(mine):
@@ -1175,6 +1233,7 @@ async def range_engine():
             all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
             mine = [p for p in all_pos if p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
             await review_handovers(mine)
+            await note_external_closes(mine)
             buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
                        and not user_took_over(p)]
             sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL
@@ -1190,6 +1249,7 @@ async def range_engine():
                         peak_buy_profit = curr_profit
                     if curr_profit <= (peak_buy_profit - give_back_limit(peak_buy_profit)):
                         if await safe_close_position(b["id"]):
+                            tracked_positions.pop(b["id"], None)
                             total_profit += curr_profit
                             buy_count += 1
                             buy_waiting = True
@@ -1219,6 +1279,7 @@ async def range_engine():
                         peak_sell_profit = curr_profit
                     if curr_profit <= (peak_sell_profit - give_back_limit(peak_sell_profit)):
                         if await safe_close_position(s["id"]):
+                            tracked_positions.pop(s["id"], None)
                             total_profit += curr_profit
                             sell_count += 1
                             sell_waiting = True
@@ -1359,6 +1420,7 @@ async def handle_callback(query):
                                 continue
                             try:
                                 await asyncio.wait_for(connection.close_position(p["id"]), timeout=5.0)
+                                tracked_positions.pop(p["id"], None)
                                 closed += 1
                             except Exception as e:
                                 log.warning(f"failed closing {p.get('id')}: {e}")
