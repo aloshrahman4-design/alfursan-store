@@ -122,6 +122,43 @@ npx @21st-dev/cli@latest init --client claude
 ## 10) Strix
 نفس الأداة الموجودة بالأعلى (رقم 3): تهاجم تطبيقك مثل هاكر محترف وتلقى الثغرات وتصلحها. الفيديو يعتبرها أهم إضافة، وفعلاً أنصح تشغلها على دوال الطلبات قبل أي إطلاق.
 
+---
+
+# الفيديو الثالث: 7 سكيلات (تم التحقق منها من صفحاتها الرسمية)
+
+| # | السكيل | شنو يسوي | التثبيت (داخل Claude Code) |
+|---|---|---|---|
+| 1 | **frontend-design** (رسمي من Anthropic) | يصمم واجهات ما تبين "مصنوعة بالذكاء الاصطناعي" | `/plugin install frontend-design@claude-plugins-official` |
+| 2 | **Humanizer** | يعيد كتابة النص حتى ما ينكشف أنه AI، ويقلد أسلوبك | `/plugin marketplace add blader/humanizer` ثم `/plugin install humanizer@humanizer` |
+| 3 | **أوامر موجودة أصلاً** | `/simplify` و`/security-review` و`/loop` جاهزة بدون تثبيت | لا يحتاج تثبيت |
+| 4 | **HyperFrames** (HeyGen) | يسوي فيديوهات وأنيميشن احترافي من الكود | `/plugin marketplace add heygen-com/hyperframes` ثم `/plugin install hyperframes@hyperframes` |
+| 5 | **Marketing Skills** | فريق تسويق كامل: SEO، كتابة إعلانات، تحسين التحويل، إيميلات | `/plugin marketplace add coreyhaines31/marketingskills` |
+| 6 | **Claude in Chrome** (رسمي) | يتحكم بمتصفحك: يتصفح ويعبي النماذج ويبحث بدالك | ملحق Chrome الرسمي من متجر Chrome، ثم `claude --chrome` |
+| 7 | **Superpowers** | يفكر ويخطط قبل ما يبني (الهدف، المستخدم، الأولويات) ثم يبني خطوة خطوة بالاختبارات | `/plugin install superpowers@claude-plugins-official` |
+
+**ملاحظة على 3:** الفيديو يذكر `/deep-research` كأمر موجود، لكن ما قدرت أتأكد منه بنسختي الحالية، فجربه عندك. `/simplify` و`/security-review` و`/loop` أكيد موجودين.
+**أنفع لمتجرنا:** frontend-design لتحسين `index.html`، وMarketing Skills لنصوص المنتجات والإعلانات، وHumanizer لمنشورات الفيسبوك، وSuperpowers قبل أي ميزة كبيرة.
+
+## نسخة وحدة تلصقها كلها (داخل Claude Code)
+
+```
+/plugin install claude-code-setup@claude-plugins-official
+/plugin install frontend-design@claude-plugins-official
+/plugin install superpowers@claude-plugins-official
+/plugin marketplace add thedotmack/claude-mem
+/plugin install claude-mem@thedotmack
+/plugin marketplace add addyosmani/agent-skills
+/plugin install agent-skills@addy-agent-skills
+/plugin marketplace add blader/humanizer
+/plugin install humanizer@humanizer
+/plugin marketplace add heygen-com/hyperframes
+/plugin install hyperframes@hyperframes
+/plugin marketplace add coreyhaines31/marketingskills
+```
+ثم من الطرفية: `npx ctx7 setup` و`npx skills add usestrix/strix`.
+
+⚠️ لا تثبّت الكل مرة وحدة: كل سكيل ياخذ جزء من سياق Claude ويقلل تركيزه. ابدأ بـ 4 أو 5 تحتاجها فعلاً (أنصح: superpowers وfrontend-design وContext7 وStrix وclaude-mem) وزيد حسب الشغل.
+
 ### ترتيب مقترح
 
 1. `claude-code-setup` أولاً (رسمية وآمنة) ← خله يقترح الباقي.
