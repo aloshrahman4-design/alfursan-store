@@ -11,6 +11,10 @@ EnvironmentFile=/home/ubuntu/trading_bot/.env
 ExecStart=/home/ubuntu/trading_bot/venv/bin/python /home/ubuntu/trading_bot/range_harvester.py
 Restart=always
 RestartSec=5
+# TradingView only posts to ports 80 and 443, so the bot has to bind a privileged
+# port while still running as an unprivileged user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

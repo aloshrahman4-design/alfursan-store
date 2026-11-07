@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -56,6 +57,20 @@ WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
 # broker before it can quote anything. That is minutes on the first run, so a 30s wait made
 # a perfectly healthy new account report "Timed out waiting for MetaApi to synchronize".
 DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
+# --- TradingView webhook ------------------------------------------------------------
+# TradingView posts alerts to ports 80/443 only, over IPv4, and cancels a request that
+# takes more than three seconds. It sends no headers we could authenticate with, so the
+# secret lives in the URL path and the four addresses it publishes are the only senders
+# accepted. HOOK_MODE starts at "watch": signals are reported, not traded, until the user
+# has seen them arrive correctly and arms it with /hook trade.
+HOOK_ENABLED = os.environ.get("HOOK_ENABLED", "1") not in ("0", "false", "no")
+HOOK_PORT = int(os.environ.get("HOOK_PORT", "80"))
+HOOK_SECRET = os.environ.get("HOOK_SECRET", "")
+HOOK_MODE = os.environ.get("HOOK_MODE", "watch").strip().lower()      # watch | trade
+HOOK_HOST = os.environ.get("HOOK_HOST", "").strip()
+HOOK_ALLOW_IPS = os.environ.get(
+    "HOOK_ALLOW_IPS", "52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7")
+HOOK_MAX_BODY = 8192
 SETTABLE_KEYS = {
     "META_API_TOKEN": "توكن MetaApi",
     "ACCOUNT_ID": "رقم الحساب في MetaApi",
@@ -81,6 +96,12 @@ SETTABLE_KEYS = {
     "PULLBACK_CASH": "الارتداد المسموح من القمة بالدولار",
     "PULLBACK_PCT": "الارتداد المسموح كنسبة % من القمة (0 = استخدم الدولار)",
     "BREAKOUT_DIST": "مسافة الاختراق للارتكاز الجديد",
+    "HOOK_ENABLED": "استقبال إشارات TradingView (1 أو 0)",
+    "HOOK_MODE": "تصرف الإشارة: watch مراقبة فقط أو trade تنفيذ",
+    "HOOK_PORT": "منفذ استقبال الإشارات (80 أو 443)",
+    "HOOK_HOST": "عنوان السيرفر العام للرابط",
+    "HOOK_SECRET": "السر داخل رابط الإشارات",
+    "HOOK_ALLOW_IPS": "عناوين TradingView المسموحة (فاضي = الكل)",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -97,6 +118,8 @@ KEY_ALIASES = {
     "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
+    "hookmode": "HOOK_MODE", "hookport": "HOOK_PORT", "hookhost": "HOOK_HOST",
+    "hooksecret": "HOOK_SECRET", "hookips": "HOOK_ALLOW_IPS", "hookon": "HOOK_ENABLED",
 }
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -142,6 +165,7 @@ peak_buy_profit, peak_sell_profit = 0.0, 0.0
 handed_over_ids = set()
 # Last seen state of every bot position, so a close done at the broker is noticed.
 tracked_positions = {}
+hook_last, hook_count = None, 0
 total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
@@ -644,6 +668,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /hook — ربط TradingView: الرابط والحالة (`/hook trade` للتنفيذ، `/hook watch` للمراقبة)\n"
     "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
@@ -1214,6 +1239,243 @@ async def review_handovers(mine):
     handed_over_ids &= {p.get("id") for p in mine}   # a closed trade must not linger here
 
 
+# --- TradingView webhook -------------------------------------------------------------
+BUY_WORDS = ("buy", "long", "شراء")
+SELL_WORDS = ("sell", "short", "بيع")
+CLOSE_WORDS = ("close", "exit", "flat", "اغلاق", "إغلاق", "اغلق", "أغلق")
+HOOK_LABEL = {"buy": "🟢 شراء", "sell": "🔴 بيع", "close": "🚪 إغلاق"}
+
+
+def read_signal(body):
+    """Work out what an alert is asking for, from JSON or from plain text.
+
+    The user writes the alert message himself in TradingView, so this reads intent rather
+    than a fixed format: an Arabic 'فرصة شراء', an English 'buy', or a JSON payload all
+    arrive here. A message carrying both sides is refused rather than guessed at — opening
+    the wrong direction costs real money.
+    """
+    text = (body or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                text = " ".join(str(v) for v in data.values())
+        except Exception:
+            pass
+    low = text.lower()
+    if any(w in low for w in CLOSE_WORDS):
+        return "close", text
+    hit_buy = any(w in low for w in BUY_WORDS)
+    hit_sell = any(w in low for w in SELL_WORDS)
+    if hit_buy == hit_sell:          # both, or neither: never guess a direction
+        return None, text
+    return ("buy" if hit_buy else "sell"), text
+
+
+async def close_bot_positions():
+    """Close every position the bot owns and still controls. Returns (closed, left alone)."""
+    if not connection:
+        return 0, 0
+    closed, skipped = 0, 0
+    all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
+    for p in all_pos:
+        if p.get("symbol") != SYMBOL or p.get("magic") not in (MAGIC_BUY, MAGIC_SELL):
+            continue
+        if user_took_over(p):        # the user owns this one now
+            skipped += 1
+            continue
+        try:
+            await asyncio.wait_for(connection.close_position(p["id"]), timeout=5.0)
+            tracked_positions.pop(p["id"], None)
+            closed += 1
+        except Exception as e:
+            log.warning(f"failed closing {p.get('id')}: {e}")
+    return closed, skipped
+
+
+async def on_hook_signal(body, ip):
+    """Act on one alert. Runs after the HTTP reply, never inside it."""
+    global hook_last, hook_count
+    action, text = read_signal(body)
+    short = (text.strip()[:200] or "(رسالة فارغة)")
+    hook_count += 1
+    hook_last = (datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), action or "غير مفهومة", short[:120])
+    log.info(f"webhook signal from {ip}: action={action} body={text[:120]!r}")
+
+    if action is None:
+        await notify(f"📡 *وصلت إشارة من TradingView* بس ما عرفت شتريد:\n`{short}`\n\n"
+                     "لازم نص التنبيه يحتوي *شراء* أو *بيع* (أو buy / sell) — وحدة منهم مو الثنتين.")
+        return
+    label = HOOK_LABEL[action]
+    if HOOK_MODE != "trade":
+        await notify(f"📡 *إشارة {label} من TradingView*\n`{short}`\n\n"
+                     "👁 وضع المراقبة — ما نفّذت شي.\n"
+                     "لما تتأكد إن الإشارات تجيك صح وبوقتها، أرسل `/hook trade`.")
+        return
+    if not bot_active:
+        await notify(f"📡 إشارة {label} وصلت، بس النظام مطفي من اللوحة — ما نفّذت.")
+        return
+    if not await wake_for_execution("إشارة TradingView"):
+        await notify(f"📡 إشارة {label} وصلت بس ما كدرت أجهّز الحساب بالوقت — ما نفّذت.")
+        return
+    try:
+        if action == "buy":
+            await set_new_buy_anchor(manual=True)
+        elif action == "sell":
+            await set_new_sell_anchor(manual=True)
+        else:
+            closed, skipped = await close_bot_positions()
+            msg = f"📡 إشارة إغلاق من TradingView — أغلقت `{closed}` صفقة."
+            if skipped:
+                msg += f"\n🤝 تركت `{skipped}` صفقة سلّمتها لك."
+            await notify(msg)
+    except Exception as e:
+        log.error(f"webhook execution failed: {e}", exc_info=True)
+        await notify(f"⚠️ إشارة {label} وصلت بس التنفيذ فشل: `{str(e)[:200]}`")
+
+
+async def hook_server():
+    """A tiny HTTP endpoint for TradingView alerts.
+
+    Hand-rolled rather than pulling in a web framework: one route, one method, and the bot
+    already has enough moving parts. The reply goes out before any trading work starts,
+    because TradingView cancels a request that takes longer than three seconds.
+    """
+    if not (HOOK_ENABLED and HOOK_SECRET):
+        log.info("webhook listener off (disabled or no secret)")
+        return
+    allow = {ip.strip() for ip in HOOK_ALLOW_IPS.split(",") if ip.strip()}
+    want_path = f"/hook/{HOOK_SECRET}"
+
+    async def handle(reader, writer):
+        ok, body, ip = False, "", "?"
+        try:
+            peer = writer.get_extra_info("peername")
+            ip = peer[0] if peer else "?"
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+            lines = head.decode("latin-1").split("\r\n")
+            parts = lines[0].split()
+            method, path = (parts + ["", ""])[:2]
+            length = 0
+            for h in lines[1:]:
+                if h.lower().startswith("content-length:"):
+                    try:
+                        length = max(0, min(int(h.split(":", 1)[1].strip()), HOOK_MAX_BODY))
+                    except ValueError:
+                        length = 0
+            if length:
+                raw = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
+                body = raw.decode("utf-8", "replace")
+            ok = (method.upper() == "POST"
+                  and hmac.compare_digest(path.strip(), want_path)
+                  and (not allow or ip in allow))
+            if not ok:
+                log.warning(f"webhook rejected from {ip}: {method} {path[:40]}")
+            status = b"200 OK" if ok else b"403 Forbidden"
+            writer.write(b"HTTP/1.1 " + status + b"\r\nContent-Type: text/plain\r\n"
+                         b"Content-Length: 2\r\nConnection: close\r\n\r\nok")
+            await writer.drain()
+        except Exception as e:
+            ok = False
+            log.warning(f"webhook request from {ip} failed: {e}")
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        if ok:   # answered first, traded second
+            asyncio.create_task(on_hook_signal(body, ip))
+
+    try:
+        server = await asyncio.start_server(handle, "0.0.0.0", HOOK_PORT)
+    except Exception as e:
+        log.error(f"webhook listener failed on port {HOOK_PORT}: {e}")
+        await notify(f"⚠️ *ما كدرت أفتح منفذ الإشارات* `{HOOK_PORT}`\n`{str(e)[:160]}`\n\n"
+                     "منفذ 80 يحتاج صلاحية. الحل بأمر واحد بالسيرفر موجود بالشرح.")
+        return
+    log.info(f"webhook listening on 0.0.0.0:{HOOK_PORT}{want_path}")
+    async with server:
+        await server.serve_forever()
+
+
+def hook_status_text():
+    url = f"http://{HOOK_HOST or '<عنوان-السيرفر>'}:{HOOK_PORT}/hook/{HOOK_SECRET or '<السر>'}"
+    if HOOK_PORT in (80, 443):
+        scheme = "https" if HOOK_PORT == 443 else "http"
+        url = f"{scheme}://{HOOK_HOST or '<عنوان-السيرفر>'}/hook/{HOOK_SECRET or '<السر>'}"
+    state = ("🚀 *تنفيذ* — الإشارة تفتح صفقة فعلية" if HOOK_MODE == "trade"
+             else "👁 *مراقبة* — يخبرك بالإشارة بدون تنفيذ")
+    lines = [
+        "📡 *ربط TradingView*", "",
+        f"• الحالة: {'✅ شغال' if HOOK_ENABLED and HOOK_SECRET else '❌ مطفي'}",
+        f"• الوضع: {state}",
+        f"• المنفذ: `{HOOK_PORT}`",
+        f"• إشارات وصلت: `{hook_count}`",
+    ]
+    if hook_last:
+        when, act, body = hook_last
+        lines.append(f"• آخر إشارة: `{when}` → *{act}*\n  `{body}`")
+    lines += ["", "*الرابط اللي تحطه بخانة Webhook URL:*", f"`{url}`", "",
+              "*نص التنبيه:* اكتب فيه كلمة `شراء` أو `بيع` — وحدة بس.", "",
+              "`/hook trade` للتنفيذ · `/hook watch` للمراقبة"]
+    return "\n".join(lines)
+
+
+async def detect_public_ip():
+    """The address TradingView has to reach. Asked for once, then stored."""
+    cmd = ["curl", "-fsS", "--max-time", "10", "https://api.ipify.org"]
+    if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+        cmd.insert(1, "-4")
+    try:
+        got = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=15)
+        ip = (got.stdout or "").strip()
+        return ip if ip.count(".") == 3 and len(ip) <= 15 else None
+    except Exception as e:
+        log.warning(f"public ip lookup failed: {e}")
+        return None
+
+
+async def handle_hook_command(text):
+    """/hook — show the link and state. /hook trade | watch | off | on — change it."""
+    global HOOK_HOST
+    arg = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) > 1 else ""
+    if arg in ("trade", "تنفيذ"):
+        if HOOK_MODE == "trade":
+            await send_long("🚀 وضع التنفيذ مفعّل أصلاً.", markup=keyboard())
+            return
+        write_env_value("HOOK_MODE", "trade")
+        await send_long("🚀 *فعّلت التنفيذ من إشارات TradingView*\n\n"
+                        f"أي إشارة شراء أو بيع راح تفتح صفقة حقيقية بـ `{TRADE_LOT}` لوت فوراً.\n"
+                        "ترجعه للمراقبة بأمر `/hook watch`.\n\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("watch", "مراقبة"):
+        write_env_value("HOOK_MODE", "watch")
+        await send_long("👁 رجعته للمراقبة — يخبرك بالإشارة بدون أي تنفيذ.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("off", "stop", "ايقاف", "إيقاف"):
+        write_env_value("HOOK_ENABLED", "0")
+        await send_long("🛑 أطفيت استقبال الإشارات نهائياً.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("on", "تشغيل"):
+        write_env_value("HOOK_ENABLED", "1")
+        await send_long("✅ شغّلت استقبال الإشارات.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("new", "reset", "تجديد"):
+        import secrets
+        fresh = secrets.token_urlsafe(24)
+        write_env_value("HOOK_SECRET", fresh)
+        await send_long("🔑 بدّلت السر — الرابط القديم بطل.\n"
+                        "بعد ما أرجع أرسل `/hook` وحدّث الرابط بـ TradingView.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if not HOOK_HOST:
+        await send_long("⏳ أدوّر على عنوان السيرفر العام...")
+        found = await detect_public_ip()
+        if found:
+            HOOK_HOST = found
+            write_env_value("HOOK_HOST", found)
+    await send_long(hook_status_text(), markup=keyboard())
+
+
 async def range_engine():
     global bot_active, connection, buy_anchor, sell_anchor, buy_waiting, sell_waiting
     global peak_buy_profit, peak_sell_profit, total_profit, buy_count, sell_count, last_price_ok
@@ -1411,19 +1673,7 @@ async def handle_callback(query):
                 await wake_for_execution("طلب إغلاق الصفقات")
             if connection:
                 try:
-                    all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
-                    closed, skipped = 0, 0
-                    for p in all_pos:
-                        if p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL):
-                            if user_took_over(p):   # the user owns this one now
-                                skipped += 1
-                                continue
-                            try:
-                                await asyncio.wait_for(connection.close_position(p["id"]), timeout=5.0)
-                                tracked_positions.pop(p["id"], None)
-                                closed += 1
-                            except Exception as e:
-                                log.warning(f"failed closing {p.get('id')}: {e}")
+                    closed, skipped = await close_bot_positions()
                     txt = f"🚨 **تم إغلاق `{closed}` من صفقات البوت.**"
                     if skipped:
                         txt += f"\n🤝 تركت `{skipped}` صفقة حاطط عليها هدف بنفسك — هي تحت إدارتك."
@@ -1447,6 +1697,8 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/hook"):
+                await handle_hook_command(text)
             elif text.startswith("/live"):
                 await handle_go_live()
             elif text.startswith("/gold"):
@@ -1653,6 +1905,7 @@ async def main():
             BotCommand("check", "فحص الاتصال والحساب"),
             BotCommand("live", "تنفيذ آلي على MetaApi (البوت ينفّذ بنفسه)"),
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
+            BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
@@ -1666,12 +1919,19 @@ async def main():
         ])
     except Exception as e:
         log.warning(f"set_my_commands failed: {e}")
+    global HOOK_SECRET
+    if HOOK_ENABLED and not HOOK_SECRET:
+        import secrets
+        HOOK_SECRET = secrets.token_urlsafe(24)
+        write_env_value("HOOK_SECRET", HOOK_SECRET)
+        log.info("generated a webhook secret")
     log.info("Bot booting up (supervised mode)")
     tasks = [
         supervise("connection", ensure_connection),
         supervise("range_engine", range_engine),
         supervise("telegram_listener", telegram_listener),
         supervise("cost_governor", cost_governor),
+        supervise("hook_server", hook_server),
     ]
     if intel is not None and not LEAN:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))

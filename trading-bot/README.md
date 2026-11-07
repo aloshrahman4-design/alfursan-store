@@ -165,3 +165,22 @@ while doing nothing. A bot position that disappears on two consecutive reads (on
 can be a resync) is reported with its last seen result, and that side is cleared rather than
 re-entered: re-entry after a stop-out would fire immediately, since price sits on the wrong
 side of the anchor by definition. The user starts the next anchor himself.
+
+## TradingView signals
+
+TradingView posts alerts over plain HTTP to ports 80 and 443 only, IPv4 only, and cancels
+a request that takes more than three seconds. It sends no header a receiver could
+authenticate with, so three things stand in for that: the secret sits in the URL path
+(`/hook/<HOOK_SECRET>`, generated on first boot and compared with `hmac.compare_digest`),
+the four addresses TradingView publishes are the only accepted senders (`HOOK_ALLOW_IPS`,
+empty to accept any), and the HTTP reply is written before any trading work starts.
+
+The listener is ~60 lines of `asyncio.start_server` rather than a web framework: one route,
+one method, and the bot has enough moving parts already. Binding port 80 as an
+unprivileged user needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit file.
+
+`HOOK_MODE` starts at `watch`: a signal is reported and nothing is traded, so the user can
+confirm alerts arrive correctly and on time before `/hook trade` arms it against a live
+account. An alert naming both directions, or neither, is reported rather than guessed at —
+`read_signal` reads intent from Arabic, English or JSON, and refusing is cheaper than
+opening the wrong side.
