@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { InboxMessage, Tab, Task, ModelTier } from '../types'
+import type { InboxMessage, Lesson, Tab, Task, ModelTier } from '../types'
 
 // ثلاث أفكار من فيديو "Claude Code Mods":
 // 1) جلسات تتكلم وية بعض: /team يشغّل فريق (باحث، مسوّق، مدير) يتراسلون،
@@ -16,6 +16,7 @@ const tasks = atom({ plugin: 'alfursan-mods', key: 'tasks' } as const, [], { sha
 const inbox = atom({ plugin: 'alfursan-mods', key: 'inbox' } as const, [], { shape: 'inbox-1' })
 const tier = atom({ plugin: 'alfursan-mods', key: 'modelTier' } as const, null as ModelTier | null)
 const isSaverOn = atom({ plugin: 'alfursan-mods', key: 'isSaverOn' } as const, true)
+const lessons = atom({ plugin: 'alfursan-mods', key: 'lessons' } as const, [], { shape: 'lessons-1' })
 const tab = atom({ plugin: 'alfursan-mods', key: 'tab' } as const, 'tasks')
 
 // ---------- اختيار الموديل ----------
@@ -50,6 +51,21 @@ const MODEL_LABEL: Record<ModelTier['model'], string> = {
   opus: 'Opus (الأقوى)',
 }
 
+
+// ---------- الملاحظات (فكرة Task Observer + claude-mem) ----------
+// يراقب تصحيحاتك ("لا"، "غلط"، "مو هيج") ويحفظها، ويرجّع آخر الدروس
+// للجلسة الجاية حتى ما يكرر Claude نفس الغلطة. بدون أي طلب إضافي للموديل.
+const CORRECTION = /^\s*(لا[\s،,.!]|لا$|مو\s|مب\s|غلط|خطأ|ماكو|مو هيج|مو هذا|ارجع|رجّع|رجع)|\b(wrong|not what i|that's not|don't|do not|stop doing|undo|revert)\b/i
+const MAX_LESSONS = 40
+
+function lessonsText(list: Lesson[]): string {
+  return list.slice(-8).map(l => `- ${l.text}`).join('\n')
+}
+
+async function persistLessons($: any, list: Lesson[]) {
+  await $.store.set('lessons', list)
+}
+
 // ---------- فريق الجلسات ----------
 function teamPrompt(goal: string): string {
   return [
@@ -69,6 +85,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const stored = await $.store.get('tasks')
     if (Array.isArray(stored)) await update($, tasks, () => stored as Task[])
+    const storedLessons = await $.store.get('lessons')
+    if (Array.isArray(storedLessons)) await update($, lessons, () => storedLessons as Lesson[])
     const saver = await $.store.get('isSaverOn')
     if (typeof saver === 'boolean') await update($, isSaverOn, () => saver)
 
@@ -78,6 +96,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'send', description: 'أرسل رسالة لجلسة أو وكيل: /send الاسم الرسالة' })
     await $.command.register({ name: 'saver', description: 'اختيار الموديل التلقائي: /saver on | off' })
 
+    await $.command.register({ name: 'lesson', description: 'سجّل درس يتذكره Claude: /lesson النص | /lesson save لحفظها بالمشروع | /lesson clear' })
     void $.ui.open({ id: PANE, title: 'لوحة الفرسان' })
     return next(e)
   })
@@ -148,6 +167,68 @@ export const register: Register = on => {
     return { text: isOn ? 'اختيار الموديل التلقائي: شغّال' : 'اختيار الموديل التلقائي: طافي (يرجع لموديلك)' }
   })
 
+
+  on('command.run', { command: 'lesson' }, async ($, e) => {
+    const args = e.args.trim()
+    const list = await read($, lessons)
+    if (!args) {
+      return { text: list.length ? list.map((l, i) => `${i + 1}. [${l.kind === 'manual' ? 'يدوي' : 'تصحيح'}] ${l.text}`).join('\n') : 'ماكو دروس لحد الآن.' }
+    }
+    if (/^clear$/i.test(args)) {
+      await update($, lessons, () => [])
+      await persistLessons($, [])
+      return { text: 'انمسحت الدروس.' }
+    }
+    if (/^save$/i.test(args)) {
+      const root = await $.session.root()
+      const file = `${root}/docs/lessons.md`
+      const body = ['# دروس تعلمها Claude بهذا المشروع', '', ...list.map(l => `- ${l.text}`), ''].join('\n')
+      await $.fs.write(file, body)
+      return { text: `انحفظت ${list.length} دروس بـ docs/lessons.md. ضيفها لـ CLAUDE.md إذا تريدها دائمية.` }
+    }
+    const item: Lesson = { at: await $.clock.now(), kind: 'manual', text: args.slice(0, 300) }
+    const next = [...list, item].slice(-MAX_LESSONS)
+    await update($, lessons, () => next)
+    await persistLessons($, next)
+    return { text: `تذكرت: ${args}` }
+  })
+
+  // يلتقط تصحيحاتك تلقائياً (بدون ما يغيّر الرسالة)
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      if (!e.command && !e.isMeta && e.text && e.text.length < 400 && CORRECTION.test(e.text)) {
+        const item: Lesson = { at: await $.clock.now(), kind: 'correction', text: e.text.trim() }
+        const list = [...(await read($, lessons)), item].slice(-MAX_LESSONS)
+        await update($, lessons, () => list)
+        await persistLessons($, list)
+      }
+    } catch {
+      // الملاحظة إضافة بس؛ لو فشلت، رسالتك لازم توصل.
+    }
+    return next(e)
+  })
+
+  // يرجّع آخر الدروس للموديل بكل جلسة (فكرة claude-mem)
+  on('prompt.compose', async ($, e, next) => {
+    const res = await next(e)
+    try {
+      const list = await read($, lessons)
+      if (list.length === 0) return res
+      return {
+        sections: [
+          ...res.sections,
+          {
+            id: 'alfursan-mods:lessons',
+            scope: 'session',
+            text: 'Lessons the user taught in earlier turns/sessions of this project (their corrections). Do not repeat these mistakes:\n' + lessonsText(list),
+          },
+        ],
+      }
+    } catch {
+      return res
+    }
+  })
+
   // ---------- الرسائل الواصلة ----------
   on('session.receive', async ($, e, next) => {
     if (e.origin.kind === 'peer' || e.origin.kind === 'coordinator' || e.origin.kind === 'peer-send-message') {
@@ -200,6 +281,7 @@ export const register: Register = on => {
     const list = await read($, tasks)
     const msgs = await read($, inbox)
     const t = await read($, tier)
+    const ls = await read($, lessons)
     const saver = await read($, isSaverOn)
     const open = list.filter(x => !x.isDone).length
 
@@ -216,6 +298,7 @@ export const register: Register = on => {
           <Button key="t" label={`المهام (${open})`} onPress={setTab('tasks')} />
           <Button key="m" label={`الرسائل (${msgs.length})`} onPress={setTab('messages')} />
           <Button key="d" label="الموديل" onPress={setTab('model')} />
+          <Button key="l" label={`الدروس (${ls.length})`} onPress={setTab('lessons')} />
         </Box>
 
         {current === 'tasks' && (
@@ -240,6 +323,15 @@ export const register: Register = on => {
                 <Text bold>{m.from}</Text>
                 <Text>{m.text}</Text>
               </Box>
+            ))}
+          </Box>
+        )}
+
+        {current === 'lessons' && (
+          <Box flexDirection="column">
+            {ls.length === 0 && <Text dimColor>ماكو دروس. تنسجل تصحيحاتك تلقائياً، أو اكتب: /lesson النص</Text>}
+            {ls.slice(-12).map(l => (
+              <Text key={String(l.at)}>• {l.text}</Text>
             ))}
           </Box>
         )}

@@ -39,3 +39,25 @@ test('a read-only subagent is moved to haiku', async ($, on) => {
   const heavy = await $.agent.spawn({ prompt: 'fix the bug', subagentType: 'general-purpose' })
   expect(heavy.model).toBe('inherit')
 })
+
+test('a correction is remembered and reaches the system prompt', async ($, on) => {
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 1 }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.compose', () => ({ sections: [] }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'لا، مو هيج، استخدم Decimal مو float' })
+  await $.prompt.submit({ text: 'شكرا، سوي الصفحة' })
+
+  const r = await $.command.run({ command: 'lesson', args: '' })
+  expect(r.text).toContain('Decimal')
+  expect(r.text).not.toContain('الصفحة')
+
+  const composed = await $.prompt.compose({ model: 'sonnet', promptModel: 'sonnet', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
+  expect(composed.sections.some(s => s.id === 'alfursan-mods:lessons' && s.text.includes('Decimal'))).toBe(true)
+})

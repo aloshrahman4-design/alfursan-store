@@ -21,7 +21,7 @@ Customers order via WhatsApp; no payment processing on-site.
   `pricing.py` applies markup with `Decimal` → Pillow patches the new price into the image.
   See `telegram-bot/README.md` (Arabic, detailed design notes and rejected approaches).
 - `mods/alfursan-mods/` — Claude Code mod (function hooks): dashboard pane (`/alfursan`, `/task`),
-  role team (`/team`, `/send`), automatic model tiering (`/saver`). Check with `claude plugin validate`/`test`.
+  role team (`/team`, `/send`), automatic model tiering (`/saver`), lessons memory (`/lesson`). Check with `claude plugin validate`/`test`.
 
 ## Project skills (`.claude/skills/`)
 `pricing-change` (any price/markup fix), `store-security-review` (before merge/deploy),
