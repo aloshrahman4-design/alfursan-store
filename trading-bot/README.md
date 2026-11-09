@@ -488,3 +488,23 @@ each one leaves on its own trailing stop — so the opposite side costs nothing.
 
 `GRID_ONE_WAY` defaults to 0. It can still be switched on deliberately, and the status
 line says plainly what it does when it is.
+
+## Stopping
+
+`/stop` is the full shutdown: close every position the bot owns, cancel the grid's pending
+orders, disable the grid, switch the system off, restart so nothing lingers in memory. It
+says what it could not do — with no broker connection it reports that rather than implying
+the account is flat.
+
+Two holes this exposed, both in the path that was supposed to be the safe one:
+
+- **Closing positions is not stopping.** The panic button closed trades and left the
+  ladder armed, so the next tick filled it again. Anything that closes the grid's trades
+  now disarms the grid.
+- **A panic close took the user's own trades.** Positions handed over through `release`
+  were skipped by the grid engine but not by `close_bot_positions`, so the button that is
+  meant to protect him took the trades he had accepted responsibility for. They are now
+  skipped there too, and counted as spared.
+
+Softer options, in order: `/grid off` stops the grid alone; the panel's system switch stops
+the bot managing (and warns that armed orders still fill); `/stop` stops everything.

@@ -718,6 +718,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /stop — *إيقاف كامل*: يغلق الصفقات، يلغي الأوامر، ويطفي النظام\n"
     "• /mine — صفقاتك المسلّمة: البوت يراقبها ولا يتدخل\n"
     "• /grid — شبكة المضاعفة المكبوحة (`/grid on` · `/grid off` · `/grid reset`)\n"
     "• /hook — ربط TradingView: الرابط والحالة (`/hook trade` للتنفيذ، `/hook watch` للمراقبة)\n"
@@ -1349,8 +1350,14 @@ async def close_bot_positions():
     if not connection:
         return 0, 0
     closed, skipped = 0, 0
+    # Trades handed to the user are his. A panic close that takes them anyway makes the
+    # handover a lie, and he is the one holding the consequences.
+    released = set(grid.load().get("released", [])) if grid is not None else set()
     all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
     for p in all_pos:
+        if p.get("id") in released:
+            skipped += 1
+            continue
         magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
         if p.get("symbol") != SYMBOL or p.get("magic") not in magics:
             continue
@@ -1366,6 +1373,13 @@ async def close_bot_positions():
             closed += 1
         except Exception as e:
             log.warning(f"failed closing {p.get('id')}: {e}")
+    # Closing positions while twenty stop orders stay armed is not stopping: the next tick
+    # fills them again. Whatever closes the grid's trades disarms the grid.
+    if grid is not None and hasattr(connection, "cancel_order"):
+        try:
+            await grid.cancel_all(connection)
+        except Exception as e:
+            log.warning(f"could not cancel grid orders while closing: {e}")
     return closed, skipped
 
 
@@ -1881,7 +1895,8 @@ async def handle_callback(query):
             if connection:
                 try:
                     closed, skipped = await close_bot_positions()
-                    txt = f"🚨 **تم إغلاق `{closed}` من صفقات البوت.**"
+                    txt = (f"🚨 **تم إغلاق `{closed}` من صفقات البوت**، "
+                           "وألغيت أوامر الشبكة المعلّقة.")
                     if skipped:
                         txt += f"\n🤝 تركت `{skipped}` صفقة حاطط عليها هدف بنفسك — هي تحت إدارتك."
                 except Exception as e:
@@ -1904,6 +1919,29 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/stop"):
+                global bot_active
+                bot_active = False
+                lines = ["🛑 *إيقاف كامل*", ""]
+                if connection is not None:
+                    try:
+                        closed, skipped = await close_bot_positions()
+                        lines.append(f"• أغلقت `{closed}` صفقة")
+                        if skipped:
+                            lines.append(f"• تركت `{skipped}` صفقة مسلّمة إلك")
+                    except Exception as e:
+                        lines.append(f"• ⚠️ فشل الإغلاق: `{str(e)[:150]}`")
+                else:
+                    lines.append("• ⚠️ ماكو اتصال — ما كدرت أغلق شي، افحص المنصة بنفسك")
+                if grid is not None:
+                    grid.reset()
+                    write_env_value("GRID_ENABLED", "0")
+                    lines.append("• أطفيت الشبكة وألغيت أوامرها")
+                lines += ["• أطفيت النظام — ما يفتح ولا صفقة جديدة", "",
+                          "للرجوع: `/grid on` ثم زر *النظام* من اللوحة."]
+                await send_long("\n".join(lines))
+                await asyncio.sleep(1.0)
+                os._exit(0)
             elif text.startswith("/mine"):
                 if grid is None:
                     await send_long("⚠️ الوحدة غير موجودة — أرسل `/update`.", markup=keyboard())
@@ -2122,6 +2160,7 @@ async def main():
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
+            BotCommand("stop", "إيقاف كامل: يغلق كل شي ويطفي البوت"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
