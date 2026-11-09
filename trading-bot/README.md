@@ -295,3 +295,18 @@ reads, the basket is taken at the first figure at or below it, which can be well
 the trail. That is inherent to a software trail on a basket — a broker-side take profit
 protects one position, not the sum of nine — and it is the reason the floor exists: the
 basket is never taken below `GRID_TP_CASH`, however far the give-back overshoots.
+
+### Re-centring
+
+`/grid center` (also `/grid reset`) closes the grid's own positions, cancels its pending
+orders and clears the state, so the engine arms one fresh ladder on the current price.
+
+Clearing the state alone was a footgun: the engine would arm a new ladder on top of the
+pending orders still sitting at the broker and double every level. With no connection it
+clears the state and says plainly that the old orders could not be cleaned up, rather than
+pretending the slate is clean.
+
+`reset()` deliberately preserves the released list. Those trades were handed over for good,
+and wiping the list on a re-centre would quietly take them back — the bot would start
+counting them again and the next teardown would close positions it had promised not to
+touch.

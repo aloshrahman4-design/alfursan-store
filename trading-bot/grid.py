@@ -169,7 +169,15 @@ def save(state):
 
 
 def reset():
-    save(_blank())
+    """Clear the grid's own state, but never the released list.
+
+    Those trades were handed to the user permanently. Wiping the list on a re-centre would
+    quietly take them back: the bot would start counting them again, and the next teardown
+    would close positions it had promised not to touch.
+    """
+    fresh = _blank()
+    fresh["released"] = load().get("released", [])
+    save(fresh)
 
 
 async def grid_positions(conn, exclude=None):

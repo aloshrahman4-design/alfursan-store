@@ -1525,9 +1525,28 @@ async def handle_grid_command(text):
         write_env_value("GRID_ENABLED", "0")
         await send_long("🛑 أطفيت الشبكة.\n♻️ أعيد التشغيل...")
         os._exit(0)
-    if arg in ("reset", "تصفير"):
+    if arg in ("reset", "تصفير", "center", "centre", "recenter", "تمركز"):
+        # Clearing the state alone was a footgun: the engine would arm a fresh ladder on
+        # top of the pending orders still sitting at the broker and double every level.
+        if connection is None:
+            grid.reset()
+            await send_long("🔄 صفّرت حالة الشبكة. ماكو اتصال حالياً، فما كدرت أنظّف "
+                            "الأوامر القديمة — افحصها بالمنصة قبل ما ترجع تشغّل.",
+                            markup=keyboard())
+            return
+        try:
+            closed, booked, cancelled = await grid.teardown(connection)
+        except Exception as e:
+            await send_long(f"⚠️ ما كدرت أنظّف الشبكة: `{str(e)[:200]}`\n"
+                            "ما صفّرت شي — جرب مرة ثانية.", markup=keyboard())
+            return
         grid.reset()
-        await send_long("🔄 صفّرت حالة الشبكة — تنصب من جديد بالدورة الجاية.", markup=keyboard())
+        await send_long(
+            "🎯 *أعدت التمركز*\n\n"
+            f"• أغلقت `{closed}` صفقة شبكة (`{booked:+g}$`)\n"
+            f"• ألغيت `{cancelled}` أمر معلّق\n"
+            "• صفقاتك المسلّمة ما لمستها\n\n"
+            "🕸 أنصبها من جديد على السعر الحالي خلال ثواني...")
         return
     balance = 0.0
     if connection is not None:
