@@ -352,3 +352,16 @@ Every open position is now harvested on its own merits, each trailing its own pe
 dropped when it closes, and stale ids are swept each tick against what is actually open.
 The anchor price still comes from the newest trade, which is what the re-entry logic means
 by "the anchor".
+
+## Request load and reconnect noise
+
+The grid asked the broker for account information on every tick to work out its loss limit
+— a third of its request load, for a number that barely moves. Under that load price reads
+started timing out, `last_price_ok` went stale past `CONNECTION_STALE_SECS`, and the
+supervisor rebuilt the connection: eleven "connected successfully" messages in twenty-two
+minutes, each one a real reconnect. The balance is now cached for `GRID_BALANCE_TTL` (30s).
+
+The message itself is rate limited to one per `CONNECT_NOTE_QUIET_SECS` (15 minutes). A
+reconnect is worth a log line, not a notification; saying it eleven times teaches the user
+to scroll past everything the bot sends, including the messages that matter. Every
+reconnect is still logged.

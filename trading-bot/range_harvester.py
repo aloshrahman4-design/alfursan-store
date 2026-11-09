@@ -31,6 +31,7 @@ PULLBACK_CASH = round(float(os.environ.get("PULLBACK_CASH", 0.80 * _scale)), 2)
 # should be allowed to breathe more than one sitting at +6$. Set to 0 to use PULLBACK_CASH.
 PULLBACK_PCT = float(os.environ.get("PULLBACK_PCT", "10"))
 BREAKOUT_DIST = float(os.environ.get("BREAKOUT_DIST", "4.50"))   # a price distance: never scaled
+CONNECT_NOTE_QUIET_SECS = int(os.environ.get("CONNECT_NOTE_QUIET_SECS", "900"))
 CONNECTION_STALE_SECS = 25  # if no successful price fetch in this window, force a reconnect
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -197,6 +198,8 @@ tracked_positions = {}
 hook_last, hook_count = None, 0
 # Peak profit per open position: the harvest trails each trade on its own.
 peak_by_id = {}
+# Reconnects are routine; announcing each one is noise.
+last_connect_note = 0.0
 hook_bound_port = None
 total_profit = 0.0
 buy_count, sell_count = 0, 0
@@ -1095,7 +1098,12 @@ async def ensure_connection():
             last_price_ok = time.time()
             fail_streak, hinted = 0, None
             log.info("Connected MetaApi OK!")
-            await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**")
+            # A reconnect every few minutes is worth a log line, not a message. Saying it
+            # eleven times in twenty minutes teaches the user to scroll past the bot.
+            global last_connect_note
+            if time.time() - last_connect_note > CONNECT_NOTE_QUIET_SECS:
+                last_connect_note = time.time()
+                await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**")
         except Exception as e:
             global last_connection_error
             log.error(f"Connection error: {e}", exc_info=True)

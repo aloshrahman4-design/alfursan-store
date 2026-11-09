@@ -72,6 +72,10 @@ GRID_TRAIL_MIN = _f("GRID_TRAIL_MIN", 1.0)
 GRID_MAX_LOSS = _f("GRID_MAX_LOSS", 0.0)      # 0 = work it out from the percentage
 GRID_MAX_LOSS_PCT = _f("GRID_MAX_LOSS_PCT", 15.0)
 GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
+# The loss limit is a share of the balance, and balance barely moves. Asking the broker for
+# it on every tick was a third of the request load on its own, which slowed the price reads
+# enough that the connection kept being declared stale and rebuilt.
+GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
 # Both sides armed at once means a move that should earn is paid for by the other side
 # bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
@@ -398,6 +402,18 @@ async def arm(conn, symbol, notify):
     return True, None
 
 
+_balance_cache = {"at": 0.0, "value": 0.0}
+
+
+async def cached_balance(conn):
+    now = time.time()
+    if now - _balance_cache["at"] < GRID_BALANCE_TTL and _balance_cache["value"]:
+        return _balance_cache["value"]
+    acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
+    _balance_cache.update({"at": now, "value": float(acct.get("balance", 0) or 0)})
+    return _balance_cache["value"]
+
+
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
@@ -442,8 +458,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             sells = [p for p in positions if p.get("magic") == MAGIC_GRID_SELL]
             floating = pnl(positions)
 
-            acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
-            limit = loss_limit(float(acct.get("balance", 0) or 0))
+            limit = loss_limit(await cached_balance(conn))
 
             # Each side is judged on its own when side-harvesting, so a winning direction is
             # not held hostage by the other one bleeding at the same rate.
