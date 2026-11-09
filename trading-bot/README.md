@@ -246,3 +246,20 @@ permanently — only the legs that would have fought the committed direction.
 
 It fires only when exactly one side is open. If both sides already hold positions the
 damage is done and cancelling pendings would not undo it, so nothing is touched.
+
+### Side harvest, and handing the losers over
+
+`GRID_SIDE_HARVEST` judges each direction on its own instead of waiting for the two to net
+out. A winning side is no longer held hostage by the other one bleeding at the same rate:
+the user watched a $3 move up land as a quarter of a dollar because the sells filled on the
+earlier dip gave it straight back.
+
+`GRID_RELEASE_LOSERS` then leaves the other side's open trades alone instead of closing them
+with the winners, and records their ids so the bot never counts, manages or closes them
+again — they survive teardown, the panic close and a restart. Normally "close the winners,
+keep the losers" is how a grid account dies, because the losers pile up behind the bot's
+back and its risk numbers stop describing reality. Here they leave the bot's books entirely
+and become the user's, at his explicit request. Nothing accumulates where the bot cannot see
+it, and the account-level exposure is his to manage.
+
+The released list is capped at 200 ids so closed trades cannot grow it without bound.

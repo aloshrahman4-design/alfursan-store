@@ -72,6 +72,13 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 # So once a side commits, the other side's pending orders are pulled and the basket becomes
 # directional; both sides are armed again at the next re-arm.
 GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "1") not in ("0", "false", "no")
+# Harvest each side on its own merits instead of waiting for the two to net out, and hand
+# the other side's open trades to the user rather than closing them with it. He asked for
+# that split explicitly: the bot takes the winners, he decides what to do with the losers.
+# It is the one arrangement where releasing losers is not the usual grid suicide - they
+# stop being the bot's problem entirely, so nothing accumulates behind its back.
+GRID_SIDE_HARVEST = os.environ.get("GRID_SIDE_HARVEST", "1") not in ("0", "false", "no")
+GRID_RELEASE_LOSERS = os.environ.get("GRID_RELEASE_LOSERS", "1") not in ("0", "false", "no")
 
 
 def ladder(base=None, cap=None, levels=None, double_every=None):
@@ -131,7 +138,7 @@ def loss_limit(balance=0.0):
 
 def _blank():
     return {"armed": False, "center": None, "armed_at": 0, "cycles": 0,
-            "realized": 0.0, "halted": False, "halt_reason": ""}
+            "realized": 0.0, "halted": False, "halt_reason": "", "released": []}
 
 
 def load():
@@ -139,6 +146,7 @@ def load():
         with open(STATE_PATH) as f:
             state = _blank()
             state.update(json.load(f))
+            state.setdefault("released", [])
             return state
     except Exception:
         return _blank()
@@ -158,9 +166,40 @@ def reset():
     save(_blank())
 
 
-async def grid_positions(conn):
+async def grid_positions(conn, exclude=None):
+    """Grid trades the bot still owns. Released ones are the user's and stay invisible."""
+    exclude = set(exclude if exclude is not None else load().get("released", []))
     pos = await asyncio.wait_for(conn.get_positions(), timeout=6.0)
-    return [p for p in pos if p.get("magic") in MAGICS]
+    return [p for p in pos if p.get("magic") in MAGICS and p.get("id") not in exclude]
+
+
+async def close_positions(conn, positions):
+    """Close exactly these. Returns (count, realized)."""
+    closed, booked = 0, 0.0
+    for p in positions:
+        try:
+            booked += float(p.get("unrealizedProfit", 0.0) or 0.0)
+            await asyncio.wait_for(conn.close_position(p["id"]), timeout=6.0)
+            closed += 1
+        except Exception as e:
+            log.warning(f"could not close {p.get('id')}: {e}")
+    return closed, round(booked, 2)
+
+
+def release(positions):
+    """Hand these trades to the user: the bot stops counting, managing and closing them."""
+    if not positions:
+        return 0
+    state = load()
+    kept = set(state.get("released", [])) | {p.get("id") for p in positions}
+    # ids of trades that closed long ago would pile up forever; the list stays bounded
+    state["released"] = [i for i in kept if i][-200:]
+    save(state)
+    return len(positions)
+
+
+def pnl(positions):
+    return round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0) for p in positions), 2)
 
 
 async def grid_orders(conn):
@@ -224,6 +263,9 @@ def plan_text(balance=0.0):
         f"• وقف الشبكة: `-{limit:g}$`",
         ("• 🧭 اتجاه واحد: أول ما تلتزم جهة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
+        ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
+        ("• 🤝 الخاسرة تبقى مفتوحة وتصير إلك — البوت ما يتحكم بيها"
+         if GRID_RELEASE_LOSERS else "• الخاسرة تنغلق مع الرابحة"),
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
         f"• لو تأرجح وكسر الجهتين: `-{whip:,.0f}$` ← وهنا يقطع الوقف عند `-{limit:g}$`",
         f"• لو امتلأت واستمر بنفس الاتجاه: `+{best:,.0f}$`",
@@ -287,7 +329,8 @@ async def arm(conn, symbol, notify):
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
-    peak = 0.0          # best the current basket has shown; in memory, it dies with the basket
+    # best each side has shown; in memory, so a peak dies with the basket that earned it
+    peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
     while True:
         try:
             if not (GRID_ENABLED and is_active()):
@@ -321,35 +364,61 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             positions = await grid_positions(conn)
             orders = await grid_orders(conn)
-            floating = round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0) for p in positions), 2)
+            buys = [p for p in positions if p.get("magic") == MAGIC_GRID_BUY]
+            sells = [p for p in positions if p.get("magic") == MAGIC_GRID_SELL]
+            floating = pnl(positions)
 
             acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
             limit = loss_limit(float(acct.get("balance", 0) or 0))
 
-            if positions and floating > peak:
-                peak = floating
-            give_back = (round(max(peak * GRID_TRAIL_PCT / 100.0, GRID_TRAIL_MIN), 2)
-                         if GRID_TRAIL_PCT > 0 else 0.0)
-            # Rounded: 5.6 - 0.56 is 5.039999... in binary, so an exact 5.04 would miss.
-            ready = floating >= GRID_TP_CASH and floating <= round(peak - give_back, 2)
-            if positions and ready:
-                rode = peak
-                closed, booked, cancelled = await teardown(conn)
-                peak = 0.0
+            # Each side is judged on its own when side-harvesting, so a winning direction is
+            # not held hostage by the other one bleeding at the same rate.
+            groups = ([("buy", buys, sells), ("sell", sells, buys)] if GRID_SIDE_HARVEST
+                      else [("all", positions, [])])
+            taken = None
+            for name, group, other in groups:
+                if not group:
+                    peaks[name] = 0.0
+                    continue
+                here = pnl(group)
+                if here > peaks[name]:
+                    peaks[name] = here
+                give_back = (round(max(peaks[name] * GRID_TRAIL_PCT / 100.0, GRID_TRAIL_MIN), 2)
+                             if GRID_TRAIL_PCT > 0 else 0.0)
+                # Rounded: 5.6 - 0.56 is 5.039999... in binary, so an exact 5.04 would miss.
+                if here >= GRID_TP_CASH and here <= round(peaks[name] - give_back, 2):
+                    taken = (name, group, other, peaks[name])
+                    break
+
+            if taken:
+                name, group, other, rode = taken
+                closed, booked = await close_positions(conn, group)
+                handed = release(other) if (GRID_RELEASE_LOSERS and other) else 0
+                if not handed:
+                    extra, more = await close_positions(conn, other)
+                    closed, booked = closed + extra, round(booked + more, 2)
+                cancelled = await cancel_all(conn)
+                peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
+                state = load()
                 state["cycles"] = state.get("cycles", 0) + 1
                 state["realized"] = round(state.get("realized", 0.0) + booked, 2)
                 state["armed"] = False
                 save(state)
+                side_ar = {"buy": "الشراء", "sell": "البيع", "all": "الشبكة"}[name]
                 top = f" (القمة كانت `+{rode:g}$`)" if rode > booked else ""
-                await notify(f"💰 *حصدت الشبكة* `+{booked:g}$`{top}\n"
-                             f"• أغلقت `{closed}` صفقة وألغيت `{cancelled}` أمر معلّق\n"
-                             f"• الدورة رقم `{state['cycles']}` · الإجمالي `{state['realized']:g}$`\n"
-                             "🕸 أنصبها من جديد على السعر الحالي...")
+                msg = [f"💰 *حصدت {side_ar}* `+{booked:g}$`{top}",
+                       f"• أغلقت `{closed}` صفقة وألغيت `{cancelled}` أمر معلّق"]
+                if handed:
+                    msg.append(f"🤝 تركت لك `{handed}` صفقة خاسرة مفتوحة — صارت إلك، "
+                               "ما أتحكم بيها ولا أحسبها علي.")
+                msg.append(f"• الدورة رقم `{state['cycles']}` · الإجمالي `{state['realized']:g}$`")
+                msg.append("🕸 أنصبها من جديد على السعر الحالي...")
+                await notify("\n".join(msg))
                 continue
 
             if positions and floating <= -limit:
                 closed, booked, cancelled = await teardown(conn)
-                peak = 0.0
+                peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
                 state.update({"armed": False, "halted": True,
                               "halt_reason": f"الخسارة وصلت {booked:g}$",
                               "realized": round(state.get("realized", 0.0) + booked, 2)})
@@ -380,7 +449,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                                      "بالجهة المعاكسة حتى ما تاكل الربح.")
 
             if not positions and not orders:
-                peak = 0.0
+                peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
                 state["armed"] = False
                 save(state)
                 continue
@@ -407,6 +476,9 @@ def status_text(balance=0.0):
         head += " — ⏳ تنتظر النصب"
     body = [head, "", plan_text(balance), "",
             f"• دورات مكتملة: `{state.get('cycles', 0)}` · محصّلة: `{state.get('realized', 0.0):g}$`"]
+    freed = len(state.get("released", []))
+    if freed:
+        body.append(f"• 🤝 `{freed}` صفقة سلّمتها لك — مفتوحة بإدارتك، خارج حساب الشبكة")
     if lots and max(lots) >= GRID_MAX_LOT:
         body.append(f"• 🔒 السقف `{GRID_MAX_LOT:g}` فعّال — بدونه أكبر لوت كان "
                     f"`{round(GRID_BASE_LOT * 2 ** ((len(lots) - 1) // GRID_DOUBLE_EVERY), 2):g}`")
