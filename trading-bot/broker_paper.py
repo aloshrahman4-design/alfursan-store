@@ -272,6 +272,18 @@ class PaperBroker:
         _save(state)
         return {"orderId": str(order_id)}
 
+    async def modify_position(self, position_id, stop_loss=None, take_profit=None, **kw):
+        state = _load()
+        pos = next((p for p in state["positions"] if p["id"] == str(position_id)), None)
+        if pos is None:
+            raise RuntimeError(f"paper position {position_id} not found")
+        if take_profit is not None:
+            pos["takeProfit"] = round(float(take_profit), 2)
+        if stop_loss is not None:
+            pos["stopLoss"] = round(float(stop_loss), 2)
+        _save(state)
+        return {"positionId": pos["id"]}
+
     async def get_candles(self, symbol=None, timeframe="1h", limit=200):
         return await datafeed.get_candles(symbol or ENGINE_SYMBOL, timeframe, limit)
 

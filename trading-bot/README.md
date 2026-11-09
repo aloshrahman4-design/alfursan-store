@@ -328,6 +328,13 @@ in the loop, which means it fires on a gap or while the bot is restarting — th
 polled exit always loses. `tp_distance` converts cash to a price move for the order's volume
 ($2 on 0.01 lot of gold is a $2 move; on 0.05 it is $0.40). Set it to 0 for basket-only.
 
+Attaching it at placement time is not enough on its own: every position opened before the
+setting existed, or by an order from an older build, ran with no exit of its own. The user
+watched a level sit at +$2.43 and give all of it back for precisely that reason.
+`ensure_take_profits` reconciles the target against what is actually open each tick, so a
+position missing one is given it, and nothing is touched twice. It is skipped on a broker
+with no `modify_position`.
+
 One sharp edge this created: `user_took_over` reads a take profit as "the user took this trade
 over", which is true for anchor trades and false for the grid, since the grid now sets a TP on
 everything it opens. Without scoping that test to the anchor magics, the entire grid would have

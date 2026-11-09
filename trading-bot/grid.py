@@ -236,6 +236,39 @@ def pnl(positions):
     return round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0) for p in positions), 2)
 
 
+async def ensure_take_profits(conn, positions, notify=None):
+    """Put the per-trade target on any grid position that is missing one.
+
+    Attaching it only when the order is placed leaves every position opened before the
+    setting existed - or by an order placed under an older build - running with no exit of
+    its own. The user watched a level sit at +$2.43 and give it all back for exactly that
+    reason, so the target is reconciled on what is open, not only on what is sent.
+    """
+    if GRID_TP_PER_TRADE <= 0:
+        return 0
+    fixed = []
+    for p in positions:
+        if p.get("takeProfit"):
+            continue
+        dist = tp_distance(p.get("volume", 0))
+        if not dist:
+            continue
+        entry = float(p.get("openPrice", 0) or 0)
+        if not entry:
+            continue
+        is_buy = p.get("type") == "POSITION_TYPE_BUY"
+        tp = round(entry + dist, 2) if is_buy else round(entry - dist, 2)
+        try:
+            await asyncio.wait_for(conn.modify_position(p["id"], take_profit=tp), timeout=8.0)
+            fixed.append((p["id"], tp))
+        except Exception as e:
+            log.warning(f"could not set take profit on {p.get('id')}: {e}")
+    if fixed and notify:
+        await notify(f"🎯 *حطيت هدف `+{GRID_TP_PER_TRADE:g}$` على `{len(fixed)}` صفقة شبكة "
+                     "كانت بلا هدف* — صارت تغلق لحالها عند الوسيط.")
+    return len(fixed)
+
+
 async def grid_orders(conn):
     if not hasattr(conn, "get_orders"):
         return []
@@ -402,6 +435,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 continue
 
             positions = await grid_positions(conn)
+            if hasattr(conn, "modify_position"):
+                await ensure_take_profits(conn, positions, notify)
             orders = await grid_orders(conn)
             buys = [p for p in positions if p.get("magic") == MAGIC_GRID_BUY]
             sells = [p for p in positions if p.get("magic") == MAGIC_GRID_SELL]
