@@ -92,6 +92,22 @@ def best_case(lots=None, step=None, contract=None):
     return round(sum((n - i - 1) * step * contract * lot for i, lot in enumerate(lots)), 2)
 
 
+def whipsaw_case(lots=None, step=None, contract=None):
+    """Loss if price sweeps one side, comes back, and keeps going through the other.
+
+    The real worst case, and much worse than a one-sided round trip: every level on the
+    first side is now a full grid-width under water while the second side has only just
+    begun to earn. This is the number GRID_MAX_LOSS exists to cut short.
+    """
+    lots = ladder() if lots is None else lots
+    step = GRID_STEP if step is None else step
+    contract = GRID_CONTRACT if contract is None else contract
+    n = len(lots)
+    losing = sum(((i + 1) * step + n * step) * contract * lot for i, lot in enumerate(lots))
+    winning = sum((n * step - (j + 1) * step) * contract * lot for j, lot in enumerate(lots))
+    return round(losing - winning, 2)
+
+
 def loss_limit(balance=0.0):
     """The floating loss at which the basket is closed and the grid stands down."""
     if GRID_MAX_LOSS > 0:
@@ -179,7 +195,7 @@ def plan_text(balance=0.0):
     lots = ladder()
     total = round(sum(lots), 2)
     margin_each = GRID_CONTRACT  # unknown price here; the caller fills real margin in
-    worst, best = worst_case(lots), best_case(lots)
+    worst, best, whip = worst_case(lots), best_case(lots), whipsaw_case(lots)
     limit = loss_limit(balance)
     shown = ", ".join(f"{x:g}" for x in lots[:10]) + (" …" if len(lots) > 10 else "")
     lines = [
@@ -188,11 +204,13 @@ def plan_text(balance=0.0):
         f"• أكبر لوت: `{max(lots) if lots else 0:g}` · المجموع `{total:g}` لوت",
         f"• مدى الشبكة: `{round(len(lots) * GRID_STEP, 2):g}$` بكل اتجاه",
         f"• جني الباسكت: `+{GRID_TP_CASH:g}$` · وقف الشبكة: `-{limit:g}$`",
-        f"• لو امتلأت كلها ورجع السعر: `-{worst:,.0f}$`",
+        f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
+        f"• لو تأرجح وكسر الجهتين: `-{whip:,.0f}$` ← وهنا يقطع الوقف عند `-{limit:g}$`",
         f"• لو امتلأت واستمر بنفس الاتجاه: `+{best:,.0f}$`",
     ]
     if balance:
-        lines.append(f"• أسوأ حالة = `{round(worst / balance * 100)}%` من رصيدك `{balance:g}$`")
+        lines.append(f"• الوقف = `{round(limit / balance * 100)}%` من رصيدك `{balance:g}$` — "
+                     "وهو السقف الحقيقي للخسارة، مو رقم التأرجح")
     _ = margin_each
     return "\n".join(lines)
 
