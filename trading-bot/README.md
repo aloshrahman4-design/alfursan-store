@@ -526,3 +526,14 @@ $2-$5 jumps, so fills, targets and trailing stops all land on prices that never 
 the result is a confident fiction. It now reads 1-minute bars (`PAPER_TF`) with a 15s cache
 for short timeframes, falling back to coarser bars rather than failing. Good enough to
 check that the logic behaves; still not tick data, so treat the P/L as indicative.
+
+### Switching accounts
+
+`/accounts` lists every trading account the MetaApi token opens, marks which one is
+running, and gives a ready-to-send `/setkey account <id>` line for each. `/live` cannot do
+this job: it prefers the account already configured, so from a demo it would simply confirm
+the demo rather than offer the way back.
+
+Switch only after `/stop`. Changing `ACCOUNT_ID` points the bot at a different account; it
+does not close what is open on the one being left, and those positions keep their broker
+stops but lose the bot that was managing them.

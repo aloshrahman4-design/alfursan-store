@@ -723,6 +723,7 @@ HELP_TEXT = (
     "• /grid — شبكة المضاعفة المكبوحة (`/grid on` · `/grid off` · `/grid reset`)\n"
     "• /hook — ربط TradingView: الرابط والحالة (`/hook trade` للتنفيذ، `/hook watch` للمراقبة)\n"
     "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
+    "• /accounts — كل حساباتك بـ MetaApi وسطر جاهز للتبديل لأي واحد\n"
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
@@ -1951,6 +1952,26 @@ async def process_update(update):
                 await handle_grid_command(text)
             elif text.startswith("/hook"):
                 await handle_hook_command(text)
+            elif text.startswith("/accounts"):
+                token = os.environ.get("META_API_TOKEN", "")
+                if not token:
+                    await send_long("🔑 ماكو توكن MetaApi. أرسل `/setkey metaapi <التوكن>`.",
+                                    markup=keyboard())
+                else:
+                    await send_long("⏳ أجيب حساباتك من MetaApi...")
+                    err, accounts = await list_metaapi_accounts(token)
+                    if err:
+                        await send_long(f"❌ ما كدرت أوصل: `{err[:250]}`", markup=keyboard())
+                    elif not accounts:
+                        await send_long("⚠️ ماكو أي حساب مربوط بالتوكن.", markup=keyboard())
+                    else:
+                        now = next((a for a in accounts if a["id"] == ACCOUNT_ID), None)
+                        head = (f"📒 *حساباتك* (`{len(accounts)}`)\n"
+                                f"الشغّال الآن: *{(now or {}).get('name') or 'مو من هذي'}*"
+                                f" — `{(now or {}).get('server', '؟')}`\n\n")
+                        await send_long(head + accounts_block(accounts)
+                                        + "\n\n⚠️ بدّل الحساب بعد `/stop` بس، حتى ما تترك "
+                                          "صفقات مفتوحة بلا حارس.", markup=keyboard())
             elif text.startswith("/live"):
                 await handle_go_live()
             elif text.startswith("/gold"):
@@ -2156,6 +2177,7 @@ async def main():
             BotCommand("session", "جلسة تداول بتنفيذ فوري: /session 3"),
             BotCommand("check", "فحص الاتصال والحساب"),
             BotCommand("live", "تنفيذ آلي على MetaApi (البوت ينفّذ بنفسه)"),
+            BotCommand("accounts", "قائمة حساباتك والتبديل بينها"),
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
