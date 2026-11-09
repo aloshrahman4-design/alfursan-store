@@ -184,6 +184,7 @@ handed_over_ids = set()
 # Last seen state of every bot position, so a close done at the broker is noticed.
 tracked_positions = {}
 hook_last, hook_count = None, 0
+hook_bound_port = None
 total_profit = 0.0
 buy_count, sell_count = 0, 0
 last_price_ok = 0.0
@@ -1408,30 +1409,43 @@ async def hook_server():
         if ok:   # answered first, traded second
             asyncio.create_task(on_hook_signal(body, ip))
 
-    try:
-        server = await asyncio.start_server(handle, "0.0.0.0", HOOK_PORT)
-    except Exception as e:
-        log.error(f"webhook listener failed on port {HOOK_PORT}: {e}")
-        await notify(f"⚠️ *ما كدرت أفتح منفذ الإشارات* `{HOOK_PORT}`\n`{str(e)[:160]}`\n\n"
-                     "منفذ 80 يحتاج صلاحية. الحل بأمر واحد بالسيرفر موجود بالشرح.")
+    global hook_bound_port
+    server = None
+    # Port 80 needs a capability the unit file may not have yet. Falling back keeps the
+    # endpoint alive on 8080; shouting about it on every restart only trains the user to
+    # ignore the bot's messages, so the state is reported by /hook instead.
+    for port in (HOOK_PORT, 8080) if HOOK_PORT < 1024 else (HOOK_PORT,):
+        try:
+            server = await asyncio.start_server(handle, "0.0.0.0", port)
+            hook_bound_port = port
+            break
+        except Exception as e:
+            log.warning(f"webhook could not bind port {port}: {e}")
+    if server is None:
+        hook_bound_port = None
+        log.error("webhook listener could not bind any port")
         return
-    log.info(f"webhook listening on 0.0.0.0:{HOOK_PORT}{want_path}")
+    log.info(f"webhook listening on 0.0.0.0:{hook_bound_port}{want_path}")
     async with server:
         await server.serve_forever()
 
 
 def hook_status_text():
-    url = f"http://{HOOK_HOST or '<عنوان-السيرفر>'}:{HOOK_PORT}/hook/{HOOK_SECRET or '<السر>'}"
-    if HOOK_PORT in (80, 443):
-        scheme = "https" if HOOK_PORT == 443 else "http"
-        url = f"{scheme}://{HOOK_HOST or '<عنوان-السيرفر>'}/hook/{HOOK_SECRET or '<السر>'}"
+    port = hook_bound_port or HOOK_PORT
+    host = HOOK_HOST or "<عنوان-السيرفر>"
+    secret = HOOK_SECRET or "<السر>"
+    url = (f"http://{host}/hook/{secret}" if port == 80 else
+           f"https://{host}/hook/{secret}" if port == 443 else
+           f"http://{host}:{port}/hook/{secret}")
     state = ("🚀 *تنفيذ* — الإشارة تفتح صفقة فعلية" if HOOK_MODE == "trade"
              else "👁 *مراقبة* — يخبرك بالإشارة بدون تنفيذ")
     lines = [
         "📡 *ربط TradingView*", "",
         f"• الحالة: {'✅ شغال' if HOOK_ENABLED and HOOK_SECRET else '❌ مطفي'}",
         f"• الوضع: {state}",
-        f"• المنفذ: `{HOOK_PORT}`",
+        f"• المنفذ: `{hook_bound_port or 'ماكو'}`" + (
+            f" ⚠️ طلبنا `{HOOK_PORT}` بس ما انفتح — TradingView ما يرسل إلا على 80 أو 443"
+            if hook_bound_port != HOOK_PORT else ""),
         f"• إشارات وصلت: `{hook_count}`",
     ]
     if hook_last:
