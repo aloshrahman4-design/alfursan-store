@@ -102,6 +102,15 @@ SETTABLE_KEYS = {
     "HOOK_HOST": "عنوان السيرفر العام للرابط",
     "HOOK_SECRET": "السر داخل رابط الإشارات",
     "HOOK_ALLOW_IPS": "عناوين TradingView المسموحة (فاضي = الكل)",
+    "GRID_ENABLED": "تشغيل شبكة المضاعفة (1 أو 0)",
+    "GRID_BASE_LOT": "لوت أول مستوى بالشبكة",
+    "GRID_MAX_LOT": "سقف اللوت بالشبكة",
+    "GRID_LEVELS": "عدد مستويات الشبكة بكل جهة",
+    "GRID_STEP": "المسافة بين مستويات الشبكة بالدولار",
+    "GRID_DOUBLE_EVERY": "يضاعف اللوت كل كم مستوى",
+    "GRID_TP_CASH": "ربح إغلاق الشبكة كاملة",
+    "GRID_MAX_LOSS": "حد خسارة الشبكة بالدولار (0 = نسبة)",
+    "GRID_MAX_LOSS_PCT": "حد خسارة الشبكة كنسبة من الرصيد",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -118,6 +127,9 @@ KEY_ALIASES = {
     "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
+    "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridloss": "GRID_MAX_LOSS",
+    "gridlosspct": "GRID_MAX_LOSS_PCT", "griddouble": "GRID_DOUBLE_EVERY",
     "hookmode": "HOOK_MODE", "hookport": "HOOK_PORT", "hookhost": "HOOK_HOST",
     "hooksecret": "HOOK_SECRET", "hookips": "HOOK_ALLOW_IPS", "hookon": "HOOK_ENABLED",
 }
@@ -145,6 +157,12 @@ try:
 except Exception as _e:
     broker_capital = None
     log.warning(f"broker_capital unavailable: {_e}")
+
+try:
+    import grid  # capped-martingale stop-order grid, its own magics, its own limits
+except Exception as _e:
+    grid = None
+    log.warning(f"grid module unavailable: {_e}")
 
 try:
     import datafeed  # free prices, so analysis never keeps a billed account deployed
@@ -600,14 +618,16 @@ async def handle_setkey(text, chat_id, message_id):
     # These are read once at import into module-level constants, so writing .env alone would
     # save the value and change nothing until the next restart. Restart now instead.
     if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
-               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST"):
+               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
+            or key.startswith("GRID_"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
     await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
 
 
-CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py", "broker_paper.py")
+CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",
+              "broker_paper.py", "grid.py")
 
 
 def self_update():
@@ -668,6 +688,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /grid — شبكة المضاعفة المكبوحة (`/grid on` · `/grid off` · `/grid reset`)\n"
     "• /hook — ربط TradingView: الرابط والحالة (`/hook trade` للتنفيذ، `/hook watch` للمراقبة)\n"
     "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
@@ -1279,7 +1300,8 @@ async def close_bot_positions():
     closed, skipped = 0, 0
     all_pos = await asyncio.wait_for(connection.get_positions(), timeout=4.0)
     for p in all_pos:
-        if p.get("symbol") != SYMBOL or p.get("magic") not in (MAGIC_BUY, MAGIC_SELL):
+        magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
+        if p.get("symbol") != SYMBOL or p.get("magic") not in magics:
             continue
         if user_took_over(p):        # the user owns this one now
             skipped += 1
@@ -1419,6 +1441,78 @@ def hook_status_text():
               "*نص التنبيه:* اكتب فيه كلمة `شراء` أو `بيع` — وحدة بس.", "",
               "`/hook trade` للتنفيذ · `/hook watch` للمراقبة"]
     return "\n".join(lines)
+
+
+def fetch_missing_modules():
+    """Download any shipped module that is not on disk yet.
+
+    A new module used to need two /update rounds: the first brought a range_harvester.py
+    that knew about the file, the second actually fetched it. One round is enough now.
+    """
+    missing = [n for n in CODE_FILES if not os.path.exists(os.path.join(BASE_DIR, n))]
+    if not missing:
+        return []
+    curl = ["curl", "-fsSL", "--connect-timeout", "15", "--retry", "2"]
+    if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+        curl.append("-4")
+    got = []
+    for name in missing:
+        dest = os.path.join(BASE_DIR, name + ".new")
+        try:
+            r = subprocess.run(curl + [f"{RAW_BASE}/{name}", "-o", dest],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                log.warning(f"could not fetch missing module {name}: {r.stderr[:160]}")
+                continue
+            c = subprocess.run([sys.executable, "-m", "py_compile", dest],
+                               capture_output=True, text=True, timeout=60)
+            if c.returncode != 0:
+                log.warning(f"missing module {name} does not compile; ignoring it")
+                os.remove(dest)
+                continue
+            os.replace(dest, os.path.join(BASE_DIR, name))
+            got.append(name)
+        except Exception as e:
+            log.warning(f"fetching {name} failed: {e}")
+    return got
+
+
+async def handle_grid_command(text):
+    """/grid — state and settings. /grid on | off | reset | now."""
+    if grid is None:
+        await send_long("⚠️ وحدة الشبكة غير موجودة — أرسل `/update` مرة ثانية.", markup=keyboard())
+        return
+    arg = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) > 1 else ""
+    if arg in ("on", "تشغيل"):
+        grid.reset()                       # clears any halt left over from a stop
+        write_env_value("GRID_ENABLED", "1")
+        await send_long("🕸 *شغّلت الشبكة.*\nتنصب نفسها على السعر الحالي أول ما أرجع.\n"
+                        "♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("off", "stop", "ايقاف", "إيقاف"):
+        if connection is not None:
+            try:
+                closed, booked, cancelled = await grid.teardown(connection)
+                await send_long(f"🧹 أغلقت `{closed}` صفقة شبكة (`{booked:g}$`) "
+                                f"وألغيت `{cancelled}` أمر معلّق.")
+            except Exception as e:
+                await send_long(f"⚠️ ما كدرت أنظّف الشبكة: `{str(e)[:200]}`")
+        grid.reset()
+        write_env_value("GRID_ENABLED", "0")
+        await send_long("🛑 أطفيت الشبكة.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("reset", "تصفير"):
+        grid.reset()
+        await send_long("🔄 صفّرت حالة الشبكة — تنصب من جديد بالدورة الجاية.", markup=keyboard())
+        return
+    balance = 0.0
+    if connection is not None:
+        try:
+            acct = await asyncio.wait_for(connection.get_account_information(), timeout=6.0)
+            balance = float(acct.get("balance", 0) or 0)
+        except Exception:
+            pass
+    await send_long(grid.status_text(balance), markup=keyboard())
 
 
 async def detect_public_ip():
@@ -1697,6 +1791,8 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/grid"):
+                await handle_grid_command(text)
             elif text.startswith("/hook"):
                 await handle_hook_command(text)
             elif text.startswith("/live"):
@@ -1906,6 +2002,7 @@ async def main():
             BotCommand("live", "تنفيذ آلي على MetaApi (البوت ينفّذ بنفسه)"),
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
+            BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
@@ -1919,6 +2016,10 @@ async def main():
         ])
     except Exception as e:
         log.warning(f"set_my_commands failed: {e}")
+    pulled = await asyncio.to_thread(fetch_missing_modules)
+    if pulled:
+        log.info(f"fetched missing modules {pulled}; restarting to load them")
+        os._exit(0)
     global HOOK_SECRET
     if HOOK_ENABLED and not HOOK_SECRET:
         import secrets
@@ -1933,6 +2034,9 @@ async def main():
         supervise("cost_governor", cost_governor),
         supervise("hook_server", hook_server),
     ]
+    if grid is not None and grid.GRID_ENABLED:
+        tasks.append(supervise("grid_engine", lambda: grid.grid_engine(
+            lambda: connection, SYMBOL, notify, lambda: bot_active)))
     if intel is not None and not LEAN:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))
         tasks.append(supervise("daily_scheduler", lambda: intel.daily_scheduler(fetch_candles, SYMBOL, notify)))

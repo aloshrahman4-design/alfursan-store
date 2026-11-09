@@ -48,7 +48,7 @@ def configured():
 
 
 def _blank():
-    return {"balance": START_BALANCE, "positions": [], "history": [], "next_id": 1,
+    return {"balance": START_BALANCE, "positions": [], "orders": [], "history": [], "next_id": 1,
             "since": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
 
 
@@ -57,6 +57,7 @@ def _load():
         with open(STATE_PATH) as f:
             state = json.load(f)
             state.setdefault("history", [])
+            state.setdefault("orders", [])
             state.setdefault("next_id", 1)
             return state
     except Exception:
@@ -117,6 +118,7 @@ class PaperBroker:
                 "equity": round(state["balance"] + floating, 2), "currency": "USD"}
 
     async def get_positions(self):
+        await self._trigger_pending()
         state = _load()
         try:
             mid = await self._mid()
@@ -169,6 +171,74 @@ class PaperBroker:
         _save(state)
         log.info(f"paper close {pos['id']} pnl {pnl}")
         return {"dealId": pos["id"], "profit": pnl}
+
+    # --- pending stop orders -----------------------------------------------------------
+    # The grid runs on stop orders, and a strategy this dangerous has to be testable for
+    # free before it is testable with money. Fills are checked whenever positions are read,
+    # which the engine does about once a second.
+    async def _trigger_pending(self):
+        state = _load()
+        if not state.get("orders"):
+            return
+        try:
+            mid = await self._mid()
+        except Exception:
+            return
+        ask, bid = mid + SPREAD / 2, mid - SPREAD / 2
+        left, fired = [], []
+        for o in state["orders"]:
+            hit = (ask >= o["openPrice"]) if o["type"] == "ORDER_TYPE_BUY_STOP" else (bid <= o["openPrice"])
+            (fired if hit else left).append(o)
+        if not fired:
+            return
+        for o in fired:
+            state["positions"].append({
+                "id": o["id"],
+                "symbol": ENGINE_SYMBOL,
+                "type": "POSITION_TYPE_BUY" if o["type"] == "ORDER_TYPE_BUY_STOP" else "POSITION_TYPE_SELL",
+                "magic": o.get("magic", 0),
+                "openPrice": o["openPrice"],     # a stop fills at its price, slippage aside
+                "volume": o["volume"],
+                "openedAt": int(time.time()),
+            })
+            log.info(f"paper pending {o['id']} filled at {o['openPrice']}")
+        state["orders"] = left
+        _save(state)
+
+    async def _place_pending(self, kind, volume, open_price, options):
+        state = _load()
+        order = {
+            "id": f"O{state['next_id']}",
+            "symbol": ENGINE_SYMBOL,
+            "type": kind,
+            "magic": (options or {}).get("magic", 0),
+            "openPrice": round(float(open_price), 2),
+            "volume": float(volume or 0.01),
+            "placedAt": int(time.time()),
+        }
+        state["next_id"] += 1
+        state.setdefault("orders", []).append(order)
+        _save(state)
+        return {"orderId": order["id"]}
+
+    async def create_stop_buy_order(self, symbol=None, volume=None, open_price=None, options=None, **kw):
+        return await self._place_pending("ORDER_TYPE_BUY_STOP", volume, open_price, options)
+
+    async def create_stop_sell_order(self, symbol=None, volume=None, open_price=None, options=None, **kw):
+        return await self._place_pending("ORDER_TYPE_SELL_STOP", volume, open_price, options)
+
+    async def get_orders(self, **kw):
+        await self._trigger_pending()
+        return [dict(o) for o in _load().get("orders", [])]
+
+    async def cancel_order(self, order_id):
+        state = _load()
+        before = len(state.get("orders", []))
+        state["orders"] = [o for o in state.get("orders", []) if o["id"] != str(order_id)]
+        if len(state["orders"]) == before:
+            raise RuntimeError(f"paper order {order_id} not found")
+        _save(state)
+        return {"orderId": str(order_id)}
 
     async def get_candles(self, symbol=None, timeframe="1h", limit=200):
         return await datafeed.get_candles(symbol or ENGINE_SYMBOL, timeframe, limit)

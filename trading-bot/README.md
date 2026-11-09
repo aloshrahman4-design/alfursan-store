@@ -184,3 +184,25 @@ confirm alerts arrive correctly and on time before `/hook trade` arms it against
 account. An alert naming both directions, or neither, is reported rather than guessed at —
 `read_signal` reads intent from Arabic, English or JSON, and refusing is cheaper than
 opening the wrong side.
+
+## The capped grid (`grid.py`)
+
+The shape is the martingale grid sold on social media: pending stop orders laddered above
+and below price, a fixed step apart, the size doubling every couple of levels so whichever
+way price runs, the later big lots pay back the earlier small ones.
+
+The difference is the cap, and the cap is the whole design. Twenty levels from a 0.01 base,
+uncapped, reaches 5.12 lots: 20.46 lots in total, $16,777 of margin, and $71,690 lost on a
+round trip through the grid. Capped at 0.03 the same twenty levels are 0.54 lots, $443 of
+margin and $1,234 — on a $2,672 account the first is not a strategy, it is a countdown.
+
+Two limits sit on top, because a grid's risk is never one trade but the sum of the basket:
+`GRID_TP_CASH` closes the whole basket in profit and re-arms at the new price,
+`GRID_MAX_LOSS` (or `GRID_MAX_LOSS_PCT` of balance) closes it in loss and **halts**. The
+halt is deliberate and does not clear itself: a grid that re-arms after a stop is a grid
+that takes the account on the second attempt instead of the first. Only `/grid on` resumes.
+
+It runs on its own magic numbers (777333/777444) so the anchor strategy and the grid never
+see each other's positions — each would otherwise "harvest" trades the other depends on.
+Margin is checked against `GRID_MARGIN_CEILING_PCT` before anything is placed. The paper
+broker gained stop-order support specifically so this can be tested for free first.
