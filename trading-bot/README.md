@@ -282,3 +282,16 @@ often and a summary on every boot is noise. Event alerts still fire immediately.
 The watcher is supervised independently of `GRID_ENABLED`, because a released trade outlives
 the grid that released it — gating it on the grid would leave exactly the positions nobody
 else is managing with nobody watching them.
+
+### Sampling and the trail
+
+A trailing exit is only as tight as how often it looks. The engine polls every 1.5s, but
+while a basket is at or above `GRID_TP_CASH` the give-back threshold is live and every
+tick matters, so it polls every 0.5s instead. The rest of the time there is nothing to
+miss and the slower loop keeps the request rate down.
+
+It still cannot beat a gap. If price jumps straight through the threshold between two
+reads, the basket is taken at the first figure at or below it, which can be well under
+the trail. That is inherent to a software trail on a basket — a broker-side take profit
+protects one position, not the sum of nine — and it is the reason the floor exists: the
+basket is never taken below `GRID_TP_CASH`, however far the give-back overshoots.

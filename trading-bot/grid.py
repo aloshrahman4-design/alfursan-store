@@ -460,7 +460,10 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 save(state)
                 continue
 
-            await asyncio.sleep(1.5)
+            # A trailing exit is only as tight as how often it looks. While a basket is in
+            # the money the give-back threshold is live, so watch it three times as closely;
+            # the rest of the time there is nothing to miss.
+            await asyncio.sleep(0.5 if floating >= GRID_TP_CASH else 1.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
