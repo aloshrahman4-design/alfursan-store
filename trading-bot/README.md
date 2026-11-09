@@ -315,3 +315,20 @@ pretending the slate is clean.
 and wiping the list on a re-centre would quietly take them back — the bot would start
 counting them again and the next teardown would close positions it had promised not to
 touch.
+
+### A take profit on every level
+
+The basket rule waits for the whole net to clear its target, and that cost real money: two
+buy levels ran into profit while the sell side was bleeding, the net never reached $5, price
+reversed and both gains became losses. The win was there and the rule gave it back.
+
+`GRID_TP_PER_TRADE` ($2 by default) attaches a take profit to each order as it is placed, so
+every level closes at its own target independently of the basket. It lives at the broker, not
+in the loop, which means it fires on a gap or while the bot is restarting — the two cases a
+polled exit always loses. `tp_distance` converts cash to a price move for the order's volume
+($2 on 0.01 lot of gold is a $2 move; on 0.05 it is $0.40). Set it to 0 for basket-only.
+
+One sharp edge this created: `user_took_over` reads a take profit as "the user took this trade
+over", which is true for anchor trades and false for the grid, since the grid now sets a TP on
+everything it opens. Without scoping that test to the anchor magics, the entire grid would have
+quietly exempted itself from the panic button.

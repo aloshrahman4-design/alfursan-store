@@ -108,7 +108,8 @@ SETTABLE_KEYS = {
     "GRID_LEVELS": "عدد مستويات الشبكة بكل جهة",
     "GRID_STEP": "المسافة بين مستويات الشبكة بالدولار",
     "GRID_DOUBLE_EVERY": "يضاعف اللوت كل كم مستوى",
-    "GRID_TP_CASH": "أقل ربح تغلق عليه الشبكة",
+    "GRID_TP_CASH": "أقل ربح تغلق عليه الشبكة (الباسكت)",
+    "GRID_TP_PER_TRADE": "هدف كل صفقة لحالها بالدولار (0 = مطفي)",
     "GRID_TRAIL_PCT": "ارتداد إغلاق الشبكة % من القمة (0 = فوري)",
     "GRID_TRAIL_MIN": "أقل ارتداد بالدولار قبل إغلاق الشبكة",
     "GRID_ONE_WAY": "إلغاء الجهة المعاكسة بعد الالتزام (1 أو 0)",
@@ -136,7 +137,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
     "gridkeep": "GRID_RELEASE_LOSERS", "gridstep2": "GRID_RELEASED_STEP",
     "gridwatch": "GRID_RELEASED_SUMMARY_MIN", "gridloss": "GRID_MAX_LOSS",
     "gridlosspct": "GRID_MAX_LOSS_PCT", "griddouble": "GRID_DOUBLE_EVERY",
@@ -1315,7 +1316,10 @@ async def close_bot_positions():
         magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
         if p.get("symbol") != SYMBOL or p.get("magic") not in magics:
             continue
-        if user_took_over(p):        # the user owns this one now
+        # The handover rule reads a take profit as "the user took this one over", which is
+        # only true for anchor trades: the grid attaches its own TP to every order, so the
+        # same test there would quietly exempt the entire grid from the panic button.
+        if p.get("magic") in (MAGIC_BUY, MAGIC_SELL) and user_took_over(p):
             skipped += 1
             continue
         try:

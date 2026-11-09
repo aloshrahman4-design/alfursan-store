@@ -55,6 +55,12 @@ GRID_STEP = _f("GRID_STEP", 2.0)              # price distance between levels
 GRID_DOUBLE_EVERY = max(1, _i("GRID_DOUBLE_EVERY", 2))
 GRID_CONTRACT = _f("GRID_CONTRACT", 100.0)    # units per lot: gold is 100 oz
 GRID_TP_CASH = _f("GRID_TP_CASH", 5.0)        # the basket is not taken below this
+# A take profit carried by each order itself, in dollars. The basket rule waits for the
+# whole net to clear its target, so a level that ran into profit while the other side was
+# bleeding was never taken - price reversed and a real gain turned into a real loss. This
+# puts the exit at the broker: each level closes at its own +X$ immediately, even if the
+# bot is offline or the move is too fast to poll. 0 disables it and leaves only the basket.
+GRID_TP_PER_TRADE = _f("GRID_TP_PER_TRADE", 2.0)
 # Once past GRID_TP_CASH the basket is allowed to run, and is taken when it gives back this
 # share of its own peak - the same rule the anchor strategy uses, for the same reason: a
 # flat take closes a strong move at exactly the target and leaves the rest on the table.
@@ -98,6 +104,16 @@ def ladder(base=None, cap=None, levels=None, double_every=None):
     levels = GRID_LEVELS if levels is None else levels
     double_every = GRID_DOUBLE_EVERY if double_every is None else max(1, double_every)
     return [round(min(base * 2 ** (i // double_every), cap), 2) for i in range(max(0, levels))]
+
+
+def tp_distance(volume, cash=None, contract=None):
+    """Price move that turns into `cash` on this volume. 0.01 lot of gold: $1 = $1."""
+    cash = GRID_TP_PER_TRADE if cash is None else cash
+    contract = GRID_CONTRACT if contract is None else contract
+    per_dollar = float(volume) * contract
+    if cash <= 0 or per_dollar <= 0:
+        return None
+    return round(cash / per_dollar, 2)
 
 
 def worst_case(lots=None, step=None, contract=None):
@@ -274,6 +290,9 @@ def plan_text(balance=0.0):
         f"• السلّم: `{shown}`",
         f"• أكبر لوت: `{max(lots) if lots else 0:g}` · المجموع `{total:g}` لوت",
         f"• مدى الشبكة: `{round(len(lots) * GRID_STEP, 2):g}$` بكل اتجاه",
+        (f"• 🎯 هدف كل صفقة لحالها: `+{GRID_TP_PER_TRADE:g}$` — محطوط عند الوسيط، "
+         f"يغلق فوراً حتى لو البوت مطفي" if GRID_TP_PER_TRADE > 0
+         else "• ماكو هدف لكل صفقة — الباسكت بس"),
         f"• جني الباسكت: ما يغلق قبل `+{GRID_TP_CASH:g}$`، وبعدها "
         + (f"يمشي معه ويغلق إذا رجع `{GRID_TRAIL_PCT:g}%` من القمة "
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
@@ -320,13 +339,15 @@ async def arm(conn, symbol, notify):
     for i, lot in enumerate(lots, start=1):
         up = round(center + i * GRID_STEP, 2)
         down = round(center - i * GRID_STEP, 2)
-        for maker, price_at, magic in (
-                (conn.create_stop_buy_order, up, MAGIC_GRID_BUY),
-                (conn.create_stop_sell_order, down, MAGIC_GRID_SELL)):
+        dist = tp_distance(lot)
+        for maker, price_at, magic, sign in (
+                (conn.create_stop_buy_order, up, MAGIC_GRID_BUY, 1),
+                (conn.create_stop_sell_order, down, MAGIC_GRID_SELL, -1)):
+            tp = round(price_at + sign * dist, 2) if dist else None
             try:
                 await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
-                          options={"magic": magic}), timeout=8.0)
+                          take_profit=tp, options={"magic": magic}), timeout=8.0)
                 placed += 1
             except Exception as e:
                 failed += 1
