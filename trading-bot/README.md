@@ -537,3 +537,23 @@ the demo rather than offer the way back.
 Switch only after `/stop`. Changing `ACCOUNT_ID` points the bot at a different account; it
 does not close what is open on the one being left, and those positions keep their broker
 stops but lose the bot that was managing them.
+
+## The protection guard
+
+`protect_engine` is its own supervised task, and that is the point. The same rule used to
+run inside the two engines, so it stopped whenever either did: switch the system off from
+the panel, or turn the grid off, and open trades carried on with nobody moving their stops.
+It now covers every bot position — anchor and grid — regardless of what else is running,
+skipping only trades handed to the user and anything not opened by this bot. It never
+opens, closes or widens; it only tightens a stop in the user's favour, so there is no state
+in which running it is unsafe.
+
+`BE_MIN_GAP` exists because a cash trail converts to very different price distances by lot
+size. $0.50 is $0.50 of price on 0.01 lot and $0.10 on 0.05 — tighter than the spread, so
+the computed stop landed above the market and was refused, and the largest trades ended up
+with no protection at all. The stop is now pulled back to a placeable distance rather than
+skipped, and only skipped when even that would sit below break-even.
+
+One honest consequence: with a $0.30 spread and a $0.25 minimum gap, a 0.01-lot trade needs
+roughly $0.60 of profit before any stop fits above entry, whatever `BE_TRIGGER_CASH` says.
+The trigger is a floor on intent, not a promise about the first cent.

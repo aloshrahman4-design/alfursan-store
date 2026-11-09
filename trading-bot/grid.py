@@ -100,6 +100,11 @@ BE_TRAIL_CASH = _f("BE_TRAIL_CASH", 0.50)
 # governs; at and above it the floor does, so +$2 becomes a level the trade defends
 # rather than the point it is taken at.
 BE_FLOOR_CASH = _f("BE_FLOOR_CASH", 2.0)
+# A cash trail converts to wildly different price distances by lot size: $0.50 is $0.50 of
+# price on 0.01 lot and $0.10 on 0.05 - tighter than the spread, so the stop landed above
+# the market and was refused, leaving the big trades with no protection at all. The stop is
+# pulled back to a placeable distance instead of skipped, as long as it still locks a gain.
+BE_MIN_GAP = _f("BE_MIN_GAP", 0.25)
 # Hard ceilings on what the grid may be holding at once. The level cap only ever limited
 # PENDING orders per side; nothing limited open positions, so refilling and recycling kept
 # feeding a trend until twenty were open together and the basket stop took them all at once.
@@ -591,14 +596,6 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                                      f"ألغيت `{len(stale)}` أمر معلّق بالجهة المعاكسة "
                                      "حتى ما تاكل الربح.")
 
-            if positions and BE_ENABLED:
-                try:
-                    px = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
-                    await apply_breakeven(conn, positions, float(px.get("bid", 0) or 0),
-                                          float(px.get("ask", 0) or 0), notify)
-                except Exception as e:
-                    log.warning(f"break-even pass skipped: {e}")
-
             # How much more the grid may take on, in positions and in money. Both are
             # hard: the loss that triggered these ceilings came from twenty positions
             # opening together while every individual rule was behaving correctly.
@@ -827,7 +824,7 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
 _be_peaks = {}        # best profit each secured position has shown; dies with the position
 
 
-async def apply_breakeven(conn, positions, bid, ask, notify=None, label="الشبكة"):
+async def apply_breakeven(conn, positions, bid, ask, notify=None, label=""):
     """Move the stop of any position past the trigger to its entry, costs covered.
 
     Never loosens a stop and never sets one on a losing trade: the stop can only ever end
@@ -862,8 +859,13 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label="الش�
         lock = tp_distance(vol, locked) or 0.0
         # A buy is opened at ask and closed at bid, so entry alone would close at -spread.
         target = round(entry + spread + lock, 2) if is_buy else round(entry - spread - lock, 2)
-        if (is_buy and target >= bid) or (not is_buy and target <= ask):
-            continue                      # would execute immediately; wait for more room
+        # Keep it a placeable distance from the market rather than refusing outright.
+        gap = max(spread, BE_MIN_GAP)
+        target = min(target, round(bid - gap, 2)) if is_buy else max(target, round(ask + gap, 2))
+        # ...but never at the cost of turning a protected trade into a losing one.
+        floor_px = (round(entry + spread, 2) if is_buy else round(entry - spread, 2))
+        if (is_buy and target < floor_px) or (not is_buy and target > floor_px):
+            continue                      # not enough room yet to lock anything; wait
         current = p.get("stopLoss")
         try:
             current = float(current) if current else None
@@ -882,6 +884,6 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label="الش�
     if moved and notify:
         tail = (f"\nوالوقف يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة."
                 if BE_TRAIL_CASH > 0 else "")
-        await notify(f"🛡 *أمّنت `{len(moved)}` صفقة {label}* — ربحت أكثر من "
+        await notify(f"🛡 *أمّنت `{len(moved)}` صفقة{(' ' + label) if label else ''}* — ربحت أكثر من "
                      f"`{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.{tail}")
     return len(moved)

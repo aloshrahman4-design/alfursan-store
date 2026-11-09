@@ -119,6 +119,7 @@ SETTABLE_KEYS = {
     "BE_LOCK_CASH": "الربح المضمون بعد التأمين",
     "BE_TRAIL_CASH": "كم يتبع الوقف خلف القمة بالدولار",
     "BE_FLOOR_CASH": "الربح اللي ما ينزل الوقف تحته بعد ما يعبره",
+    "BE_MIN_GAP": "أقل مسافة سعر بين الوقف والسوق",
     "GRID_MAX_POSITIONS": "أقصى عدد صفقات شبكة مفتوحة بنفس الوقت",
     "GRID_ADD_STOP_PCT": "يوقف فتح مستويات عند هذي النسبة من حد الخسارة",
     "GRID_REFILL": "سدّ فجوات الشبكة تلقائياً (1 أو 0)",
@@ -147,7 +148,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
     "gridkeep": "GRID_RELEASE_LOSERS", "gridstep2": "GRID_RELEASED_STEP",
@@ -1616,6 +1617,43 @@ async def handle_grid_command(text):
     await send_long(grid.status_text(balance), markup=keyboard())
 
 
+async def protect_engine():
+    """Watch the price of every bot trade and never let a profitable one turn red.
+
+    Its own task on purpose. The protection used to live inside the two engines, so it
+    stopped the moment either stopped: switch the system off from the panel, or turn the
+    grid off, and open trades kept running with nobody moving their stops. Nothing here
+    opens, closes or widens anything - it only ever tightens a stop in the user's favour,
+    so there is no state in which it is unsafe to be running.
+    """
+    if grid is None:
+        return
+    while True:
+        try:
+            if not (connection and getattr(grid, "BE_ENABLED", False)):
+                await asyncio.sleep(3)
+                continue
+            price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=6.0)
+            bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
+            if not bid or not ask:
+                await asyncio.sleep(2)
+                continue
+            released = set(grid.load().get("released", []))
+            magics = (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS
+            pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
+            mine = [p for p in pos
+                    if p.get("symbol") == SYMBOL and p.get("magic") in magics
+                    and p.get("id") not in released]
+            if mine:
+                await grid.apply_breakeven(connection, mine, bid, ask, notify, "")
+            await asyncio.sleep(1.0 if mine else 3.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"protect pass failed: {e}")
+            await asyncio.sleep(5)
+
+
 async def detect_public_ip():
     """The address TradingView has to reach. Asked for once, then stored."""
     cmd = ["curl", "-fsS", "--max-time", "10", "https://api.ipify.org"]
@@ -1695,12 +1733,6 @@ async def range_engine():
             # a peak belongs to a position; drop it when the position is gone
             live_ids = {p.get("id") for p in mine}
             peak_by_id = {k: v for k, v in peak_by_id.items() if k in live_ids}
-            if grid is not None and getattr(grid, "BE_ENABLED", False) and mine:
-                try:
-                    await grid.apply_breakeven(connection, mine, bid, ask, notify, "ارتكاز")
-                except Exception as e:
-                    log.warning(f"anchor break-even pass skipped: {e}")
-
             buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
                        and not user_took_over(p)]
             sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL
@@ -2213,6 +2245,7 @@ async def main():
         supervise("telegram_listener", telegram_listener),
         supervise("cost_governor", cost_governor),
         supervise("hook_server", hook_server),
+        supervise("protect", protect_engine),
     ]
     if grid is not None:
         # Watching what was handed over is not conditional on the grid running: those
