@@ -195,6 +195,8 @@ handed_over_ids = set()
 # Last seen state of every bot position, so a close done at the broker is noticed.
 tracked_positions = {}
 hook_last, hook_count = None, 0
+# Peak profit per open position: the harvest trails each trade on its own.
+peak_by_id = {}
 hook_bound_port = None
 total_profit = 0.0
 buy_count, sell_count = 0, 0
@@ -1621,6 +1623,7 @@ async def handle_hook_command(text):
 async def range_engine():
     global bot_active, connection, buy_anchor, sell_anchor, buy_waiting, sell_waiting
     global peak_buy_profit, peak_sell_profit, total_profit, buy_count, sell_count, last_price_ok
+    global peak_by_id
 
     while True:
         try:
@@ -1638,26 +1641,35 @@ async def range_engine():
             mine = [p for p in all_pos if p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
             await review_handovers(mine)
             await note_external_closes(mine)
+            # a peak belongs to a position; drop it when the position is gone
+            live_ids = {p.get("id") for p in mine}
+            peak_by_id = {k: v for k, v in peak_by_id.items() if k in live_ids}
             buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
                        and not user_took_over(p)]
             sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL
                         and not user_took_over(p)]
 
             if len(buy_pos) > 0:
-                b = buy_pos[-1]
                 if buy_anchor is None:
-                    buy_anchor = b.get("openPrice", ask)
-                curr_profit = float(b.get("unrealizedProfit", 0.0))
-                if curr_profit >= MIN_CASH_PROFIT:
-                    if curr_profit > peak_buy_profit:
-                        peak_buy_profit = curr_profit
-                    if curr_profit <= (peak_buy_profit - give_back_limit(peak_buy_profit)):
-                        if await safe_close_position(b["id"]):
-                            tracked_positions.pop(b["id"], None)
+                    buy_anchor = buy_pos[-1].get("openPrice", ask)
+                # Every position, each with its own peak. Managing only the last one left a
+                # second الشراء trade open for good: it ran into profit, nothing watched it,
+                # and price took the whole gain back.
+                for _p in list(buy_pos):
+                    _id = _p["id"]
+                    curr_profit = float(_p.get("unrealizedProfit", 0.0))
+                    if curr_profit < MIN_CASH_PROFIT:
+                        continue
+                    _peak = max(peak_by_id.get(_id, 0.0), curr_profit)
+                    peak_by_id[_id] = _peak
+                    if curr_profit <= round(_peak - give_back_limit(_peak), 2):
+                        if await safe_close_position(_id):
+                            tracked_positions.pop(_id, None)
+                            peak_by_id.pop(_id, None)
                             total_profit += curr_profit
                             buy_count += 1
                             buy_waiting = True
-                            captured = peak_buy_profit
+                            captured = _peak
                             peak_buy_profit = 0.0
                             await notify(act("🟢 اغلق صفقة الشراء الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
                                          or f"🟢 **حصد قمة الشراء!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
@@ -1674,20 +1686,26 @@ async def range_engine():
                     await asyncio.sleep(2.0)
 
             if len(sell_pos) > 0:
-                s = sell_pos[-1]
                 if sell_anchor is None:
-                    sell_anchor = s.get("openPrice", bid)
-                curr_profit = float(s.get("unrealizedProfit", 0.0))
-                if curr_profit >= MIN_CASH_PROFIT:
-                    if curr_profit > peak_sell_profit:
-                        peak_sell_profit = curr_profit
-                    if curr_profit <= (peak_sell_profit - give_back_limit(peak_sell_profit)):
-                        if await safe_close_position(s["id"]):
-                            tracked_positions.pop(s["id"], None)
+                    sell_anchor = sell_pos[-1].get("openPrice", bid)
+                # Every position, each with its own peak. Managing only the last one left a
+                # second البيع trade open for good: it ran into profit, nothing watched it,
+                # and price took the whole gain back.
+                for _p in list(sell_pos):
+                    _id = _p["id"]
+                    curr_profit = float(_p.get("unrealizedProfit", 0.0))
+                    if curr_profit < MIN_CASH_PROFIT:
+                        continue
+                    _peak = max(peak_by_id.get(_id, 0.0), curr_profit)
+                    peak_by_id[_id] = _peak
+                    if curr_profit <= round(_peak - give_back_limit(_peak), 2):
+                        if await safe_close_position(_id):
+                            tracked_positions.pop(_id, None)
+                            peak_by_id.pop(_id, None)
                             total_profit += curr_profit
                             sell_count += 1
                             sell_waiting = True
-                            captured = peak_sell_profit
+                            captured = _peak
                             peak_sell_profit = 0.0
                             await notify(act("🔴 اغلق صفقة البيع الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
                                          or f"🔴 **حصد قاع البيع!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")

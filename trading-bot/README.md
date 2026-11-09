@@ -332,3 +332,16 @@ One sharp edge this created: `user_took_over` reads a take profit as "the user t
 over", which is true for anchor trades and false for the grid, since the grid now sets a TP on
 everything it opens. Without scoping that test to the anchor magics, the entire grid would have
 quietly exempted itself from the panic button.
+
+## One position per side was a bug, not a design
+
+The anchor engine harvested `buy_pos[-1]` and `sell_pos[-1]` — the newest trade on each
+side and nothing else. With two buys open, one was watched and the other was invisible: it
+could run into profit with nothing tracking its peak, and price would take the whole gain
+back. That is exactly what happened to two 0.05 buys at 4129.42 and 4127.86.
+
+Every open position is now harvested on its own merits, each trailing its own peak in
+`peak_by_id`, so one trade closing says nothing about another. The entry for a position is
+dropped when it closes, and stale ids are swept each tick against what is actually open.
+The anchor price still comes from the newest trade, which is what the re-entry logic means
+by "the anchor".
