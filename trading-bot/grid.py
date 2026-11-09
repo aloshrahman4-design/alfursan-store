@@ -78,6 +78,12 @@ GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "1") not in ("0", "false", "no")
 # It is the one arrangement where releasing losers is not the usual grid suicide - they
 # stop being the bot's problem entirely, so nothing accumulates behind its back.
 GRID_SIDE_HARVEST = os.environ.get("GRID_SIDE_HARVEST", "1") not in ("0", "false", "no")
+# Releasing a trade gives up the decision, not the watch. A trade nobody is looking at is
+# how a $20 loss quietly becomes a $400 one, so the bot keeps reporting on what it handed
+# over: the moment it turns green (the user's chance to take it), every step deeper, and a
+# standing summary while any of them is still open.
+GRID_RELEASED_STEP = _f("GRID_RELEASED_STEP", 25.0)
+GRID_RELEASED_SUMMARY_MIN = _f("GRID_RELEASED_SUMMARY_MIN", 30.0)
 GRID_RELEASE_LOSERS = os.environ.get("GRID_RELEASE_LOSERS", "1") not in ("0", "false", "no")
 
 
@@ -484,3 +490,96 @@ def status_text(balance=0.0):
                     f"`{round(GRID_BASE_LOT * 2 ** ((len(lots) - 1) // GRID_DOUBLE_EVERY), 2):g}`")
     body.append("\n`/grid on` · `/grid off` · `/grid reset` · `/setkey gridlevels 12`")
     return "\n".join(body)
+
+
+# --- watching what was handed over ---------------------------------------------------
+_released_seen = {}        # id -> {"worst": float, "green": bool, "last": float}
+_released_summary_at = 0.0
+
+
+def released_lines(positions):
+    out = []
+    for p in sorted(positions, key=lambda q: float(q.get("unrealizedProfit", 0.0) or 0.0)):
+        pr = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        side = "شراء" if p.get("type") == "POSITION_TYPE_BUY" else "بيع"
+        mark = "🟢" if pr >= 0 else "🔴"
+        out.append(f"{mark} {side} `{p.get('volume')}` من `{p.get('openPrice')}` → "
+                   f"`{pr:+.2f}$`")
+    return out
+
+
+async def released_watcher(get_conn, notify):
+    """Report on trades the bot handed over. It never closes them."""
+    global _released_summary_at
+    # Start the clock now: the bot restarts often, and a summary fired on every boot is
+    # noise. Events still report immediately, and /mine answers on demand.
+    _released_summary_at = time.time()
+    while True:
+        try:
+            conn = get_conn()
+            ids = set(load().get("released", []))
+            if conn is None or not ids:
+                await asyncio.sleep(10)
+                continue
+            all_pos = await asyncio.wait_for(conn.get_positions(), timeout=8.0)
+            mine = [p for p in all_pos if p.get("id") in ids]
+            live = {p.get("id") for p in mine}
+
+            gone = ids - live
+            if gone:
+                state = load()
+                state["released"] = [i for i in state.get("released", []) if i in live]
+                save(state)
+                last = [f"`{_released_seen.pop(i, {}).get('last', 0.0):+.2f}$`" for i in gone]
+                await notify(f"✅ *انغلقت {len(gone)} من صفقاتك المسلّمة.*\n"
+                             f"آخر نتيجة شفتها عليها: {' · '.join(last)}\n"
+                             "(أغلقتها إنت أو ضربت ستوب — أنا ما ألمسها.)")
+
+            for p in mine:
+                pid = p.get("id")
+                pr = float(p.get("unrealizedProfit", 0.0) or 0.0)
+                seen = _released_seen.setdefault(pid, {"worst": pr, "green": pr >= 0, "last": pr})
+                seen["last"] = pr
+                side = "الشراء" if p.get("type") == "POSITION_TYPE_BUY" else "البيع"
+                if pr >= 0 and not seen["green"]:
+                    seen["green"] = True
+                    await notify(f"🎉 *صفقة {side} اللي عندك صارت رابحة* `{pr:+.2f}$`\n"
+                                 f"• الدخول `{p.get('openPrice')}` · الحجم `{p.get('volume')}`\n"
+                                 "هذي فرصتك تغلقها — القرار إلك، أنا ما ألمسها.")
+                elif pr < 0:
+                    seen["green"] = False
+                    if pr <= seen["worst"] - GRID_RELEASED_STEP:
+                        seen["worst"] = pr
+                        await notify(f"⚠️ *صفقة {side} اللي عندك غاطت أكثر* `{pr:+.2f}$`\n"
+                                     f"• الدخول `{p.get('openPrice')}` · الحجم `{p.get('volume')}`\n"
+                                     "ما عندها وقف خسارة — انتبه لها.")
+
+            now = time.time()
+            if mine and now - _released_summary_at >= GRID_RELEASED_SUMMARY_MIN * 60:
+                _released_summary_at = now
+                total = pnl(mine)
+                await notify("👁 *متابعة صفقاتك المسلّمة*\n\n" + "\n".join(released_lines(mine))
+                             + f"\n\n*المجموع:* `{total:+.2f}$` — مفتوحة بإدارتك.")
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"released watcher error: {e}", exc_info=True)
+            await asyncio.sleep(15)
+
+
+async def released_text(conn):
+    """What /mine shows."""
+    ids = set(load().get("released", []))
+    if not ids:
+        return "🤝 ماكو صفقات مسلّمة — كل شي تحت إدارة البوت."
+    if conn is None:
+        return f"🤝 عندك `{len(ids)}` صفقة مسلّمة، بس ماكو اتصال حالياً لأجيب أسعارها."
+    all_pos = await asyncio.wait_for(conn.get_positions(), timeout=8.0)
+    mine = [p for p in all_pos if p.get("id") in ids]
+    if not mine:
+        return "🤝 صفقاتك المسلّمة كلها انغلقت."
+    return ("🤝 *صفقاتك المسلّمة* — مفتوحة بإدارتك، البوت يراقب وما يتدخل\n\n"
+            + "\n".join(released_lines(mine))
+            + f"\n\n*المجموع:* `{pnl(mine):+.2f}$`\n"
+            "⚠️ بلا وقف خسارة — إنت اللي تقرر متى تغلقها.")

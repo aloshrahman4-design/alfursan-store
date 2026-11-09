@@ -263,3 +263,22 @@ and become the user's, at his explicit request. Nothing accumulates where the bo
 it, and the account-level exposure is his to manage.
 
 The released list is capped at 200 ids so closed trades cannot grow it without bound.
+
+### Watching what was handed over
+
+Releasing a trade gives up the decision, not the watch. An unwatched position is how a $20
+loss quietly becomes a $400 one, so `released_watcher` keeps reporting on everything the
+bot handed over, while never touching it:
+
+- **Turned green** — the one moment the user most needs, since it is his chance to close.
+  Announced once per crossing, not repeated while it stays positive.
+- **Sank another `GRID_RELEASED_STEP`** ($25) — stepped, so drift does not spam.
+- **Closed** — detected, reported with the last P/L seen, and dropped from the list.
+- **A standing summary** every `GRID_RELEASED_SUMMARY_MIN` (30), and `/mine` on demand.
+
+The summary clock starts when the watcher starts rather than at zero: the bot restarts
+often and a summary on every boot is noise. Event alerts still fire immediately.
+
+The watcher is supervised independently of `GRID_ENABLED`, because a released trade outlives
+the grid that released it — gating it on the grid would leave exactly the positions nobody
+else is managing with nobody watching them.

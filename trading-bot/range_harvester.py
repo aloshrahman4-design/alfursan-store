@@ -114,6 +114,8 @@ SETTABLE_KEYS = {
     "GRID_ONE_WAY": "إلغاء الجهة المعاكسة بعد الالتزام (1 أو 0)",
     "GRID_SIDE_HARVEST": "حصد كل جهة لحالها (1) أو المجموع (0)",
     "GRID_RELEASE_LOSERS": "ترك الخاسرة مفتوحة لك (1 أو 0)",
+    "GRID_RELEASED_STEP": "كل كم دولار غطس ينبهك على صفقتك",
+    "GRID_RELEASED_SUMMARY_MIN": "كل كم دقيقة يرسل متابعة صفقاتك",
     "GRID_MAX_LOSS": "حد خسارة الشبكة بالدولار (0 = نسبة)",
     "GRID_MAX_LOSS_PCT": "حد خسارة الشبكة كنسبة من الرصيد",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
@@ -134,7 +136,8 @@ KEY_ALIASES = {
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "gridside": "GRID_SIDE_HARVEST",
-    "gridkeep": "GRID_RELEASE_LOSERS", "gridloss": "GRID_MAX_LOSS",
+    "gridkeep": "GRID_RELEASE_LOSERS", "gridstep2": "GRID_RELEASED_STEP",
+    "gridwatch": "GRID_RELEASED_SUMMARY_MIN", "gridloss": "GRID_MAX_LOSS",
     "gridlosspct": "GRID_MAX_LOSS_PCT", "griddouble": "GRID_DOUBLE_EVERY",
     "hookmode": "HOOK_MODE", "hookport": "HOOK_PORT", "hookhost": "HOOK_HOST",
     "hooksecret": "HOOK_SECRET", "hookips": "HOOK_ALLOW_IPS", "hookon": "HOOK_ENABLED",
@@ -695,6 +698,7 @@ HELP_TEXT = (
     "• `/setkey claude sk-ant-...` — حفظ مفتاح Claude (تُحذف الرسالة تلقائياً)\n"
     "• `/capital <مفتاح> <إيميل> <كلمة سر>` — ربط Capital.com وضبط كل شي تلقائياً\n"
     "• /check — فحص الاتصال والحساب والسعر\n"
+    "• /mine — صفقاتك المسلّمة: البوت يراقبها ولا يتدخل\n"
     "• /grid — شبكة المضاعفة المكبوحة (`/grid on` · `/grid off` · `/grid reset`)\n"
     "• /hook — ربط TradingView: الرابط والحالة (`/hook trade` للتنفيذ، `/hook watch` للمراقبة)\n"
     "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
@@ -1811,6 +1815,11 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/mine"):
+                if grid is None:
+                    await send_long("⚠️ الوحدة غير موجودة — أرسل `/update`.", markup=keyboard())
+                else:
+                    await send_long(await grid.released_text(connection), markup=keyboard())
             elif text.startswith("/grid"):
                 await handle_grid_command(text)
             elif text.startswith("/hook"):
@@ -2023,6 +2032,7 @@ async def main():
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
+            BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),
             BotCommand("entry", "تصحيح سعر الدخول: /entry 4468.5"),
@@ -2054,9 +2064,14 @@ async def main():
         supervise("cost_governor", cost_governor),
         supervise("hook_server", hook_server),
     ]
-    if grid is not None and grid.GRID_ENABLED:
-        tasks.append(supervise("grid_engine", lambda: grid.grid_engine(
-            lambda: connection, SYMBOL, notify, lambda: bot_active)))
+    if grid is not None:
+        # Watching what was handed over is not conditional on the grid running: those
+        # trades outlive it, and an unwatched one is how a small loss becomes a large one.
+        tasks.append(supervise("released_watch", lambda: grid.released_watcher(
+            lambda: connection, notify)))
+        if grid.GRID_ENABLED:
+            tasks.append(supervise("grid_engine", lambda: grid.grid_engine(
+                lambda: connection, SYMBOL, notify, lambda: bot_active)))
     if intel is not None and not LEAN:
         tasks.append(supervise("news_watcher", lambda: intel.news_watcher(fetch_candles, SYMBOL, notify)))
         tasks.append(supervise("daily_scheduler", lambda: intel.daily_scheduler(fetch_candles, SYMBOL, notify)))
