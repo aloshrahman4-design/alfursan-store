@@ -383,3 +383,16 @@ treats an armed grid the same way. A broker error still fails safe by staying aw
 Switching the system off from the panel has the same shape on a smaller scale: it stops the
 bot managing, not the broker filling. The toggle now says so and points at `/grid off`,
 which actually cancels the orders.
+
+### Holes in the ladder
+
+Levels fill, close at their target, and leave gaps. The grid only re-arms once every
+position *and* every order is gone, so price could end up stranded in an $18 dead zone —
+nearest buy stop $11 above, nearest sell stop $7 below — with nothing to catch it, for as
+long as the remaining positions stayed open.
+
+`refill_gaps` puts a level back one step from price whenever the nearest one on that side
+has drifted more than `GRID_GAP_FACTOR` (1.5) steps away. It adds pending orders only: open
+positions are never touched, so nothing is realised to fix a gap. A side already holding
+`GRID_LEVELS` orders is left alone, which is what stops a trending market turning this into
+an order machine — the ladder tops up to the width it was always allowed, never past it.

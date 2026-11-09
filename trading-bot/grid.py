@@ -76,6 +76,12 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 # it on every tick was a third of the request load on its own, which slowed the price reads
 # enough that the connection kept being declared stale and rebuilt.
 GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
+# Levels that fill and close leave holes. The grid only re-arms once every position AND
+# every order is gone, so price can end up sitting in an $18 dead zone - nearest buy stop
+# far above, nearest sell stop far below - doing nothing for hours. Top the ladder back up
+# near price instead: it keeps the grid working without disturbing what is already open.
+GRID_REFILL = os.environ.get("GRID_REFILL", "1") not in ("0", "false", "no")
+GRID_GAP_FACTOR = _f("GRID_GAP_FACTOR", 1.5)   # a hole this many steps wide is refilled
 # Both sides armed at once means a move that should earn is paid for by the other side
 # bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
@@ -338,6 +344,8 @@ def plan_text(balance=0.0):
         (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
+        (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
+         if GRID_REFILL else "• ⚠️ ما يسدّ الفجوات — ممكن يبقى بلا أوامر قرب السعر"),
         ("• 🤝 الخاسرة تبقى مفتوحة وتصير إلك — البوت ما يتحكم بيها"
          if GRID_RELEASE_LOSERS else "• الخاسرة تنغلق مع الرابحة"),
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
@@ -538,6 +546,9 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                                      f"ألغيت `{len(stale)}` أمر معلّق بالجهة المعاكسة "
                                      "حتى ما تاكل الربح.")
 
+            if orders or positions:
+                await refill_gaps(conn, symbol, positions, orders, notify)
+
             if not positions and not orders:
                 peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
                 state["armed"] = False
@@ -670,3 +681,52 @@ async def released_text(conn):
             + "\n".join(released_lines(mine))
             + f"\n\n*المجموع:* `{pnl(mine):+.2f}$`\n"
             "⚠️ بلا وقف خسارة — إنت اللي تقرر متى تغلقها.")
+
+
+async def refill_gaps(conn, symbol, positions, orders, notify=None):
+    """Put a level back within one step of price when the nearest one has drifted away.
+
+    Never touches an open position and never exceeds GRID_LEVELS pendings a side, so a
+    trending market tops up at most to the size the ladder was always allowed to be.
+    """
+    if not (GRID_REFILL and GRID_LEVELS > 0):
+        return 0
+    try:
+        price = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
+    except Exception as e:
+        log.warning(f"refill skipped, no price: {e}")
+        return 0
+    bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
+    if not bid or not ask:
+        return 0
+    lot = round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2)
+    dist = tp_distance(lot)
+    gap = GRID_STEP * GRID_GAP_FACTOR
+    added = 0
+
+    for magic, maker, ref, sign in (
+            (MAGIC_GRID_BUY, conn.create_stop_buy_order, ask, 1),
+            (MAGIC_GRID_SELL, conn.create_stop_sell_order, bid, -1)):
+        side_orders = [o for o in orders if o.get("magic") == magic]
+        if len(side_orders) >= GRID_LEVELS:
+            continue                      # the ladder is already as wide as it may be
+        levels = [float(o.get("openPrice", 0) or 0) for o in side_orders]
+        nearest = min((abs(x - ref) for x in levels), default=None)
+        if nearest is not None and nearest <= gap:
+            continue                      # something is still close enough to catch price
+        at = round(ref + sign * GRID_STEP, 2)
+        if any(abs(at - x) < GRID_STEP / 2 for x in levels):
+            continue                      # would sit on top of an existing level
+        try:
+            await asyncio.wait_for(
+                maker(symbol=symbol, volume=lot, open_price=at,
+                      take_profit=round(at + sign * dist, 2) if dist else None,
+                      options={"magic": magic}), timeout=8.0)
+            added += 1
+            log.info(f"refilled {'buy' if sign > 0 else 'sell'} level at {at}")
+        except Exception as e:
+            log.warning(f"refill at {at} failed: {e}")
+    if added and notify:
+        await notify(f"🧩 *سدّيت فجوة بالشبكة* — أضفت `{added}` أمر قرب السعر الحالي، "
+                     "الصفقات المفتوحة ما لمستها.")
+    return added
