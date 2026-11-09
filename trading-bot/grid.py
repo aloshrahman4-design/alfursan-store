@@ -54,7 +54,11 @@ GRID_LEVELS = _i("GRID_LEVELS", 12)           # per side
 GRID_STEP = _f("GRID_STEP", 2.0)              # price distance between levels
 GRID_DOUBLE_EVERY = max(1, _i("GRID_DOUBLE_EVERY", 2))
 GRID_CONTRACT = _f("GRID_CONTRACT", 100.0)    # units per lot: gold is 100 oz
-GRID_TP_CASH = _f("GRID_TP_CASH", 5.0)        # close the whole basket at this profit
+GRID_TP_CASH = _f("GRID_TP_CASH", 5.0)        # the basket is not taken below this
+# Once past GRID_TP_CASH the basket is allowed to run, and is taken when it gives back this
+# share of its own peak - the same rule the anchor strategy uses, for the same reason: a
+# flat take closes a strong move at exactly the target and leaves the rest on the table.
+GRID_TRAIL_PCT = _f("GRID_TRAIL_PCT", 10.0)   # 0 = take the moment it reaches the target
 GRID_MAX_LOSS = _f("GRID_MAX_LOSS", 0.0)      # 0 = work it out from the percentage
 GRID_MAX_LOSS_PCT = _f("GRID_MAX_LOSS_PCT", 15.0)
 GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
@@ -203,7 +207,10 @@ def plan_text(balance=0.0):
         f"• السلّم: `{shown}`",
         f"• أكبر لوت: `{max(lots) if lots else 0:g}` · المجموع `{total:g}` لوت",
         f"• مدى الشبكة: `{round(len(lots) * GRID_STEP, 2):g}$` بكل اتجاه",
-        f"• جني الباسكت: `+{GRID_TP_CASH:g}$` · وقف الشبكة: `-{limit:g}$`",
+        f"• جني الباسكت: ما يغلق قبل `+{GRID_TP_CASH:g}$`، وبعدها "
+        + (f"يمشي معه ويغلق إذا رجع `{GRID_TRAIL_PCT:g}%` من القمة" if GRID_TRAIL_PCT > 0
+           else "يغلق فوراً عند الهدف"),
+        f"• وقف الشبكة: `-{limit:g}$`",
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
         f"• لو تأرجح وكسر الجهتين: `-{whip:,.0f}$` ← وهنا يقطع الوقف عند `-{limit:g}$`",
         f"• لو امتلأت واستمر بنفس الاتجاه: `+{best:,.0f}$`",
@@ -267,6 +274,7 @@ async def arm(conn, symbol, notify):
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
+    peak = 0.0          # best the current basket has shown; in memory, it dies with the basket
     while True:
         try:
             if not (GRID_ENABLED and is_active()):
@@ -305,13 +313,21 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
             limit = loss_limit(float(acct.get("balance", 0) or 0))
 
-            if positions and floating >= GRID_TP_CASH:
+            if positions and floating > peak:
+                peak = floating
+            give_back = round(peak * GRID_TRAIL_PCT / 100.0, 2) if GRID_TRAIL_PCT > 0 else 0.0
+            # Rounded: 5.6 - 0.56 is 5.039999... in binary, so an exact 5.04 would miss.
+            ready = floating >= GRID_TP_CASH and floating <= round(peak - give_back, 2)
+            if positions and ready:
+                rode = peak
                 closed, booked, cancelled = await teardown(conn)
+                peak = 0.0
                 state["cycles"] = state.get("cycles", 0) + 1
                 state["realized"] = round(state.get("realized", 0.0) + booked, 2)
                 state["armed"] = False
                 save(state)
-                await notify(f"💰 *حصدت الشبكة* `+{booked:g}$`\n"
+                top = f" (القمة كانت `+{rode:g}$`)" if rode > booked else ""
+                await notify(f"💰 *حصدت الشبكة* `+{booked:g}$`{top}\n"
                              f"• أغلقت `{closed}` صفقة وألغيت `{cancelled}` أمر معلّق\n"
                              f"• الدورة رقم `{state['cycles']}` · الإجمالي `{state['realized']:g}$`\n"
                              "🕸 أنصبها من جديد على السعر الحالي...")
@@ -319,6 +335,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             if positions and floating <= -limit:
                 closed, booked, cancelled = await teardown(conn)
+                peak = 0.0
                 state.update({"armed": False, "halted": True,
                               "halt_reason": f"الخسارة وصلت {booked:g}$",
                               "realized": round(state.get("realized", 0.0) + booked, 2)})
@@ -334,6 +351,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 continue
 
             if not positions and not orders:
+                peak = 0.0
                 state["armed"] = False
                 save(state)
                 continue

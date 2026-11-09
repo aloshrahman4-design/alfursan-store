@@ -206,3 +206,22 @@ It runs on its own magic numbers (777333/777444) so the anchor strategy and the 
 see each other's positions — each would otherwise "harvest" trades the other depends on.
 Margin is checked against `GRID_MARGIN_CEILING_PCT` before anything is placed. The paper
 broker gained stop-order support specifically so this can be tested for free first.
+
+### How the grid takes profit
+
+The basket, never a single trade. A grid always holds a winner and a loser at the same
+time - the buys gain while the sells bleed - so taking trades individually would close the
+winners and let the losers accumulate, which is precisely how grid accounts die. Every grid
+position's floating P/L is summed, and the whole basket is closed at once.
+
+Once that sum passes `GRID_TP_CASH` it is not taken immediately: the basket is allowed to
+run, its peak is tracked, and it is closed when it gives back `GRID_TRAIL_PCT`% of that
+peak - the same rule the anchor strategy uses. A flat take closes a strong move at exactly
+the target and leaves the rest behind. `GRID_TRAIL_PCT=0` restores the flat take. The
+floor is independent of the trail, so a basket that peaks just above the target is held
+rather than closed below it, and the give-back threshold is rounded before comparison
+(5.60 - 10% is 5.039999... in binary, which an exact 5.04 would otherwise miss).
+
+The peak lives in memory, not in the state file: it belongs to one basket, dies with it,
+and re-establishes itself after a restart rather than carrying a stale high into a new
+cycle.
