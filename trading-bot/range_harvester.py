@@ -118,6 +118,7 @@ SETTABLE_KEYS = {
     "BE_TRIGGER_CASH": "الربح اللي يأمّن الصفقة على الدخول",
     "BE_LOCK_CASH": "الربح المضمون بعد التأمين",
     "BE_TRAIL_CASH": "كم يتبع الوقف خلف القمة بالدولار",
+    "BE_FLOOR_CASH": "الربح اللي ما ينزل الوقف تحته بعد ما يعبره",
     "GRID_MAX_POSITIONS": "أقصى عدد صفقات شبكة مفتوحة بنفس الوقت",
     "GRID_ADD_STOP_PCT": "يوقف فتح مستويات عند هذي النسبة من حد الخسارة",
     "GRID_REFILL": "سدّ فجوات الشبكة تلقائياً (1 أو 0)",
@@ -146,7 +147,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
     "gridkeep": "GRID_RELEASE_LOSERS", "gridstep2": "GRID_RELEASED_STEP",
@@ -1681,8 +1682,7 @@ async def range_engine():
             peak_by_id = {k: v for k, v in peak_by_id.items() if k in live_ids}
             if grid is not None and getattr(grid, "BE_ENABLED", False) and mine:
                 try:
-                    await grid.apply_breakeven(connection, mine, max(0.0, ask - bid),
-                                               notify, "ارتكاز")
+                    await grid.apply_breakeven(connection, mine, bid, ask, notify, "ارتكاز")
                 except Exception as e:
                     log.warning(f"anchor break-even pass skipped: {e}")
 

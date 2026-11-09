@@ -60,7 +60,9 @@ GRID_TP_CASH = _f("GRID_TP_CASH", 5.0)        # the basket is not taken below th
 # bleeding was never taken - price reversed and a real gain turned into a real loss. This
 # puts the exit at the broker: each level closes at its own +X$ immediately, even if the
 # bot is offline or the move is too fast to poll. 0 disables it and leaves only the basket.
-GRID_TP_PER_TRADE = _f("GRID_TP_PER_TRADE", 2.0)
+# Off by default now: closing at a fixed +$2 capped every winner at exactly $2. The $2 is
+# a floor the trailing stop defends instead, so a trade that keeps running keeps earning.
+GRID_TP_PER_TRADE = _f("GRID_TP_PER_TRADE", 0.0)
 # Once past GRID_TP_CASH the basket is allowed to run, and is taken when it gives back this
 # share of its own peak - the same rule the anchor strategy uses, for the same reason: a
 # flat take closes a strong move at exactly the target and leaves the rest on the table.
@@ -88,12 +90,16 @@ GRID_GAP_FACTOR = _f("GRID_GAP_FACTOR", 1.5)   # a hole this many steps wide is 
 # flat. This only ever protects a gain - it can never force a loss - and the lock covers
 # the spread, so "flat" means flat after costs rather than minus the spread.
 BE_ENABLED = os.environ.get("BE_ENABLED", "1") not in ("0", "false", "no")
-BE_TRIGGER_CASH = _f("BE_TRIGGER_CASH", 1.0)
+BE_TRIGGER_CASH = _f("BE_TRIGGER_CASH", 0.35)
 BE_LOCK_CASH = _f("BE_LOCK_CASH", 0.10)
 # Break-even alone saves the trade and loses the gain: a position that reached +$1.80 and
 # turned around closed at zero, with the 1.80 gone. Once secured, the stop keeps following
 # the peak this far behind it, so a reversal banks most of what the move actually gave.
 BE_TRAIL_CASH = _f("BE_TRAIL_CASH", 0.50)
+# Once a trade has shown this much, the stop never gives it back. Below it the trail
+# governs; at and above it the floor does, so +$2 becomes a level the trade defends
+# rather than the point it is taken at.
+BE_FLOOR_CASH = _f("BE_FLOOR_CASH", 2.0)
 # Hard ceilings on what the grid may be holding at once. The level cap only ever limited
 # PENDING orders per side; nothing limited open positions, so refilling and recycling kept
 # feeding a trend until twenty were open together and the basket stop took them all at once.
@@ -362,8 +368,10 @@ def plan_text(balance=0.0):
         (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
-        (f"• 🛡 التأمين: أول ما تربح `{BE_TRIGGER_CASH:g}$` ينقل وقفها للدخول، "
-         f"وبعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة"
+        (f"• 🛡 التأمين: أول ما تعبر `{BE_TRIGGER_CASH:g}$` ينقل وقفها لنقطة الفتح — "
+         f"ما تصير خسارة بعدها أبداً\n"
+         f"• 📈 بعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة، "
+         f"وأول ما تعدّي `{BE_FLOOR_CASH:g}$` ما ينزل الوقف تحتها"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
         f"• 🚧 سقف الصفقات المفتوحة: `{GRID_MAX_POSITIONS}` · يوقف التوسّع عند "
         f"`{GRID_ADD_STOP_PCT:g}%` من حد الخسارة",
@@ -579,8 +587,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             if positions and BE_ENABLED:
                 try:
                     px = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
-                    sp = max(0.0, float(px.get("ask", 0) or 0) - float(px.get("bid", 0) or 0))
-                    await apply_breakeven(conn, positions, sp, notify)
+                    await apply_breakeven(conn, positions, float(px.get("bid", 0) or 0),
+                                          float(px.get("ask", 0) or 0), notify)
                 except Exception as e:
                     log.warning(f"break-even pass skipped: {e}")
 
@@ -812,7 +820,7 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
 _be_peaks = {}        # best profit each secured position has shown; dies with the position
 
 
-async def apply_breakeven(conn, positions, spread, notify=None, label="الشبكة"):
+async def apply_breakeven(conn, positions, bid, ask, notify=None, label="الشبكة"):
     """Move the stop of any position past the trigger to its entry, costs covered.
 
     Never loosens a stop and never sets one on a losing trade: the stop can only ever end
@@ -820,6 +828,7 @@ async def apply_breakeven(conn, positions, spread, notify=None, label="الشب�
     """
     if not (BE_ENABLED and BE_TRIGGER_CASH > 0) or not hasattr(conn, "modify_position"):
         return 0
+    spread = max(0.0, float(ask) - float(bid))
     moved = []
     for p in positions:
         try:
@@ -839,9 +848,15 @@ async def apply_breakeven(conn, positions, spread, notify=None, label="الشب�
         # Lock break-even at the least, and otherwise whatever the peak leaves after the
         # trail - so a trade that ran to +1.80 keeps most of it instead of closing at zero.
         locked = max(BE_LOCK_CASH, peak - BE_TRAIL_CASH) if BE_TRAIL_CASH > 0 else BE_LOCK_CASH
+        # The floor arms only once the peak is clear of it by the trail, or locking it the
+        # instant profit touched $2 would close the trade there - the very cap we removed.
+        if BE_FLOOR_CASH > 0 and peak >= BE_FLOOR_CASH + BE_TRAIL_CASH:
+            locked = max(locked, BE_FLOOR_CASH)
         lock = tp_distance(vol, locked) or 0.0
         # A buy is opened at ask and closed at bid, so entry alone would close at -spread.
         target = round(entry + spread + lock, 2) if is_buy else round(entry - spread - lock, 2)
+        if (is_buy and target >= bid) or (not is_buy and target <= ask):
+            continue                      # would execute immediately; wait for more room
         current = p.get("stopLoss")
         try:
             current = float(current) if current else None

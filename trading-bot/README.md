@@ -450,3 +450,24 @@ Three holes, all of them introduced by fixing something else:
 
 The pattern behind all three: a cap on a part is not a cap on the whole. Each rule was
 locally right and the sum was unbounded.
+
+## The two rules the stop enforces
+
+1. **Past the entry point, a trade can no longer be a loss.** Once profit clears
+   `BE_TRIGGER_CASH` ($0.35 — enough to put a stop above entry once the spread is paid),
+   the stop goes to entry plus costs. A reversal closes it flat, never red.
+2. **$2 is a floor, not an exit.** `GRID_TP_PER_TRADE` is off: a fixed target capped every
+   winner at exactly $2. Instead the stop trails `BE_TRAIL_CASH` behind the peak and, once
+   the peak clears `BE_FLOOR_CASH` ($2) by the trail, never locks less than $2 again. The
+   trade keeps running; it is taken only when it comes back to the level it defended.
+
+Worked through: peak $1.00 locks $0.50 · peak $2.00 locks $1.50 · peak $2.50 locks $2.00 ·
+peak $10.00 locks $9.50.
+
+The floor arms at `BE_FLOOR_CASH + BE_TRAIL_CASH`, not at `BE_FLOOR_CASH`. Locking $2 the
+instant profit touched $2 would close the trade there — which is the fixed target again,
+wearing a different name.
+
+A stop is never placed through the market: if the computed level is already past the
+current bid (buy) or ask (sell), it is skipped. Without that check an aggressive trigger
+closes the trade on the spot at a few cents instead of protecting it.
