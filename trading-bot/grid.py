@@ -82,6 +82,14 @@ GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
 # near price instead: it keeps the grid working without disturbing what is already open.
 GRID_REFILL = os.environ.get("GRID_REFILL", "1") not in ("0", "false", "no")
 GRID_GAP_FACTOR = _f("GRID_GAP_FACTOR", 1.5)   # a hole this many steps wide is refilled
+# Break-even. A trade that climbed part of the way to its target and then turned around
+# used to hand the whole gain back and keep going into loss. Once it has shown BE_TRIGGER
+# of profit its stop moves to entry, so from then on it either reaches the target or closes
+# flat. This only ever protects a gain - it can never force a loss - and the lock covers
+# the spread, so "flat" means flat after costs rather than minus the spread.
+BE_ENABLED = os.environ.get("BE_ENABLED", "1") not in ("0", "false", "no")
+BE_TRIGGER_CASH = _f("BE_TRIGGER_CASH", 1.0)
+BE_LOCK_CASH = _f("BE_LOCK_CASH", 0.10)
 # Both sides armed at once means a move that should earn is paid for by the other side
 # bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
@@ -344,6 +352,8 @@ def plan_text(balance=0.0):
         (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
+        (f"• 🛡 نقطة التعادل: أول ما تربح `{BE_TRIGGER_CASH:g}$` ينقل وقفها لسعر الدخول"
+         if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
         (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
          if GRID_REFILL else "• ⚠️ ما يسدّ الفجوات — ممكن يبقى بلا أوامر قرب السعر"),
         ("• 🤝 الخاسرة تبقى مفتوحة وتصير إلك — البوت ما يتحكم بيها"
@@ -546,6 +556,14 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                                      f"ألغيت `{len(stale)}` أمر معلّق بالجهة المعاكسة "
                                      "حتى ما تاكل الربح.")
 
+            if positions and BE_ENABLED:
+                try:
+                    px = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
+                    sp = max(0.0, float(px.get("ask", 0) or 0) - float(px.get("bid", 0) or 0))
+                    await apply_breakeven(conn, positions, sp, notify)
+                except Exception as e:
+                    log.warning(f"break-even pass skipped: {e}")
+
             if orders or positions:
                 await refill_gaps(conn, symbol, positions, orders, notify)
 
@@ -730,3 +748,45 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
         await notify(f"🧩 *سدّيت فجوة بالشبكة* — أضفت `{added}` أمر قرب السعر الحالي، "
                      "الصفقات المفتوحة ما لمستها.")
     return added
+
+
+async def apply_breakeven(conn, positions, spread, notify=None, label="الشبكة"):
+    """Move the stop of any position past the trigger to its entry, costs covered.
+
+    Never loosens a stop and never sets one on a losing trade: the stop can only ever end
+    up at or better than break-even, so this cannot turn a live trade into a forced loss.
+    """
+    if not (BE_ENABLED and BE_TRIGGER_CASH > 0) or not hasattr(conn, "modify_position"):
+        return 0
+    moved = []
+    for p in positions:
+        try:
+            profit = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if profit < BE_TRIGGER_CASH:
+            continue
+        entry = float(p.get("openPrice", 0) or 0)
+        vol = float(p.get("volume", 0) or 0)
+        if not entry or not vol:
+            continue
+        is_buy = p.get("type") == "POSITION_TYPE_BUY"
+        lock = tp_distance(vol, BE_LOCK_CASH) or 0.0
+        # A buy is opened at ask and closed at bid, so entry alone would close at -spread.
+        target = round(entry + spread + lock, 2) if is_buy else round(entry - spread - lock, 2)
+        current = p.get("stopLoss")
+        try:
+            current = float(current) if current else None
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and ((is_buy and current >= target) or (not is_buy and current <= target)):
+            continue                      # already at or better than break-even
+        try:
+            await asyncio.wait_for(conn.modify_position(p["id"], stop_loss=target), timeout=8.0)
+            moved.append((p["id"], target))
+        except Exception as e:
+            log.warning(f"break-even move failed on {p.get('id')}: {e}")
+    if moved and notify:
+        await notify(f"🛡 *أمّنت `{len(moved)}` صفقة {label} على نقطة الدخول* — "
+                     f"ربحت أكثر من `{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.")
+    return len(moved)

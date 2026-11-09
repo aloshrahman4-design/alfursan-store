@@ -114,6 +114,9 @@ SETTABLE_KEYS = {
     "GRID_TRAIL_PCT": "ارتداد إغلاق الشبكة % من القمة (0 = فوري)",
     "GRID_TRAIL_MIN": "أقل ارتداد بالدولار قبل إغلاق الشبكة",
     "GRID_ONE_WAY": "إلغاء الجهة المعاكسة بعد الالتزام (1 أو 0)",
+    "BE_ENABLED": "تأمين الصفقة على نقطة الدخول (1 أو 0)",
+    "BE_TRIGGER_CASH": "الربح اللي يأمّن الصفقة على الدخول",
+    "BE_LOCK_CASH": "الربح المضمون بعد التأمين",
     "GRID_REFILL": "سدّ فجوات الشبكة تلقائياً (1 أو 0)",
     "GRID_GAP_FACTOR": "كم خطوة تعتبر فجوة تستاهل أمر جديد",
     "GRID_COMMIT_LEVELS": "كم مستوى لازم يمتلئ قبل ما يعتبرها التزام",
@@ -140,7 +143,8 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "gridoneway": "GRID_ONE_WAY", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH",
+    "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridcommit": "GRID_COMMIT_LEVELS", "gridside": "GRID_SIDE_HARVEST",
     "gridkeep": "GRID_RELEASE_LOSERS", "gridstep2": "GRID_RELEASED_STEP",
     "gridwatch": "GRID_RELEASED_SUMMARY_MIN", "gridloss": "GRID_MAX_LOSS",
     "gridlosspct": "GRID_MAX_LOSS_PCT", "griddouble": "GRID_DOUBLE_EVERY",
@@ -639,6 +643,7 @@ async def handle_setkey(text, chat_id, message_id):
     # save the value and change nothing until the next restart. Restart now instead.
     if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
                "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
+            or key.startswith("BE_") \
             or key.startswith("GRID_"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
         os._exit(0)
@@ -1670,6 +1675,13 @@ async def range_engine():
             # a peak belongs to a position; drop it when the position is gone
             live_ids = {p.get("id") for p in mine}
             peak_by_id = {k: v for k, v in peak_by_id.items() if k in live_ids}
+            if grid is not None and getattr(grid, "BE_ENABLED", False) and mine:
+                try:
+                    await grid.apply_breakeven(connection, mine, max(0.0, ask - bid),
+                                               notify, "ارتكاز")
+                except Exception as e:
+                    log.warning(f"anchor break-even pass skipped: {e}")
+
             buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
                        and not user_took_over(p)]
             sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL

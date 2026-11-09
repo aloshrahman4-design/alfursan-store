@@ -208,7 +208,7 @@ class PaperBroker:
         _save(state)
 
     async def _trigger_take_profits(self):
-        """Close anything that reached the take profit carried on the order itself."""
+        """Close anything that reached its take profit or its stop loss."""
         state = _load()
         hit = []
         try:
@@ -217,19 +217,22 @@ class PaperBroker:
             return
         bid, ask = mid - SPREAD / 2, mid + SPREAD / 2
         for p in state["positions"]:
-            tp = p.get("takeProfit")
-            if not tp:
-                continue
-            reached = (bid >= tp) if p["type"] == "POSITION_TYPE_BUY" else (ask <= tp)
-            if reached:
-                hit.append(p)
-        for p in hit:
-            pnl = profit_of(p, mid)
+            is_buy = p["type"] == "POSITION_TYPE_BUY"
+            tp, sl = p.get("takeProfit"), p.get("stopLoss")
+            if tp and ((bid >= tp) if is_buy else (ask <= tp)):
+                hit.append((p, float(tp)))
+            elif sl and ((bid <= sl) if is_buy else (ask >= sl)):
+                hit.append((p, float(sl)))
+        for p, at in hit:
+            # A stop or a target executes at its own price, not wherever price has reached
+            # by the time we look. Booking it at the current mid made a protected trade
+            # report the loss it was protected from.
+            pnl = profit_of(p, at)
             state["balance"] = round(state["balance"] + pnl, 2)
             state["positions"] = [q for q in state["positions"] if q["id"] != p["id"]]
-            state["history"].append({**p, "closePrice": round(mid, 2), "profit": pnl,
-                                     "closedAt": int(time.time()), "reason": "TP"})
-            log.info(f"paper take profit {p['id']} at {tp} pnl {pnl}")
+            state["history"].append({**p, "closePrice": round(at, 2), "profit": pnl,
+                                     "closedAt": int(time.time()), "reason": "TP/SL"})
+            log.info(f"paper exit {p['id']} at {at} pnl {pnl}")
         if hit:
             state["history"] = state["history"][-500:]
             _save(state)

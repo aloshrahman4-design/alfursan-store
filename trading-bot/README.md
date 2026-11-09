@@ -396,3 +396,24 @@ has drifted more than `GRID_GAP_FACTOR` (1.5) steps away. It adds pending orders
 positions are never touched, so nothing is realised to fix a gap. A side already holding
 `GRID_LEVELS` orders is left alone, which is what stops a trending market turning this into
 an order machine — the ladder tops up to the width it was always allowed, never past it.
+
+## Break-even
+
+A trade that climbed part of the way to its target and then turned around used to hand the
+whole gain back and keep going into loss. Once a position shows `BE_TRIGGER_CASH` ($1) of
+profit its stop moves to entry, so from that point it either reaches the target or closes
+flat — it cannot become a loss.
+
+The stop is placed at entry plus the current spread plus `BE_LOCK_CASH` ($0.10), not at
+entry itself: a buy opens at ask and closes at bid, so entry alone would exit at minus the
+spread. "Flat" here means flat after costs.
+
+It only ever protects a gain. A losing trade is never given a stop by this, and an existing
+stop is never loosened — the check refuses to move one that is already at or better than
+break-even — so it cannot turn a live trade into a forced loss. That is why it is on by
+default even though per-trade stop losses are not.
+
+Both engines use it: the grid each tick, the anchor engine from the price it already holds.
+`broker_paper` books a stop or target at its own price rather than wherever price has
+reached by the next poll — booking at the current mid made a protected trade report the
+very loss it had been protected from.
