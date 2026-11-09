@@ -94,6 +94,12 @@ BE_LOCK_CASH = _f("BE_LOCK_CASH", 0.10)
 # turned around closed at zero, with the 1.80 gone. Once secured, the stop keeps following
 # the peak this far behind it, so a reversal banks most of what the move actually gave.
 BE_TRAIL_CASH = _f("BE_TRAIL_CASH", 0.50)
+# Hard ceilings on what the grid may be holding at once. The level cap only ever limited
+# PENDING orders per side; nothing limited open positions, so refilling and recycling kept
+# feeding a trend until twenty were open together and the basket stop took them all at once.
+GRID_MAX_POSITIONS = _i("GRID_MAX_POSITIONS", 8)
+# And a soft ceiling in money: stop adding once the basket is most of the way to its stop.
+GRID_ADD_STOP_PCT = _f("GRID_ADD_STOP_PCT", 50.0)
 # Both sides armed at once means a move that should earn is paid for by the other side
 # bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
@@ -359,6 +365,8 @@ def plan_text(balance=0.0):
         (f"• 🛡 التأمين: أول ما تربح `{BE_TRIGGER_CASH:g}$` ينقل وقفها للدخول، "
          f"وبعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
+        f"• 🚧 سقف الصفقات المفتوحة: `{GRID_MAX_POSITIONS}` · يوقف التوسّع عند "
+        f"`{GRID_ADD_STOP_PCT:g}%` من حد الخسارة",
         (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
          if GRID_REFILL else "• ⚠️ ما يسدّ الفجوات — ممكن يبقى بلا أوامر قرب السعر"),
         ("• 🤝 الخاسرة تبقى مفتوحة وتصير إلك — البوت ما يتحكم بيها"
@@ -464,6 +472,10 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 await asyncio.sleep(5)
                 continue
             if not state.get("armed"):
+                held = await grid_positions(conn)
+                if len(held) >= GRID_MAX_POSITIONS:
+                    await asyncio.sleep(5)   # too crowded to lay a new ladder
+                    continue
                 ok, err = await arm(conn, symbol, notify)
                 if not ok:
                     await notify(f"⚠️ ما كدرت أنصب الشبكة: {err}")
@@ -545,11 +557,14 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     "ما أعيد نصبها لوحدي. راجع الإعدادات وأرسل `/grid on` لما تقرر.")
                 continue
 
-            if GRID_ONE_WAY and positions and orders:
+            stood_down = None
+            if GRID_ONE_WAY and positions:
                 live_sides = {p.get("magic") for p in positions}
                 if len(live_sides) == 1 and len(positions) >= GRID_COMMIT_LEVELS:
                     committed = next(iter(live_sides))
-                    stale = [o for o in orders if o.get("magic") != committed]
+                    stood_down = (MAGIC_GRID_SELL if committed == MAGIC_GRID_BUY
+                                  else MAGIC_GRID_BUY)
+                    stale = [o for o in orders if o.get("magic") == stood_down]
                     for o in stale:
                         try:
                             await asyncio.wait_for(conn.cancel_order(o["id"]), timeout=6.0)
@@ -569,8 +584,25 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 except Exception as e:
                     log.warning(f"break-even pass skipped: {e}")
 
+            # How much more the grid may take on, in positions and in money. Both are
+            # hard: the loss that triggered these ceilings came from twenty positions
+            # opening together while every individual rule was behaving correctly.
+            room = max(0, GRID_MAX_POSITIONS - len(positions))
+            if floating <= -(limit * GRID_ADD_STOP_PCT / 100.0):
+                room = 0                  # already most of the way to the stop
+            if room == 0 and orders and not state.get("crowded"):
+                state["crowded"] = True
+                save(state)
+                await notify(f"🚧 *وقفت التوسّع* — عندي `{len(positions)}` صفقة مفتوحة "
+                             f"(الحد `{GRID_MAX_POSITIONS}`) أو الخسارة قربت من الوقف.\n"
+                             "ما أضيف مستويات جديدة لين تنفك الصفقات الحالية.")
+            elif room > 0 and state.get("crowded"):
+                state["crowded"] = False
+                save(state)
+
             if orders or positions:
-                await refill_gaps(conn, symbol, positions, orders, notify)
+                await refill_gaps(conn, symbol, positions, orders, notify,
+                                  skip_magic=stood_down, room=room)
 
             if not positions and not orders:
                 peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
@@ -706,13 +738,18 @@ async def released_text(conn):
             "⚠️ بلا وقف خسارة — إنت اللي تقرر متى تغلقها.")
 
 
-async def refill_gaps(conn, symbol, positions, orders, notify=None):
+async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=None,
+                      room=None):
     """Put a level back within one step of price when the nearest one has drifted away.
 
-    Never touches an open position and never exceeds GRID_LEVELS pendings a side, so a
-    trending market tops up at most to the size the ladder was always allowed to be.
+    Never touches an open position. Three things stop it feeding a trend: the per-side
+    pending cap, `room` (how many more positions the grid may hold at all), and skip_magic,
+    which is the side one-way has deliberately stood down - refilling that side was undoing
+    the same decision on the next tick, over and over.
     """
     if not (GRID_REFILL and GRID_LEVELS > 0):
+        return 0
+    if room is not None and room <= 0:
         return 0
     try:
         price = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
@@ -730,6 +767,10 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
     for magic, maker, ref, sign in (
             (MAGIC_GRID_BUY, conn.create_stop_buy_order, ask, 1),
             (MAGIC_GRID_SELL, conn.create_stop_sell_order, bid, -1)):
+        if magic == skip_magic:
+            continue                      # one-way stood this side down; leave it down
+        if room is not None and added >= room:
+            break
         side_orders = [o for o in orders if o.get("magic") == magic]
         levels = [float(o.get("openPrice", 0) or 0) for o in side_orders]
         nearest = min((abs(x - ref) for x in levels), default=None)

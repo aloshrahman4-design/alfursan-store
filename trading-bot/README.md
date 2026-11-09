@@ -429,3 +429,24 @@ Both engines use it: the grid each tick, the anchor engine from the price it alr
 `broker_paper` books a stop or target at its own price rather than wherever price has
 reached by the next poll — booking at the current mid made a protected trade report the
 very loss it had been protected from.
+
+## Ceilings — why twenty positions were open at once
+
+The grid hit its basket stop with twenty positions open and took $101 in one go. Every
+individual rule had behaved correctly; what was missing was any limit on the total.
+
+Three holes, all of them introduced by fixing something else:
+
+1. **No cap on open positions.** `GRID_LEVELS` capped *pending orders per side*. Nothing
+   capped positions, and refilling plus recycling kept feeding a trend — each refilled
+   level filled almost immediately, and the next tick refilled the gap it left behind.
+   `GRID_MAX_POSITIONS` (8) is now a hard ceiling: no refill, no re-arm past it.
+2. **Refill and one-way fought each other.** One-way cancelled the opposite side's pending
+   orders; refill saw that side had nothing near price and put one straight back; one-way
+   cancelled it again. The engine now tells refill which side was stood down, and refill
+   leaves it alone while the commitment holds.
+3. **No money ceiling on expansion.** A basket already most of the way to its stop went on
+   adding levels. Past `GRID_ADD_STOP_PCT` (50%) of the loss limit, nothing new is opened.
+
+The pattern behind all three: a cap on a part is not a cap on the whole. Each rule was
+locally right and the sum was unbounded.
