@@ -231,3 +231,18 @@ smaller, so large baskets still trail by percentage.
 The peak lives in memory, not in the state file: it belongs to one basket, dies with it,
 and re-establishes itself after a restart rather than carrying a stale high into a new
 cycle.
+
+### One-way commitment
+
+Both sides armed at once sounds like insurance and behaves like a tax. Price climbs $3,
+the open buys gain it, and the sells that filled on the earlier dip give it back at the
+same rate, so a move that should have paid lands as pennies. In a choppy session the grid
+grinds itself down that way without ever being wrong about direction.
+
+`GRID_ONE_WAY` (on by default) pulls the opposite side's pending orders the moment one
+side has positions and the other has none. The basket becomes directional and keeps what
+the move is worth. Both sides are armed again at the next re-arm, so nothing is lost
+permanently — only the legs that would have fought the committed direction.
+
+It fires only when exactly one side is open. If both sides already hold positions the
+damage is done and cancelling pendings would not undo it, so nothing is touched.

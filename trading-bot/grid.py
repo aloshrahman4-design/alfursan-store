@@ -66,6 +66,12 @@ GRID_TRAIL_MIN = _f("GRID_TRAIL_MIN", 1.0)
 GRID_MAX_LOSS = _f("GRID_MAX_LOSS", 0.0)      # 0 = work it out from the percentage
 GRID_MAX_LOSS_PCT = _f("GRID_MAX_LOSS_PCT", 15.0)
 GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
+# Both sides armed at once means a move that should earn is paid for by the other side
+# bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
+# straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
+# So once a side commits, the other side's pending orders are pulled and the basket becomes
+# directional; both sides are armed again at the next re-arm.
+GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "1") not in ("0", "false", "no")
 
 
 def ladder(base=None, cap=None, levels=None, double_every=None):
@@ -216,6 +222,8 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
+        ("• 🧭 اتجاه واحد: أول ما تلتزم جهة، تنلغي أوامر الجهة الثانية"
+         if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
         f"• لو تأرجح وكسر الجهتين: `-{whip:,.0f}$` ← وهنا يقطع الوقف عند `-{limit:g}$`",
         f"• لو امتلأت واستمر بنفس الاتجاه: `+{best:,.0f}$`",
@@ -355,6 +363,21 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     f"• الحد كان `-{limit:g}$`\n\n"
                     "ما أعيد نصبها لوحدي. راجع الإعدادات وأرسل `/grid on` لما تقرر.")
                 continue
+
+            if GRID_ONE_WAY and positions and orders:
+                live_sides = {p.get("magic") for p in positions}
+                if len(live_sides) == 1:
+                    committed = next(iter(live_sides))
+                    stale = [o for o in orders if o.get("magic") != committed]
+                    for o in stale:
+                        try:
+                            await asyncio.wait_for(conn.cancel_order(o["id"]), timeout=6.0)
+                        except Exception as e:
+                            log.warning(f"could not cancel opposite order {o.get('id')}: {e}")
+                    if stale:
+                        way = "الشراء" if committed == MAGIC_GRID_BUY else "البيع"
+                        await notify(f"🧭 *السعر التزم جهة {way}* — ألغيت `{len(stale)}` أمر معلّق "
+                                     "بالجهة المعاكسة حتى ما تاكل الربح.")
 
             if not positions and not orders:
                 peak = 0.0
