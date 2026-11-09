@@ -410,6 +410,16 @@ The stop is placed at entry plus the current spread plus `BE_LOCK_CASH` ($0.10),
 entry itself: a buy opens at ask and closes at bid, so entry alone would exit at minus the
 spread. "Flat" here means flat after costs.
 
+Once secured the stop keeps following the peak, `BE_TRAIL_CASH` ($0.50) behind it, with
+break-even as the floor. Break-even alone saved the trade and lost the gain: a position that
+reached +$1.80 and turned around closed at zero and the $1.80 was gone. Trailing banks most
+of what the move actually gave.
+
+One consequence worth stating: with a trailing stop this tight, individual trades are
+usually taken long before the basket's net reaches `GRID_TP_CASH`, so the basket rule now
+fires rarely. That is the intended trade — many small certain gains instead of a few larger
+ones that a reversal can erase — but it does mean the basket figures move slowly.
+
 It only ever protects a gain. A losing trade is never given a stop by this, and an existing
 stop is never loosened — the check refuses to move one that is already at or better than
 break-even — so it cannot turn a live trade into a forced loss. That is why it is on by

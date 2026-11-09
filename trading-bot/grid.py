@@ -90,6 +90,10 @@ GRID_GAP_FACTOR = _f("GRID_GAP_FACTOR", 1.5)   # a hole this many steps wide is 
 BE_ENABLED = os.environ.get("BE_ENABLED", "1") not in ("0", "false", "no")
 BE_TRIGGER_CASH = _f("BE_TRIGGER_CASH", 1.0)
 BE_LOCK_CASH = _f("BE_LOCK_CASH", 0.10)
+# Break-even alone saves the trade and loses the gain: a position that reached +$1.80 and
+# turned around closed at zero, with the 1.80 gone. Once secured, the stop keeps following
+# the peak this far behind it, so a reversal banks most of what the move actually gave.
+BE_TRAIL_CASH = _f("BE_TRAIL_CASH", 0.50)
 # Both sides armed at once means a move that should earn is paid for by the other side
 # bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
@@ -352,7 +356,8 @@ def plan_text(balance=0.0):
         (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
-        (f"• 🛡 نقطة التعادل: أول ما تربح `{BE_TRIGGER_CASH:g}$` ينقل وقفها لسعر الدخول"
+        (f"• 🛡 التأمين: أول ما تربح `{BE_TRIGGER_CASH:g}$` ينقل وقفها للدخول، "
+         f"وبعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
         (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
          if GRID_REFILL else "• ⚠️ ما يسدّ الفجوات — ممكن يبقى بلا أوامر قرب السعر"),
@@ -763,6 +768,9 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
     return added
 
 
+_be_peaks = {}        # best profit each secured position has shown; dies with the position
+
+
 async def apply_breakeven(conn, positions, spread, notify=None, label="الشبكة"):
     """Move the stop of any position past the trigger to its entry, costs covered.
 
@@ -784,7 +792,13 @@ async def apply_breakeven(conn, positions, spread, notify=None, label="الشب�
         if not entry or not vol:
             continue
         is_buy = p.get("type") == "POSITION_TYPE_BUY"
-        lock = tp_distance(vol, BE_LOCK_CASH) or 0.0
+        pid = p.get("id")
+        peak = max(_be_peaks.get(pid, 0.0), profit)
+        _be_peaks[pid] = peak
+        # Lock break-even at the least, and otherwise whatever the peak leaves after the
+        # trail - so a trade that ran to +1.80 keeps most of it instead of closing at zero.
+        locked = max(BE_LOCK_CASH, peak - BE_TRAIL_CASH) if BE_TRAIL_CASH > 0 else BE_LOCK_CASH
+        lock = tp_distance(vol, locked) or 0.0
         # A buy is opened at ask and closed at bid, so entry alone would close at -spread.
         target = round(entry + spread + lock, 2) if is_buy else round(entry - spread - lock, 2)
         current = p.get("stopLoss")
@@ -799,7 +813,12 @@ async def apply_breakeven(conn, positions, spread, notify=None, label="الشب�
             moved.append((p["id"], target))
         except Exception as e:
             log.warning(f"break-even move failed on {p.get('id')}: {e}")
+    live = {p.get("id") for p in positions}
+    for gone in [k for k in _be_peaks if k not in live]:
+        _be_peaks.pop(gone, None)
     if moved and notify:
-        await notify(f"🛡 *أمّنت `{len(moved)}` صفقة {label} على نقطة الدخول* — "
-                     f"ربحت أكثر من `{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.")
+        tail = (f"\nوالوقف يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة."
+                if BE_TRAIL_CASH > 0 else "")
+        await notify(f"🛡 *أمّنت `{len(moved)}` صفقة {label}* — ربحت أكثر من "
+                     f"`{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.{tail}")
     return len(moved)
