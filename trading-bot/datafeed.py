@@ -31,7 +31,10 @@ log = logging.getLogger("harvester.datafeed")
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datafeed_state.json")
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 MAX_SANE_OFFSET = 120.0   # a bigger gap than this means we compared the wrong instruments
-CACHE_SECS = 60
+CACHE_SECS = int(os.environ.get("FEED_CACHE_SECS", "60"))
+# One-minute bars cached for a minute means half the resolution is stale by
+# the time it is read. Short timeframes get a short cache.
+FAST_CACHE_SECS = int(os.environ.get("FEED_FAST_CACHE_SECS", "15"))
 
 # symbol -> yahoo ticker. Spot first: it is what a broker's GOLD actually tracks.
 YAHOO = {
@@ -177,7 +180,8 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
     """Free candles in the same shape MetaApi returns. Raises only if every source fails."""
     key = (symbol.upper(), timeframe, limit)
     hit = _cache.get(key)
-    if hit and time.time() - hit[0] < CACHE_SECS:
+    ttl = FAST_CACHE_SECS if timeframe in ("1m", "5m") else CACHE_SECS
+    if hit and time.time() - hit[0] < ttl:
         return hit[1]
 
     sym = symbol.upper()

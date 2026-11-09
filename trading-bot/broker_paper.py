@@ -30,6 +30,7 @@ log = logging.getLogger("harvester.paper")
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 START_BALANCE = float(os.environ.get("PAPER_BALANCE", "10000"))
 CONTRACT_SIZE = float(os.environ.get("PAPER_CONTRACT_SIZE", "100"))
+PAPER_TF = os.environ.get("PAPER_TF", "1m")
 SPREAD = float(os.environ.get("PAPER_SPREAD", "0.30"))
 ENGINE_SYMBOL = os.environ.get("SYMBOL", "GOLD").strip()
 
@@ -98,10 +99,17 @@ class PaperBroker:
         return None
 
     async def _mid(self):
-        candles = await datafeed.get_candles(ENGINE_SYMBOL, "15m", 60)
-        if not candles:
-            raise RuntimeError("no price available for the paper account")
-        return float(candles[-1]["close"])
+        # One-minute bars, not fifteen. A $2 grid step cannot be tested against a price
+        # that only moves every quarter of an hour: fills, targets and trailing stops all
+        # land on a price that never existed, and the result is a confident fiction.
+        for tf in (PAPER_TF, "5m", "15m"):
+            try:
+                candles = await datafeed.get_candles(ENGINE_SYMBOL, tf, 60)
+            except Exception:
+                candles = None
+            if candles:
+                return float(candles[-1]["close"])
+        raise RuntimeError("no price available for the paper account")
 
     async def get_symbol_price(self, symbol=None):
         mid = await self._mid()

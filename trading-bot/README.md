@@ -508,3 +508,21 @@ Two holes this exposed, both in the path that was supposed to be the safe one:
 
 Softer options, in order: `/grid off` stops the grid alone; the panel's system switch stops
 the bot managing (and warns that armed orders still fill); `/stop` stops everything.
+
+## Testing on a demo account
+
+Two ways, and they are not equivalent.
+
+**A real MT5 demo through MetaApi** is the faithful one: the same execution path, the
+broker's own ticks and spread, pending orders and stops handled by the broker exactly as
+they are live. Open a demo at the broker, add it to MetaApi, then `/setkey account <id>`.
+The bot switches to it with nothing else changed, and `/setkey account <live-id>` switches
+back. Only one account is deployed at a time, so this does not add to the MetaApi bill —
+but live trading is paused for as long as the test runs.
+
+**The internal paper account** (`/paper`) needs no setup and costs nothing. It was reading
+15-minute candle closes cached for a minute, which cannot test a $2 grid: price arrives in
+$2-$5 jumps, so fills, targets and trailing stops all land on prices that never existed and
+the result is a confident fiction. It now reads 1-minute bars (`PAPER_TF`) with a 15s cache
+for short timeframes, falling back to coarser bars rather than failing. Good enough to
+check that the logic behaves; still not tick data, so treat the P/L as indicative.
