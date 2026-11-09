@@ -111,7 +111,14 @@ GRID_ADD_STOP_PCT = _f("GRID_ADD_STOP_PCT", 50.0)
 # straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
 # So once a side commits, the other side's pending orders are pulled and the basket becomes
 # directional; both sides are armed again at the next re-arm.
-GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "1") not in ("0", "false", "no")
+# Off. It was built when exits were decided by the basket's net, where an open opposite
+# side genuinely ate the profit. Exits are per trade now - each one leaves on its own
+# trailing stop - so there is nothing left to eat, and the rule's premise inverted on us:
+# it reads "the side holding positions is the committed direction", but in a grid the
+# winners close and the LOSERS are what stays open. So it stood down the winning side and
+# kept feeding the losing one, which is how three losing sells ended up with the buy side
+# cancelled while price climbed $15 away from them.
+GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "0") not in ("0", "false", "no")
 # One filled level is not a trend, it is a wiggle: price touching the first step above the
 # centre once was enough to cancel the whole opposite side and leave a reversal uncaught.
 # A direction has to prove itself over this many levels before the other side is pulled.
@@ -365,8 +372,8 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
-        (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
-         if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
+        ("• ⚠️ اتجاه واحد مفعّل — ينتبه: يوقف الجهة اللي ما عندها صفقات، وهي غالباً الرابحة"
+         if GRID_ONE_WAY else "• ↔️ الجهتين شغالات دائماً — كل صفقة تخرج بوقفها لحالها"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
         (f"• 🛡 التأمين: أول ما تعبر `{BE_TRIGGER_CASH:g}$` ينقل وقفها لنقطة الفتح — "
          f"ما تصير خسارة بعدها أبداً\n"

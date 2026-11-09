@@ -471,3 +471,20 @@ wearing a different name.
 A stop is never placed through the market: if the computed level is already past the
 current bid (buy) or ask (sell), it is skipped. Without that check an aggressive trigger
 closes the trade on the spot at a few cents instead of protecting it.
+
+## One-way was backwards, and is now off
+
+The rule read "the side holding open positions is the committed direction — stand the other
+side down". In a grid that is inverted. Winners close on their own target or trailing stop
+and disappear; **losers are what stays open**. So the side still holding positions is the
+losing one, and standing down its opposite means cancelling the side that would have earned.
+
+Seen live: three losing sells open, price $15 above them and still climbing, the buy side
+cancelled, and refill forbidden from restoring it because the engine had stood it down.
+
+It also no longer has a purpose. It was written when exits were decided by the basket's
+net, where an open opposite side genuinely did eat the profit. Exits are per trade now —
+each one leaves on its own trailing stop — so the opposite side costs nothing.
+
+`GRID_ONE_WAY` defaults to 0. It can still be switched on deliberately, and the status
+line says plainly what it does when it is.
