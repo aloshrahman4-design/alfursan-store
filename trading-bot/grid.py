@@ -72,6 +72,10 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 # So once a side commits, the other side's pending orders are pulled and the basket becomes
 # directional; both sides are armed again at the next re-arm.
 GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "1") not in ("0", "false", "no")
+# One filled level is not a trend, it is a wiggle: price touching the first step above the
+# centre once was enough to cancel the whole opposite side and leave a reversal uncaught.
+# A direction has to prove itself over this many levels before the other side is pulled.
+GRID_COMMIT_LEVELS = max(1, _i("GRID_COMMIT_LEVELS", 2))
 # Harvest each side on its own merits instead of waiting for the two to net out, and hand
 # the other side's open trades to the user rather than closing them with it. He asked for
 # that split explicitly: the bot takes the winners, he decides what to do with the losers.
@@ -275,7 +279,7 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
-        ("• 🧭 اتجاه واحد: أول ما تلتزم جهة، تنلغي أوامر الجهة الثانية"
+        (f"• 🧭 اتجاه واحد: بعد `{GRID_COMMIT_LEVELS}` مستويات بجهة وحدة، تنلغي أوامر الجهة الثانية"
          if GRID_ONE_WAY else "• ⚠️ الجهتين مفتوحات سوا — الربح ممكن تاكله الجهة المعاكسة"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
         ("• 🤝 الخاسرة تبقى مفتوحة وتصير إلك — البوت ما يتحكم بيها"
@@ -449,7 +453,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             if GRID_ONE_WAY and positions and orders:
                 live_sides = {p.get("magic") for p in positions}
-                if len(live_sides) == 1:
+                if len(live_sides) == 1 and len(positions) >= GRID_COMMIT_LEVELS:
                     committed = next(iter(live_sides))
                     stale = [o for o in orders if o.get("magic") != committed]
                     for o in stale:
@@ -459,8 +463,9 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                             log.warning(f"could not cancel opposite order {o.get('id')}: {e}")
                     if stale:
                         way = "الشراء" if committed == MAGIC_GRID_BUY else "البيع"
-                        await notify(f"🧭 *السعر التزم جهة {way}* — ألغيت `{len(stale)}` أمر معلّق "
-                                     "بالجهة المعاكسة حتى ما تاكل الربح.")
+                        await notify(f"🧭 *السعر التزم جهة {way}* (`{len(positions)}` مستويات) — "
+                                     f"ألغيت `{len(stale)}` أمر معلّق بالجهة المعاكسة "
+                                     "حتى ما تاكل الربح.")
 
             if not positions and not orders:
                 peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}

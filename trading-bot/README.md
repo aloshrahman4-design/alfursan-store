@@ -244,8 +244,13 @@ side has positions and the other has none. The basket becomes directional and ke
 the move is worth. Both sides are armed again at the next re-arm, so nothing is lost
 permanently — only the legs that would have fought the committed direction.
 
-It fires only when exactly one side is open. If both sides already hold positions the
-damage is done and cancelling pendings would not undo it, so nothing is touched.
+It fires only when exactly one side is open AND at least `GRID_COMMIT_LEVELS` (2) of its
+levels have filled. One level is a wiggle, not a trend: price touching the first step above
+the centre once was enough to cancel all twelve orders on the other side and leave a
+reversal with nothing to catch it. A direction has to prove itself over two levels first.
+
+If both sides already hold positions the drag exists regardless of the pendings, so nothing
+is touched.
 
 ### Side harvest, and handing the losers over
 
