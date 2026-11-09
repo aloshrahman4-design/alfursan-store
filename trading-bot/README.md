@@ -393,9 +393,11 @@ long as the remaining positions stayed open.
 
 `refill_gaps` puts a level back one step from price whenever the nearest one on that side
 has drifted more than `GRID_GAP_FACTOR` (1.5) steps away. It adds pending orders only: open
-positions are never touched, so nothing is realised to fix a gap. A side already holding
-`GRID_LEVELS` orders is left alone, which is what stops a trending market turning this into
-an order machine — the ladder tops up to the width it was always allowed, never past it.
+positions are never touched, so nothing is realised to fix a gap. A side already holding `GRID_LEVELS` orders does not refuse — it recycles. The cap exists
+to stop a trending market turning this into an order machine, but refusing outright left the
+whole ladder stranded far above price with nothing covering the near side, which is the
+dead zone all over again. The furthest level is cancelled to pay for the near one, so the
+count never grows and the ladder walks toward price instead of being abandoned by it.
 
 ## Break-even
 

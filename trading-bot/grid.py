@@ -720,14 +720,12 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
     lot = round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2)
     dist = tp_distance(lot)
     gap = GRID_STEP * GRID_GAP_FACTOR
-    added = 0
+    added, recycled = 0, 0
 
     for magic, maker, ref, sign in (
             (MAGIC_GRID_BUY, conn.create_stop_buy_order, ask, 1),
             (MAGIC_GRID_SELL, conn.create_stop_sell_order, bid, -1)):
         side_orders = [o for o in orders if o.get("magic") == magic]
-        if len(side_orders) >= GRID_LEVELS:
-            continue                      # the ladder is already as wide as it may be
         levels = [float(o.get("openPrice", 0) or 0) for o in side_orders]
         nearest = min((abs(x - ref) for x in levels), default=None)
         if nearest is not None and nearest <= gap:
@@ -735,6 +733,20 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
         at = round(ref + sign * GRID_STEP, 2)
         if any(abs(at - x) < GRID_STEP / 2 for x in levels):
             continue                      # would sit on top of an existing level
+        if len(side_orders) >= GRID_LEVELS:
+            # The cap stops a trend turning this into an order machine, but refusing on a
+            # full ladder left every level stranded far above price with nothing covering
+            # it. Recycle instead: drop the furthest level to pay for the near one, so the
+            # count never grows and the ladder walks toward price.
+            furthest = max(side_orders, key=lambda o: abs(float(o.get("openPrice", 0) or 0) - ref))
+            if abs(float(furthest.get("openPrice", 0) or 0) - ref) <= abs(at - ref):
+                continue                  # nothing is further out than the level we want
+            try:
+                await asyncio.wait_for(conn.cancel_order(furthest["id"]), timeout=6.0)
+                recycled += 1
+            except Exception as e:
+                log.warning(f"could not recycle {furthest.get('id')}: {e}")
+                continue
         try:
             await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
@@ -745,8 +757,9 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None):
         except Exception as e:
             log.warning(f"refill at {at} failed: {e}")
     if added and notify:
+        extra = (f"\nنقلت `{recycled}` أمر من أبعد نقطة بدل ما أزيد العدد." if recycled else "")
         await notify(f"🧩 *سدّيت فجوة بالشبكة* — أضفت `{added}` أمر قرب السعر الحالي، "
-                     "الصفقات المفتوحة ما لمستها.")
+                     f"الصفقات المفتوحة ما لمستها.{extra}")
     return added
 
 
