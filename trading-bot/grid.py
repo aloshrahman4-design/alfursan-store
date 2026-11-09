@@ -59,6 +59,10 @@ GRID_TP_CASH = _f("GRID_TP_CASH", 5.0)        # the basket is not taken below th
 # share of its own peak - the same rule the anchor strategy uses, for the same reason: a
 # flat take closes a strong move at exactly the target and leaves the rest on the table.
 GRID_TRAIL_PCT = _f("GRID_TRAIL_PCT", 10.0)   # 0 = take the moment it reaches the target
+# A percentage give-back is meaningless on a small basket: 10% of a $3 peak is $0.30, well
+# inside one tick's worth of noise, so the trail would fire immediately and behave exactly
+# like the flat take it replaced. The give-back is never smaller than this.
+GRID_TRAIL_MIN = _f("GRID_TRAIL_MIN", 1.0)
 GRID_MAX_LOSS = _f("GRID_MAX_LOSS", 0.0)      # 0 = work it out from the percentage
 GRID_MAX_LOSS_PCT = _f("GRID_MAX_LOSS_PCT", 15.0)
 GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
@@ -208,7 +212,8 @@ def plan_text(balance=0.0):
         f"• أكبر لوت: `{max(lots) if lots else 0:g}` · المجموع `{total:g}` لوت",
         f"• مدى الشبكة: `{round(len(lots) * GRID_STEP, 2):g}$` بكل اتجاه",
         f"• جني الباسكت: ما يغلق قبل `+{GRID_TP_CASH:g}$`، وبعدها "
-        + (f"يمشي معه ويغلق إذا رجع `{GRID_TRAIL_PCT:g}%` من القمة" if GRID_TRAIL_PCT > 0
+        + (f"يمشي معه ويغلق إذا رجع `{GRID_TRAIL_PCT:g}%` من القمة "
+           f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
@@ -315,7 +320,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             if positions and floating > peak:
                 peak = floating
-            give_back = round(peak * GRID_TRAIL_PCT / 100.0, 2) if GRID_TRAIL_PCT > 0 else 0.0
+            give_back = (round(max(peak * GRID_TRAIL_PCT / 100.0, GRID_TRAIL_MIN), 2)
+                         if GRID_TRAIL_PCT > 0 else 0.0)
             # Rounded: 5.6 - 0.56 is 5.039999... in binary, so an exact 5.04 would miss.
             ready = floating >= GRID_TP_CASH and floating <= round(peak - give_back, 2)
             if positions and ready:

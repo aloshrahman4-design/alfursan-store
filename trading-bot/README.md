@@ -222,6 +222,12 @@ floor is independent of the trail, so a basket that peaks just above the target 
 rather than closed below it, and the give-back threshold is rounded before comparison
 (5.60 - 10% is 5.039999... in binary, which an exact 5.04 would otherwise miss).
 
+The give-back is never smaller than `GRID_TRAIL_MIN` ($1 by default). A percentage alone
+is meaningless on a small basket: 10% of a $3 peak is $0.30, well inside what one tick
+moves a 0.02-lot basket, so the trail would fire on the first tick down and behave exactly
+like the flat take it was meant to replace. The floor only binds while the percentage is
+smaller, so large baskets still trail by percentage.
+
 The peak lives in memory, not in the state file: it belongs to one basket, dies with it,
 and re-establishes itself after a restart rather than carrying a stale high into a new
 cycle.
