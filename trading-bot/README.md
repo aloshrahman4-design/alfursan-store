@@ -365,3 +365,21 @@ The message itself is rate limited to one per `CONNECT_NOTE_QUIET_SECS` (15 minu
 reconnect is worth a log line, not a notification; saying it eleven times teaches the user
 to scroll past everything the bot sends, including the messages that matter. Every
 reconnect is still logged.
+
+## The saver was blind to the grid
+
+`our_positions_open` looked only for the anchor magics, so a grid holding twenty-four stop
+orders and several open positions read to the cost governor as "nothing going on". After
+twenty idle minutes — or at the weekend — it undeployed the MetaApi account underneath it.
+
+Undeploying does not stop the grid. The pending orders sit at the broker and keep filling;
+what goes away is the bot: the basket stop cannot fire, `note_external_closes` sees nothing,
+and nobody is watching. The per-trade take profits would still close winners, which only
+makes the shape worse — winners taken, losers accumulating, no stop, no eyes.
+
+It now counts grid positions and armed grid pending orders as live work, and `work_pending`
+treats an armed grid the same way. A broker error still fails safe by staying awake.
+
+Switching the system off from the panel has the same shape on a smaller scale: it stops the
+bot managing, not the broker filling. The toggle now says so and points at `/grid off`,
+which actually cancels the orders.

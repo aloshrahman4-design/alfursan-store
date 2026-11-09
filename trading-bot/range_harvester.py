@@ -389,13 +389,14 @@ async def broker_check():
         price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=10)
         pos = await asyncio.wait_for(connection.get_positions(), timeout=10)
         ours = [p for p in pos if p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
+        gridded = [p for p in pos if grid is not None and p.get("magic") in grid.MAGICS]
         floating = round(float(acc.get("equity", 0)) - float(acc.get("balance", 0)), 2)
         lines += [
             "✅ الاتصال شغال",
             f"• الرصيد: `{acc.get('balance')} {acc.get('currency','')}` | السيولة: `{acc.get('equity')}`",
             f"• الربح/الخسارة العائمة: `{floating}$`",
             f"• السعر: bid `{price.get('bid')}` / ask `{price.get('ask')}`",
-            f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` للبوت"
+            f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` ارتكاز و`{len(gridded)}` شبكة"
             + (f" — `{sum(1 for p in ours if user_took_over(p))}` سلّمتها لك" if any(user_took_over(p) for p in ours) else ""),
             f"• الوضع: {mode_label()}",
             f"• قاعدة الحصاد: ما يغلق قبل `{MIN_CASH_PROFIT}$`، وبعدها يغلق إذا رجع {trail_rule_line()}",
@@ -855,11 +856,24 @@ def savings_line():
 
 
 async def our_positions_open():
+    """Anything of ours the broker is holding — positions or armed pending orders.
+
+    The grid was invisible here, because this only ever looked for the anchor magics. A
+    grid with twenty-four stop orders and open positions read as "nothing going on", so the
+    saver undeployed the account under it. The orders stay at the broker and keep filling
+    either way: what sleeping actually removes is the basket stop and every pair of eyes.
+    """
     if not connection:
         return False
     try:
+        magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
         pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
-        return any(p.get("symbol") == SYMBOL and p.get("magic") in (MAGIC_BUY, MAGIC_SELL) for p in pos)
+        if any(p.get("symbol") == SYMBOL and p.get("magic") in magics for p in pos):
+            return True
+        if grid is not None and hasattr(connection, "get_orders"):
+            if await grid.grid_orders(connection):
+                return True
+        return False
     except Exception as e:
         log.warning(f"position check before sleeping failed: {e}")
         return True  # unknown state -> stay awake, never risk an unwatched position
@@ -889,6 +903,8 @@ async def work_pending():
     """Is there anything that genuinely requires a live broker connection?
     An armed anchor or an open position: yes. Idle watching: no — free data covers that."""
     if buy_anchor is not None or sell_anchor is not None:
+        return True
+    if grid is not None and grid.GRID_ENABLED and grid.load().get("armed"):
         return True
     return await our_positions_open()
 
@@ -1781,6 +1797,11 @@ async def handle_callback(query):
         elif data == "toggle_bot":
             bot_active = not bot_active
             txt = "تم **تشغيل النظام** 🟢" if bot_active else "تم **إيقاف النظام** 🔴"
+            if not bot_active and grid is not None and grid.GRID_ENABLED and grid.load().get("armed"):
+                # The switch stops the bot managing, not the broker filling.
+                txt += ("\n\n⚠️ *بس أوامر الشبكة لسه مسلّحة عند الوسيط* وتنفتح لحالها.\n"
+                        "البوت ما يحرسها الآن — ولا حتى وقف الـ100$.\n"
+                        "`/grid off` يلغيها كلها إذا تريد توقف فعلاً.")
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
         elif data in ("anchor_buy", "anchor_sell", "anchor_dual"):
             if not await wake_for_execution("طلب ارتكاز"):
