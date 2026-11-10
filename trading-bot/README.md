@@ -232,25 +232,66 @@ The peak lives in memory, not in the state file: it belongs to one basket, dies 
 and re-establishes itself after a restart rather than carrying a stale high into a new
 cycle.
 
-### One-way commitment
+### The trend guard
 
-Both sides armed at once sounds like insurance and behaves like a tax. Price climbs $3,
-the open buys gain it, and the sells that filled on the earlier dip give it back at the
-same rate, so a move that should have paid lands as pennies. In a choppy session the grid
-grinds itself down that way without ever being wrong about direction.
+A grid earns in a range and bleeds in a trend. Price walks one way, every level it crosses
+opens a trade that is under water the moment it fills, and refill keeps laying new ones in
+its path. That is what the -$101.65 and the -$214 both were: no rule misbehaved, the market
+simply went somewhere a grid has no answer for.
 
-`GRID_ONE_WAY` (on by default) pulls the opposite side's pending orders the moment one
-side has positions and the other has none. The basket becomes directional and keeps what
-the move is worth. Both sides are armed again at the next re-arm, so nothing is lost
-permanently — only the legs that would have fought the committed direction.
+`GRID_TREND` (on by default) gives it one. It measures the direction off **price against
+the grid's own centre**: once price is `GRID_TREND_STEPS` (3) steps clear of the centre and
+has held there for `GRID_TREND_HOLD` (60s), the side it is running over stands down — its
+pending orders are cancelled and refill is forbidden from restoring them. The other side
+stays armed and follows price.
 
-It fires only when exactly one side is open AND at least `GRID_COMMIT_LEVELS` (2) of its
-levels have filled. One level is a wiggle, not a trend: price touching the first step above
-the centre once was enough to cancel all twelve orders on the other side and leave a
-reversal with nothing to catch it. A direction has to prove itself over two levels first.
+Price above the centre stands the **sell** side down. That is the part worth saying twice,
+because the previous attempt got exactly this backwards (see below).
 
-If both sides already hold positions the drag exists regardless of the pendings, so nothing
-is touched.
+Two guards keep it from thrashing:
+
+- **The hold.** A spike three levels deep and straight back is the precise move a grid is
+  built to earn from. Standing a side down for it would throw the trade away.
+- **Hysteresis.** Once called, a trend stays called until price comes back inside
+  `GRID_TREND_RELEASE` (1.5) steps. Without the gap, one candle either side of the
+  threshold cancels and re-places the same ladder every minute.
+
+It never touches an open position. Those keep their own stop, their own break-even and
+their own trail; the guard only decides what the grid is allowed to open next.
+
+Arming a new ladder clears the memory: whatever was stood down was stood down against the
+old centre.
+
+It costs no extra requests. The engine reads the price **once per tick** and hands the same
+quote to the guard and to refill — a second call per tick is precisely how the grid produced
+eleven reconnects in twenty-two minutes the last time something was added to the loop.
+
+### Bounded recovery
+
+The hedge-recovery bots are right about one thing — after a run of losses, a flat lot size
+means you need several wins to climb out of one hole. Their fix is to double, which is why
+`IRONWALL HEDGE V7`'s own promotional video shows a 20.48-lot order and -$1,770 floating.
+Doubling has no bounded worst case; that is the whole objection, not the idea behind it.
+
+`GRID_RECOVER` takes the idea and removes the ruin. After `GRID_RECOVER_AFTER` (3)
+consecutive losing cycles the next ladder starts `GRID_RECOVER_STEP` (0.01) bigger, and it
+stops dead at `GRID_RECOVER_MAX`, itself clamped to `GRID_MAX_LOT`:
+
+    0 losses  ->  0.01
+    3 losses  ->  0.02
+    6 losses  ->  0.03
+    9 losses  ->  0.03
+    99 losses ->  0.03
+
+Addition, not multiplication, against a hard ceiling. The worst case after a hundred losing
+cycles is the same worst case as after none — which is exactly what a martingale cannot say.
+
+One rule drives the counter, both ways: a cycle that books money clears the run, a cycle
+that costs money lengthens it. A re-centre keeps the count, because the run is about cycles
+and not about where the ladder happens to sit.
+
+**It is off by default.** It is the only setting in the grid that raises risk rather than
+lowering it, so it is the user's decision, not a default: `/setkey recover 1`.
 
 ### Side harvest, and handing the losers over
 
@@ -430,6 +471,23 @@ Both engines use it: the grid each tick, the anchor engine from the price it alr
 reached by the next poll — booking at the current mid made a protected trade report the
 very loss it had been protected from.
 
+## The position cap was advisory, and now is not
+
+`GRID_MAX_POSITIONS` was checked in two places: before laying a fresh ladder, and before
+refilling a gap. Neither is the path that matters. The ladder arms with `GRID_LEVELS` (12)
+pending orders a side, and **every one of them could still fire after the cap was reached**
+— so in the one scenario the cap exists for, a trend sweeping the ladder, it did nothing.
+The test reproduces it: a price sweep opens all twelve against a cap of eight.
+
+The engine now pulls the remaining pendings the moment there is no room, whether the limit
+hit was the position count or `GRID_ADD_STOP_PCT` of the loss stop. The grid keeps what it
+holds, can open nothing more, and refill walks levels back toward price once something
+closes.
+
+This also made the risk figures honest. `/grid` quoted a twelve-level round trip, which
+with a real cap of eight overstated every loss number by about half. They are now computed
+on `exposure_lots()` — what can actually be open at once — and the line says so.
+
 ## Ceilings — why twenty positions were open at once
 
 The grid hit its basket stop with twenty positions open and took $101 in one go. Every
@@ -472,7 +530,7 @@ A stop is never placed through the market: if the computed level is already past
 current bid (buy) or ask (sell), it is skipped. Without that check an aggressive trigger
 closes the trade on the spot at a few cents instead of protecting it.
 
-## One-way was backwards, and is now off
+## One-way was backwards, and has been deleted
 
 The rule read "the side holding open positions is the committed direction — stand the other
 side down". In a grid that is inverted. Winners close on their own target or trailing stop
@@ -482,12 +540,13 @@ losing one, and standing down its opposite means cancelling the side that would 
 Seen live: three losing sells open, price $15 above them and still climbing, the buy side
 cancelled, and refill forbidden from restoring it because the engine had stood it down.
 
-It also no longer has a purpose. It was written when exits were decided by the basket's
-net, where an open opposite side genuinely did eat the profit. Exits are per trade now —
-each one leaves on its own trailing stop — so the opposite side costs nothing.
+It was switched off for a while, which was the wrong fix — a rule that inverts under load
+is not a setting, it is a bug with a default. `GRID_ONE_WAY` and `GRID_COMMIT_LEVELS` are
+gone from the code entirely, replaced by the trend guard above.
 
-`GRID_ONE_WAY` defaults to 0. It can still be switched on deliberately, and the status
-line says plainly what it does when it is.
+The lesson is the one that keeps recurring here: **read the signal off something that
+cannot invert.** Position inventory flips meaning depending on which trades have already
+closed. Price against the centre does not.
 
 ## Stopping
 

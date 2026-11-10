@@ -111,23 +111,44 @@ BE_MIN_GAP = _f("BE_MIN_GAP", 0.25)
 GRID_MAX_POSITIONS = _i("GRID_MAX_POSITIONS", 8)
 # And a soft ceiling in money: stop adding once the basket is most of the way to its stop.
 GRID_ADD_STOP_PCT = _f("GRID_ADD_STOP_PCT", 50.0)
-# Both sides armed at once means a move that should earn is paid for by the other side
-# bleeding at the same rate: price climbs $3, the buys gain it, the open sells give it
-# straight back, and the basket nets pennies. In chop the grid grinds itself down that way.
-# So once a side commits, the other side's pending orders are pulled and the basket becomes
-# directional; both sides are armed again at the next re-arm.
-# Off. It was built when exits were decided by the basket's net, where an open opposite
-# side genuinely ate the profit. Exits are per trade now - each one leaves on its own
-# trailing stop - so there is nothing left to eat, and the rule's premise inverted on us:
-# it reads "the side holding positions is the committed direction", but in a grid the
-# winners close and the LOSERS are what stays open. So it stood down the winning side and
-# kept feeding the losing one, which is how three losing sells ended up with the buy side
-# cancelled while price climbed $15 away from them.
-GRID_ONE_WAY = os.environ.get("GRID_ONE_WAY", "0") not in ("0", "false", "no")
-# One filled level is not a trend, it is a wiggle: price touching the first step above the
-# centre once was enough to cancel the whole opposite side and leave a reversal uncaught.
-# A direction has to prove itself over this many levels before the other side is pulled.
-GRID_COMMIT_LEVELS = max(1, _i("GRID_COMMIT_LEVELS", 2))
+# --- the trend guard -----------------------------------------------------------------
+# A grid earns in a range and bleeds in a trend: price walks one way, every level it
+# crosses opens a trade that is immediately under water, and refill keeps putting new
+# ones in its path. That is what the -$101.65 and the -$214 both were.
+#
+# The old GRID_ONE_WAY tried to fix it and got the sign backwards. It read the committed
+# direction off WHICH SIDE HELD POSITIONS - but in a grid the winners close and the
+# LOSERS are what stays open, so it named the losing side as "committed" and cancelled
+# the winning one. Three losing sells ended up with the buy ladder pulled while price
+# climbed $15 away from them. It has been deleted, not left switched off.
+#
+# This reads the direction off PRICE against the grid's own centre, which cannot invert:
+# price `GRID_TREND_STEPS` steps above the centre means the SELL ladder is the one being
+# run over, so the SELL side stands down and the BUY side keeps following price up.
+GRID_TREND = os.environ.get("GRID_TREND", "1") not in ("0", "false", "no")
+# How far past the centre counts as a trend rather than a wiggle, in grid steps.
+GRID_TREND_STEPS = _f("GRID_TREND_STEPS", 3.0)
+# ...and it has to hold there this long. A single spike through three levels and straight
+# back is the exact move a grid is built to earn from; standing a side down for it would
+# throw away the trade instead of taking it.
+GRID_TREND_HOLD = _f("GRID_TREND_HOLD", 60.0)
+# Hysteresis: once a trend is called it stays called until price comes back inside this
+# many steps of the centre. Without the gap, one candle either side of the threshold
+# cancels and re-places the same ladder every minute.
+GRID_TREND_RELEASE = _f("GRID_TREND_RELEASE", 1.5)
+
+# --- bounded recovery ----------------------------------------------------------------
+# The one idea worth taking from the hedge-recovery bots, with the ruin removed: after a
+# run of losing cycles the next ladder starts one notch bigger, so a single good cycle
+# recovers more of the hole. Theirs doubles with no end - the video's own ladder reached
+# 20.48 lots and -$1,770 floating. This one steps by a flat GRID_RECOVER_STEP and stops
+# dead at the cap: 0.01, then 0.02, then 0.03, then 0.03 for ever.
+# Off by default. It is the only setting here that RAISES risk, so it is the user's call,
+# not a default - `/setkey recover 1` turns it on.
+GRID_RECOVER = os.environ.get("GRID_RECOVER", "0") not in ("0", "false", "no")
+GRID_RECOVER_AFTER = max(1, _i("GRID_RECOVER_AFTER", 3))   # losing cycles per notch
+GRID_RECOVER_STEP = _f("GRID_RECOVER_STEP", 0.01)          # added per notch, never doubled
+GRID_RECOVER_MAX = _f("GRID_RECOVER_MAX", 0.03)            # and never past GRID_MAX_LOT
 # Harvest each side on its own merits instead of waiting for the two to net out, and hand
 # the other side's open trades to the user rather than closing them with it. He asked for
 # that split explicitly: the bot takes the winners, he decides what to do with the losers.
@@ -201,6 +222,143 @@ def whipsaw_case(lots=None, step=None, contract=None):
     return round(losing - winning, 2)
 
 
+def exposure_lots(lots=None):
+    """The lots that can actually be open at the same time.
+
+    The ladder is GRID_LEVELS deep per side, but GRID_MAX_POSITIONS now caps open
+    positions for real (the engine pulls the remaining pendings when it is reached), so
+    quoting a full twelve-level round trip overstated every risk figure the user reads.
+    """
+    lots = ladder() if lots is None else lots
+    return lots[:GRID_MAX_POSITIONS] if GRID_MAX_POSITIONS > 0 else lots
+
+
+def recovery_base(streak=0):
+    """Base lot for the next ladder, stepped up after a run of losing cycles.
+
+    Arithmetic and capped, which is the whole difference from a martingale: it adds
+    GRID_RECOVER_STEP per notch and can never exceed GRID_MAX_LOT, so the worst case is
+    the same worst case as always - unlike doubling, where the worst case has no bound.
+    """
+    base = round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2)
+    try:
+        streak = int(streak or 0)
+    except (TypeError, ValueError):
+        return base
+    if not GRID_RECOVER or streak < GRID_RECOVER_AFTER:
+        return base
+    cap = round(min(GRID_RECOVER_MAX, GRID_MAX_LOT), 2)
+    return round(min(base + GRID_RECOVER_STEP * (streak // GRID_RECOVER_AFTER), cap), 2)
+
+
+# Direction memory. `dir` is the confirmed trend, `pending` one that has not held long
+# enough yet, `down` the magic currently stood down. In memory on purpose: a restart
+# should re-prove the trend rather than inherit a stale one.
+_trend = {"dir": 0, "pending": 0, "since": 0.0, "down": None}
+
+
+def trend_reset():
+    _trend.update({"dir": 0, "pending": 0, "since": 0.0, "down": None})
+
+
+def trend_read(center, mid, now=None):
+    """+1 if price has committed above the grid's centre, -1 below, 0 inside the band.
+
+    Measured off price, never off which side holds positions - that is the inversion
+    that broke the old one-way rule.
+    """
+    now = time.time() if now is None else now
+    try:
+        center, mid = float(center or 0), float(mid or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not center or not mid or GRID_STEP <= 0:
+        return 0
+    steps = (mid - center) / GRID_STEP
+    cur = _trend["dir"]
+    if cur:
+        # Already in a trend: it holds until price comes back inside the release band.
+        if (cur > 0 and steps <= GRID_TREND_RELEASE) or (cur < 0 and steps >= -GRID_TREND_RELEASE):
+            _trend.update({"dir": 0, "pending": 0, "since": 0.0})
+            return 0
+        return cur
+    want = 1 if steps >= GRID_TREND_STEPS else (-1 if steps <= -GRID_TREND_STEPS else 0)
+    if not want:
+        _trend.update({"pending": 0, "since": 0.0})
+        return 0
+    if _trend["pending"] != want:
+        _trend.update({"pending": want, "since": now})
+        return 0
+    if now - _trend["since"] < GRID_TREND_HOLD:
+        return 0                          # proving itself; not a trend yet
+    _trend.update({"dir": want, "pending": 0, "since": now})
+    return want
+
+
+def trend_stand_down(direction):
+    """The side a confirmed trend is running over - the one that must stop being fed.
+
+    Price above the centre means the SELL ladder is the one underwater, so SELL stands
+    down and BUY keeps following price. The old rule did exactly the opposite.
+    """
+    if direction > 0:
+        return MAGIC_GRID_SELL
+    if direction < 0:
+        return MAGIC_GRID_BUY
+    return None
+
+
+async def trend_guard(conn, symbol, center, orders, notify=None, quote=None):
+    """Stop feeding the side price is running away from; leave open trades alone.
+
+    Returns the magic to keep stood down this tick, or None. It only ever cancels
+    PENDING orders - what is already open keeps its own stop and its own exit.
+
+    `quote` is the tick's already-fetched price. The engine reads the price once and
+    hands the same one to the guard and to refill, because a second call per tick is
+    how the grid produced eleven reconnects in twenty-two minutes the last time.
+    """
+    if not GRID_TREND:
+        return None
+    try:
+        if quote is None:
+            quote = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
+        bid, ask = float(quote.get("bid", 0) or 0), float(quote.get("ask", 0) or 0)
+    except Exception as e:
+        log.warning(f"trend guard has no price: {e}")
+        return _trend["down"]             # keep the last decision rather than flip blind
+    if not bid or not ask:
+        return _trend["down"]
+    direction = trend_read(center, (bid + ask) / 2.0)
+    down = trend_stand_down(direction)
+    if down == _trend["down"]:
+        return down                       # nothing changed; stay quiet
+    was, _trend["down"] = _trend["down"], down
+    if down is None:
+        if notify and was is not None:
+            await notify("🧭 *رجع السعر لنطاق الشبكة* — رجّعت الجهة الموقوفة للعمل، "
+                         "الجهتين شغالات من جديد.")
+        return None
+    stale = [o for o in orders if o.get("magic") == down]
+    cancelled = 0
+    for o in stale:
+        try:
+            await asyncio.wait_for(conn.cancel_order(o["id"]), timeout=6.0)
+            cancelled += 1
+        except Exception as e:
+            log.warning(f"trend guard could not cancel {o.get('id')}: {e}")
+    if notify:
+        way = "فوق" if direction > 0 else "تحت"
+        side_ar = "البيع" if down == MAGIC_GRID_SELL else "الشراء"
+        other_ar = "الشراء" if down == MAGIC_GRID_SELL else "البيع"
+        await notify(
+            f"🧭 *السعر التزم اتجاه — مشى {way} أكثر من `{GRID_TREND_STEPS:g}` خطوات عن المركز*\n"
+            f"• وقّفت جهة *{side_ar}* — هذي الجهة اللي السعر يدهسها، ما أضيف عليها بعد\n"
+            f"• جهة *{other_ar}* تبقى شغالة وتمشي مع الحركة\n"
+            f"• ألغيت `{cancelled}` أمر معلّق · الصفقات المفتوحة ما لمستها")
+    return down
+
+
 def loss_limit(balance=0.0):
     """The floating loss at which the basket is closed and the grid stands down."""
     if GRID_MAX_LOSS > 0:
@@ -210,7 +368,8 @@ def loss_limit(balance=0.0):
 
 def _blank():
     return {"armed": False, "center": None, "armed_at": 0, "cycles": 0,
-            "realized": 0.0, "halted": False, "halt_reason": "", "released": []}
+            "realized": 0.0, "halted": False, "halt_reason": "", "released": [],
+            "loss_streak": 0}
 
 
 def load():
@@ -219,6 +378,7 @@ def load():
             state = _blank()
             state.update(json.load(f))
             state.setdefault("released", [])
+            state.setdefault("loss_streak", 0)
             return state
     except Exception:
         return _blank()
@@ -242,8 +402,13 @@ def reset():
     would close positions it had promised not to touch.
     """
     fresh = _blank()
-    fresh["released"] = load().get("released", [])
+    old = load()
+    fresh["released"] = old.get("released", [])
+    # The losing run survives a re-centre on purpose: recovery sizing is about the run of
+    # cycles, and zeroing it here would make every re-arm look like a fresh start.
+    fresh["loss_streak"] = old.get("loss_streak", 0)
     save(fresh)
+    trend_reset()
 
 
 async def grid_positions(conn, exclude=None):
@@ -358,10 +523,14 @@ async def teardown(conn):
 
 def plan_text(balance=0.0):
     """Everything the user needs to judge the configuration before arming it."""
-    lots = ladder()
+    lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
     total = round(sum(lots), 2)
     margin_each = GRID_CONTRACT  # unknown price here; the caller fills real margin in
-    worst, best, whip = worst_case(lots), best_case(lots), whipsaw_case(lots)
+    # Quote the risk on what can actually be open at once, not on the full ladder: the
+    # position cap is enforced for real now, so the old twelve-level figures were fiction
+    # that made the grid look about twice as dangerous as it is.
+    risk = exposure_lots(lots)
+    worst, best, whip = worst_case(risk), best_case(risk), whipsaw_case(risk)
     limit = loss_limit(balance)
     shown = ", ".join(f"{x:g}" for x in lots[:10]) + (" …" if len(lots) > 10 else "")
     lines = [
@@ -377,8 +546,14 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
-        ("• ⚠️ اتجاه واحد مفعّل — ينتبه: يوقف الجهة اللي ما عندها صفقات، وهي غالباً الرابحة"
-         if GRID_ONE_WAY else "• ↔️ الجهتين شغالات دائماً — كل صفقة تخرج بوقفها لحالها"),
+        (f"• 🧭 حارس الترند: إذا ابتعد السعر `{GRID_TREND_STEPS:g}` خطوات عن المركز وثبت "
+         f"`{GRID_TREND_HOLD:g}` ثانية، يوقف الجهة اللي يدهسها ويمشي مع الحركة "
+         f"(يرجّعها عند `{GRID_TREND_RELEASE:g}` خطوات)"
+         if GRID_TREND else "• ⚠️ حارس الترند مطفي — الجهتين تنعبّى حتى بالترند"),
+        (f"• 🔁 استرداد محدود: كل `{GRID_RECOVER_AFTER}` دورات خاسرة يزيد اللوت "
+         f"`+{GRID_RECOVER_STEP:g}` ويقف عند "
+         f"`{round(min(GRID_RECOVER_MAX, GRID_MAX_LOT), 2):g}` — جمع، مو مضاعفة"
+         if GRID_RECOVER else "• الاسترداد المحدود مطفي — اللوت ثابت مهما خسرت الدورات"),
         ("• ✂️ يحصد كل جهة لحالها" if GRID_SIDE_HARVEST else "• يحصد المجموع الكلي"),
         (f"• 🛡 التأمين: أول ما تعبر `{BE_TRIGGER_CASH:g}$` ينقل وقفها لنقطة الفتح — "
          f"ما تصير خسارة بعدها أبداً\n"
@@ -394,6 +569,7 @@ def plan_text(balance=0.0):
         f"• لو امتلأت جهة ورجع السعر للوسط: `-{worst:,.0f}$`",
         f"• لو تأرجح وكسر الجهتين: `-{whip:,.0f}$` ← وهنا يقطع الوقف عند `-{limit:g}$`",
         f"• لو امتلأت واستمر بنفس الاتجاه: `+{best:,.0f}$`",
+        f"  _(محسوبة على `{len(risk)}` صفقة — سقف المفتوح، مو كل `{len(lots)}` مستوى)_",
     ]
     if balance:
         lines.append(f"• الوقف = `{round(limit / balance * 100)}%` من رصيدك `{balance:g}$` — "
@@ -409,9 +585,14 @@ async def arm(conn, symbol, notify):
     if not bid or not ask:
         return False, "ماكو سعر"
     center = round((bid + ask) / 2.0, 2)
-    lots = ladder()
+    streak = load().get("loss_streak", 0)
+    base = recovery_base(streak)
+    lots = ladder(base=base)
     if not lots:
         return False, "ماكو مستويات"
+    # A fresh ladder is a fresh direction question: whatever was stood down was stood
+    # down against the OLD centre, and keeping it would leave the new grid half-armed.
+    trend_reset()
 
     acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
     balance = float(acct.get("balance", 0) or 0)
@@ -448,8 +629,13 @@ async def arm(conn, symbol, notify):
                   "halted": False, "halt_reason": ""})
     save(state)
     note = f"\n⚠️ `{failed}` أمر ما انحط." if failed else ""
+    rec = ""
+    if base > round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2):
+        rec = (f"\n🔁 *استرداد محدود فعّال* — `{streak}` دورة خاسرة ورا بعض، "
+               f"فبديت من `{base:g}` بدل `{GRID_BASE_LOT:g}`. "
+               f"السقف `{round(min(GRID_RECOVER_MAX, GRID_MAX_LOT), 2):g}` وما يتعداه أبداً.")
     await notify(f"🕸 *نصبت الشبكة حول* `{center}`\n\n{plan_text(balance)}\n"
-                 f"• أوامر معلّقة: `{placed}`{note}")
+                 f"• أوامر معلّقة: `{placed}`{note}{rec}")
     return True, None
 
 
@@ -546,6 +732,10 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 state = load()
                 state["cycles"] = state.get("cycles", 0) + 1
                 state["realized"] = round(state.get("realized", 0.0) + booked, 2)
+                # One rule, both ways: a cycle that books money clears the run, a cycle
+                # that costs money lengthens it. That run is all recovery sizing reads.
+                state["loss_streak"] = (0 if booked > 0
+                                        else state.get("loss_streak", 0) + 1)
                 state["armed"] = False
                 save(state)
                 side_ar = {"buy": "الشراء", "sell": "البيع", "all": "الشبكة"}[name]
@@ -565,7 +755,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
                 state.update({"armed": False, "halted": True,
                               "halt_reason": f"الخسارة وصلت {booked:g}$",
-                              "realized": round(state.get("realized", 0.0) + booked, 2)})
+                              "realized": round(state.get("realized", 0.0) + booked, 2),
+                              "loss_streak": state.get("loss_streak", 0) + 1})
                 save(state)
                 # Deliberately does not re-arm. A grid that restarts itself after a stop
                 # is a grid that takes the account on the second try instead of the first.
@@ -577,44 +768,54 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     "ما أعيد نصبها لوحدي. راجع الإعدادات وأرسل `/grid on` لما تقرر.")
                 continue
 
-            stood_down = None
-            if GRID_ONE_WAY and positions:
-                live_sides = {p.get("magic") for p in positions}
-                if len(live_sides) == 1 and len(positions) >= GRID_COMMIT_LEVELS:
-                    committed = next(iter(live_sides))
-                    stood_down = (MAGIC_GRID_SELL if committed == MAGIC_GRID_BUY
-                                  else MAGIC_GRID_BUY)
-                    stale = [o for o in orders if o.get("magic") == stood_down]
-                    for o in stale:
-                        try:
-                            await asyncio.wait_for(conn.cancel_order(o["id"]), timeout=6.0)
-                        except Exception as e:
-                            log.warning(f"could not cancel opposite order {o.get('id')}: {e}")
-                    if stale:
-                        way = "الشراء" if committed == MAGIC_GRID_BUY else "البيع"
-                        await notify(f"🧭 *السعر التزم جهة {way}* (`{len(positions)}` مستويات) — "
-                                     f"ألغيت `{len(stale)}` أمر معلّق بالجهة المعاكسة "
-                                     "حتى ما تاكل الربح.")
+            # One price read per tick, shared by everything below it.
+            try:
+                quote = await asyncio.wait_for(
+                    conn.get_symbol_price(symbol=symbol), timeout=6.0)
+            except Exception as e:
+                log.warning(f"tick has no price: {e}")
+                quote = None
+
+            # Stop feeding the side price is running over. Read off price against the
+            # centre, so it names the side that is actually losing - see trend_read.
+            stood_down = await trend_guard(conn, symbol, state.get("center"), orders,
+                                           notify, quote=quote)
+            if stood_down is not None:
+                orders = [o for o in orders if o.get("magic") != stood_down]
 
             # How much more the grid may take on, in positions and in money. Both are
             # hard: the loss that triggered these ceilings came from twenty positions
             # opening together while every individual rule was behaving correctly.
             room = max(0, GRID_MAX_POSITIONS - len(positions))
-            if floating <= -(limit * GRID_ADD_STOP_PCT / 100.0):
+            near_stop = floating <= -(limit * GRID_ADD_STOP_PCT / 100.0)
+            if near_stop:
                 room = 0                  # already most of the way to the stop
-            if room == 0 and orders and not state.get("crowded"):
-                state["crowded"] = True
-                save(state)
-                await notify(f"🚧 *وقفت التوسّع* — عندي `{len(positions)}` صفقة مفتوحة "
-                             f"(الحد `{GRID_MAX_POSITIONS}`) أو الخسارة قربت من الوقف.\n"
-                             "ما أضيف مستويات جديدة لين تنفك الصفقات الحالية.")
-            elif room > 0 and state.get("crowded"):
+            if room == 0:
+                # The cap used to be checked only where the grid ADDED levels. But the
+                # ladder arms with GRID_LEVELS pendings a side and every one of them
+                # could still fire after the cap was reached, so on the one path that
+                # mattered - a trend sweeping the ladder - the cap did nothing. Pull the
+                # pendings: the grid keeps what it holds and can open nothing more until
+                # something closes, and then refill walks levels back toward price.
+                pulled = await cancel_all(conn) if orders else 0
+                orders = []
+                if not state.get("crowded"):
+                    state["crowded"] = True
+                    save(state)
+                    why = ("الخسارة قربت من الوقف" if near_stop
+                           else f"وصلت سقف الصفقات `{GRID_MAX_POSITIONS}`")
+                    await notify(f"🚧 *وقفت التوسّع* — {why}.\n"
+                                 f"• عندي `{len(positions)}` صفقة مفتوحة\n"
+                                 f"• سحبت `{pulled}` أمر معلّق حتى ما ينفتح شي جديد\n"
+                                 "الصفقات المفتوحة تكمل بوقفها الخاص.")
+            elif state.get("crowded"):
                 state["crowded"] = False
                 save(state)
+                await notify("✅ *انفكّت الزحمة* — رجعت أنصب مستويات قرب السعر.")
 
             if orders or positions:
                 await refill_gaps(conn, symbol, positions, orders, notify,
-                                  skip_magic=stood_down, room=room)
+                                  skip_magic=stood_down, room=room, quote=quote)
 
             if not positions and not orders:
                 peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
@@ -635,7 +836,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
 def status_text(balance=0.0):
     state = load()
-    lots = ladder()
+    lots = ladder(base=recovery_base(state.get("loss_streak", 0)))
     head = "🕸 *شبكة المضاعفة المكبوحة*"
     if not GRID_ENABLED:
         head += " — ❌ مطفية"
@@ -650,6 +851,15 @@ def status_text(balance=0.0):
     freed = len(state.get("released", []))
     if freed:
         body.append(f"• 🤝 `{freed}` صفقة سلّمتها لك — مفتوحة بإدارتك، خارج حساب الشبكة")
+    streak = state.get("loss_streak", 0)
+    if streak:
+        nxt = recovery_base(streak)
+        tail = (f" · اللوت الجاي `{nxt:g}`" if GRID_RECOVER and nxt > GRID_BASE_LOT
+                else " · اللوت ما يتغير (الاسترداد مطفي)" if not GRID_RECOVER else "")
+        body.append(f"• 📉 دورات خاسرة ورا بعض: `{streak}`{tail}")
+    if _trend["down"] is not None:
+        side_ar = "البيع" if _trend["down"] == MAGIC_GRID_SELL else "الشراء"
+        body.append(f"• 🧭 حارس الترند شغّال — جهة {side_ar} موقوفة مؤقتاً")
     if lots and max(lots) >= GRID_MAX_LOT:
         body.append(f"• 🔒 السقف `{GRID_MAX_LOT:g}` فعّال — بدونه أكبر لوت كان "
                     f"`{round(GRID_BASE_LOT * 2 ** ((len(lots) - 1) // GRID_DOUBLE_EVERY), 2):g}`")
@@ -752,7 +962,7 @@ async def released_text(conn):
 
 
 async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=None,
-                      room=None):
+                      room=None, quote=None):
     """Put a level back within one step of price when the nearest one has drifted away.
 
     Never touches an open position. Three things stop it feeding a trend: the per-side
@@ -765,11 +975,12 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
     if room is not None and room <= 0:
         return 0
     try:
-        price = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
+        if quote is None:
+            quote = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
     except Exception as e:
         log.warning(f"refill skipped, no price: {e}")
         return 0
-    bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
+    bid, ask = float(quote.get("bid", 0) or 0), float(quote.get("ask", 0) or 0)
     if not bid or not ask:
         return 0
     lot = round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2)
