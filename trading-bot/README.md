@@ -484,6 +484,27 @@ Both engines use it: the grid each tick, the anchor engine from the price it alr
 reached by the next poll — booking at the current mid made a protected trade report the
 very loss it had been protected from.
 
+## A saved setting that looks unsaved
+
+`/setkey gridmax 0.02` writes the value, restarts, and changes nothing visible — because
+the lot only ever reaches the market through a **new ladder**, and at `GRID_MAX_POSITIONS`
+open trades the engine will not lay one:
+
+    if len(held) >= GRID_MAX_POSITIONS:
+        await asyncio.sleep(5)      # and said nothing, for as long as that lasted
+
+So the user changed the lot, saw nothing, changed it again, saw nothing again, and
+reasonably concluded the setting was broken. It was not: the ladder that would have
+carried it could never be laid. `/grid rearm` made it worse by signing off with
+"أنصب السلّم من جديد خلال ثواني" even when room was zero.
+
+Both now say it. The engine reports the block (rate-limited by `BLOCKED_NOTE_SECS`, 15
+min) with the ladder that is waiting, when it will arm, and how to force it; `/grid rearm`
+checks the room before promising anything.
+
+The rule this keeps re-teaching: **when the bot declines to act, that is information the
+user needs.** Silence reads as a bug in whatever they changed last.
+
 ## The position cap was advisory, and now is not
 
 `GRID_MAX_POSITIONS` was checked in two places: before laying a fresh ladder, and before

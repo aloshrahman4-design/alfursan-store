@@ -651,6 +651,12 @@ async def cached_balance(conn):
     return _balance_cache["value"]
 
 
+# How often the engine repeats "I cannot lay a ladder yet". Often enough to be seen,
+# rarely enough not to become noise on a grid that sits at its cap for an hour.
+BLOCKED_NOTE_SECS = _f("BLOCKED_NOTE_SECS", 900.0)
+_blocked_at = 0.0
+
+
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
@@ -680,6 +686,20 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             if not state.get("armed"):
                 held = await grid_positions(conn)
                 if len(held) >= GRID_MAX_POSITIONS:
+                    # It used to sleep here in total silence, which is how a changed lot
+                    # looked like a setting that "did not work": the value was saved, the
+                    # ladder that would carry it simply could never be laid. Say it.
+                    global _blocked_at
+                    if time.time() - _blocked_at > BLOCKED_NOTE_SECS:
+                        _blocked_at = time.time()
+                        lots = ladder(base=recovery_base(state.get("loss_streak", 0)))
+                        await notify(
+                            f"⏳ *ما أقدر أنصب سلّم جديد* — عندي `{len(held)}` صفقة مفتوحة "
+                            f"وهذا سقف الصفقات (`{GRID_MAX_POSITIONS}`).\n"
+                            f"• أي إعداد غيّرته للوت محفوظ وينطبق على السلّم الجاي: "
+                            f"`{', '.join(f'{x:g}' for x in lots[:6])} …`\n"
+                            "• أنصبه تلقائياً أول ما تنفك صفقة وحدة\n"
+                            "• تريده هسه؟ سكّر صفقة بالمنصة، أو `/grid off` ثم `/grid on`")
                     await asyncio.sleep(5)   # too crowded to lay a new ladder
                     continue
                 ok, err = await arm(conn, symbol, notify)

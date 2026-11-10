@@ -1627,12 +1627,24 @@ async def handle_grid_command(text):
         st["armed"] = False
         st["crowded"] = False
         grid.save(st)
+        room = max(0, grid.GRID_MAX_POSITIONS - len(held))
+        lots = grid.ladder(base=grid.recovery_base(st.get("loss_streak", 0)))
+        shown = ", ".join(f"{x:g}" for x in lots[:6])
+        # Do not promise a ladder the engine cannot lay. At the position cap it will not
+        # arm at all, and saying "خلال ثواني" there is what made a saved lot look unsaved.
+        tail = (f"أنصب السلّم من جديد على السعر الحالي خلال ثواني...\n"
+                f"• السلّم الجاي: `{shown} …`" if room > 0 else
+                f"⚠️ *بس ما راح أنصب سلّم جديد هسه* — `{len(held)}` صفقة مفتوحة "
+                f"وهذا سقف الصفقات (`{grid.GRID_MAX_POSITIONS}`).\n"
+                f"• السلّم الجاي جاهز بإعداداتك الجديدة: `{shown} …`\n"
+                f"• ينصب تلقائياً أول ما تنفك صفقة وحدة\n"
+                f"• تريده فوراً؟ سكّر صفقة بالمنصة، أو ارفع السقف "
+                f"بـ `/setkey gridmaxpos 10`")
         await send_long(
             "🕸 *أعيد نصب الشبكة بدون إغلاق*\n\n"
             f"• ألغيت `{cancelled}` أمر معلّق\n"
             f"• تركت `{len(held)}` صفقة مفتوحة مثل ما هي — بوقفها وتأمينها\n"
-            f"• المساحة المتبقية: `{max(0, grid.GRID_MAX_POSITIONS - len(held))}` صفقة\n\n"
-            "أنصب السلّم من جديد على السعر الحالي خلال ثواني...")
+            f"• المساحة المتبقية: `{room}` صفقة\n\n" + tail)
         return
     if arg in ("reset", "تصفير", "center", "centre", "recenter", "تمركز"):
         # Clearing the state alone was a footgun: the engine would arm a fresh ladder on
