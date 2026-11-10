@@ -593,7 +593,20 @@ async def handle_setkey(text, chat_id, message_id):
     if key not in SETTABLE_KEYS:
         await send_long("مفتاح غير معروف. المسموح: " + "، ".join(sorted(KEY_ALIASES)))
         return
-    if not value or "\n" in value:
+    # Telegram sends a multi-line paste as ONE message, so "/setkey gridmax 0.02" with
+    # "/grid rearm" underneath arrived as the single value "0.02\n/grid rearm" and was
+    # rejected as invalid - which reads like the LOT was refused, not the paste. Take the
+    # first line and say what happened to the rest. Never run the extra lines: a command
+    # the user did not mean to send twice is worse than one they have to resend.
+    extra = ""
+    if "\n" in value:
+        value, _, rest = value.partition("\n")
+        value = value.strip()
+        rest = rest.strip()
+        if rest:
+            extra = ("\n\n⚠️ أخذت السطر الأول بس. باقي الرسالة ما نفّذتها:\n"
+                     f"`{rest.splitlines()[0][:80]}`\nأرسلها برسالة منفصلة.")
+    if not value:
         await send_long("القيمة غير صالحة.")
         return
 
@@ -661,10 +674,13 @@ async def handle_setkey(text, chat_id, message_id):
                "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
             or key.startswith("BE_") \
             or key.startswith("GRID_"):
-        await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. أعيد التشغيل الآن...")
+        await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. "
+                        f"أعيد التشغيل الآن...{extra}")
+        await asyncio.sleep(1.5 if extra else 0)   # let the warning land before the exit
         os._exit(0)
     status = intel.keys_status() if intel is not None else ""
-    await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.\n\n{status}", markup=keyboard())
+    await send_long(f"✅ تم حفظ *{SETTABLE_KEYS[key]}* وحذف الرسالة.{extra}\n\n{status}",
+                    markup=keyboard())
 
 
 CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",

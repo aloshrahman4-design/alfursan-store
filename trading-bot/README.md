@@ -119,6 +119,19 @@ curl -fsSL https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/
 
 ## Keys
 
+### A pasted pair of commands
+
+Telegram delivers a multi-line paste as **one message**. `/setkey gridmax 0.02` with
+`/grid rearm` on the next line therefore arrived as the single value `0.02\n/grid rearm`,
+and the old check (`"\n" in value -> reject`) answered `القيمة غير صالحة` — which reads
+like the *lot* was refused, not the paste. The user retried with a different lot and got
+the same answer, twice.
+
+`handle_setkey` now takes the first line as the value and reports the rest instead of
+swallowing the whole thing. It never executes the leftover lines: silently running a
+command the user did not mean to send is worse than making them resend it.
+
+
 Preferred: send `/setkey claude sk-ant-…` to the bot. Manual alternative:
 
 ```bash
