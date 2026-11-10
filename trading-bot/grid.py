@@ -653,7 +653,8 @@ def status_text(balance=0.0):
     if lots and max(lots) >= GRID_MAX_LOT:
         body.append(f"• 🔒 السقف `{GRID_MAX_LOT:g}` فعّال — بدونه أكبر لوت كان "
                     f"`{round(GRID_BASE_LOT * 2 ** ((len(lots) - 1) // GRID_DOUBLE_EVERY), 2):g}`")
-    body.append("\n`/grid on` · `/grid off` · `/grid reset` · `/setkey gridlevels 12`")
+    body.append("\n`/grid on` · `/grid off` · `/grid rearm` (إعادة نصب بدون إغلاق) · "
+                "`/grid center` (مع إغلاق)")
     return "\n".join(body)
 
 

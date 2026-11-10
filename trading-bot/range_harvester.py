@@ -1584,6 +1584,30 @@ async def handle_grid_command(text):
         write_env_value("GRID_ENABLED", "0")
         await send_long("🛑 أطفيت الشبكة.\n♻️ أعيد التشغيل...")
         os._exit(0)
+    if arg in ("rearm", "relay", "نصب", "تنصيب", "جديد"):
+        # Re-lay the ladder around the current price without touching what is open. The
+        # positions stay, keep their stops, and still count toward GRID_MAX_POSITIONS.
+        if connection is None:
+            await send_long("ماكو اتصال حالياً — ما أقدر ألغي الأوامر القديمة بأمان.",
+                            markup=keyboard())
+            return
+        try:
+            held = await grid.grid_positions(connection)
+            cancelled = await grid.cancel_all(connection)
+        except Exception as e:
+            await send_long(f"⚠️ فشل: `{str(e)[:200]}`\nما غيّرت شي.", markup=keyboard())
+            return
+        st = grid.load()
+        st["armed"] = False
+        st["crowded"] = False
+        grid.save(st)
+        await send_long(
+            "🕸 *أعيد نصب الشبكة بدون إغلاق*\n\n"
+            f"• ألغيت `{cancelled}` أمر معلّق\n"
+            f"• تركت `{len(held)}` صفقة مفتوحة مثل ما هي — بوقفها وتأمينها\n"
+            f"• المساحة المتبقية: `{max(0, grid.GRID_MAX_POSITIONS - len(held))}` صفقة\n\n"
+            "أنصب السلّم من جديد على السعر الحالي خلال ثواني...")
+        return
     if arg in ("reset", "تصفير", "center", "centre", "recenter", "تمركز"):
         # Clearing the state alone was a footgun: the engine would arm a fresh ladder on
         # top of the pending orders still sitting at the broker and double every level.

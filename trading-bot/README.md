@@ -557,3 +557,14 @@ skipped, and only skipped when even that would sit below break-even.
 One honest consequence: with a $0.30 spread and a $0.25 minimum gap, a 0.01-lot trade needs
 roughly $0.60 of profit before any stop fits above entry, whatever `BE_TRIGGER_CASH` says.
 The trigger is a floor on intent, not a promise about the first cent.
+
+### Re-centring without closing
+
+`/grid rearm` cancels the pending orders and lays a fresh ladder around the current price,
+leaving every open position exactly as it is — same entry, same stop, same protection, and
+still counted against `GRID_MAX_POSITIONS`, so the new ladder can only fill into the room
+that is actually left. Nothing is realised.
+
+`/grid center` is the other one: it closes the grid's positions first, so the slate is
+genuinely clean. Use it to abandon a basket; use `rearm` to keep the basket and move the
+ladder back around price.
