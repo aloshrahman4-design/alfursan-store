@@ -137,6 +137,7 @@ SETTABLE_KEYS = {
     "GRID_RELEASED_SUMMARY_MIN": "كل كم دقيقة يرسل متابعة صفقاتك",
     "GRID_MAX_LOSS": "حد خسارة الشبكة بالدولار (0 = نسبة)",
     "GRID_MAX_LOSS_PCT": "حد خسارة الشبكة كنسبة من الرصيد",
+    "BOT_ACTIVE": "النظام شغّال (1) أو مطفي (0) — يبقى بعد إعادة التشغيل",
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
@@ -150,7 +151,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
@@ -208,7 +209,11 @@ bot = None
 api_instance = None
 account_instance = None
 connection = None
-bot_active = True
+# Read from the environment, not hardcoded. It used to be a plain True, so every restart
+# switched the system back ON: /stop said "أطفيت النظام" and then exited, systemd brought
+# the process back, and the anchor strategy was live again. The panel toggle had the same
+# hole - and /update restarts too.
+bot_active = os.environ.get("BOT_ACTIVE", "1") not in ("0", "false", "no")
 chat_id_active = None
 buy_anchor, sell_anchor = None, None
 buy_waiting, sell_waiting = False, False
@@ -753,6 +758,9 @@ HELP_TEXT = (
     "• /accounts — كل حساباتك بـ MetaApi وسطر جاهز للتبديل لأي واحد\n"
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
+    "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
+    "**بدون ما يغلق ولا صفقة مفتوحة** (الحراسة تبقى شغالة عليها)\n"
+    "• `/stop` — إيقاف كامل: يغلق كل صفقات البوت ويطفي كل شي\n"
     "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
     "• `/entry 4468.5` — تصحيح سعر دخولك الحقيقي (أضف sell للبيع)\n"
@@ -1373,6 +1381,18 @@ def read_signal(body):
     return ("buy" if hit_buy else "sell"), text
 
 
+async def open_bot_positions():
+    """Every position the bot owns and still controls. Reads only — closes nothing."""
+    if not connection:
+        return []
+    released = set(grid.load().get("released", [])) if grid is not None else set()
+    magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
+    all_pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
+    return [p for p in all_pos
+            if p.get("id") not in released
+            and p.get("symbol") == SYMBOL and p.get("magic") in magics]
+
+
 async def close_bot_positions():
     """Close every position the bot owns and still controls. Returns (closed, left alone)."""
     if not connection:
@@ -1923,12 +1943,14 @@ async def handle_callback(query):
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
         elif data == "toggle_bot":
             bot_active = not bot_active
+            write_env_value("BOT_ACTIVE", "1" if bot_active else "0")
             txt = "تم **تشغيل النظام** 🟢" if bot_active else "تم **إيقاف النظام** 🔴"
             if not bot_active and grid is not None and grid.GRID_ENABLED and grid.load().get("armed"):
                 # The switch stops the bot managing, not the broker filling.
                 txt += ("\n\n⚠️ *بس أوامر الشبكة لسه مسلّحة عند الوسيط* وتنفتح لحالها.\n"
-                        "البوت ما يحرسها الآن — ولا حتى وقف الـ100$.\n"
-                        "`/grid off` يلغيها كلها إذا تريد توقف فعلاً.")
+                        "البوت ما يحرسها الآن.\n"
+                        "`/pause` يلغيها **بدون ما يغلق أي صفقة مفتوحة**.\n"
+                        "`/grid off` يلغيها ويغلق صفقات الشبكة معها.")
             await safe_reply(query.edit_message_text, text=txt, reply_markup=keyboard(), parse_mode="Markdown")
         elif data in ("anchor_buy", "anchor_sell", "anchor_dual"):
             if not await wake_for_execution("طلب ارتكاز"):
@@ -2014,9 +2036,54 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
-            elif text.startswith("/stop"):
+            elif text.startswith("/pause") or text.startswith("/freeze"):
+                # "Stop the bot without closing my trades." /stop closes everything and
+                # /grid off closes the grid's trades, so there was no command for this at
+                # all - the panel switch left the broker's pending orders armed, and they
+                # kept opening new trades with nobody managing them.
                 global bot_active
                 bot_active = False
+                write_env_value("BOT_ACTIVE", "0")
+                lines = ["⏸ *جمّدت البوت — بدون ما أغلق ولا صفقة*", ""]
+                cancelled = 0
+                if grid is not None and connection is not None:
+                    try:
+                        cancelled = await grid.cancel_all(connection)
+                    except Exception as e:
+                        lines.append(f"• ⚠️ ما كدرت ألغي الأوامر المعلّقة: `{str(e)[:150]}`")
+                elif connection is None:
+                    lines.append("• ⚠️ ماكو اتصال — الأوامر المعلّقة باقية عند الوسيط، "
+                                 "ألغها من المنصة بنفسك")
+                if grid is not None:
+                    st = grid.load()
+                    st["armed"] = False
+                    st["crowded"] = False
+                    grid.save(st)
+                    write_env_value("GRID_ENABLED", "0")
+                held = []
+                if connection is not None:
+                    try:
+                        held = await open_bot_positions()
+                    except Exception:
+                        held = []
+                lines += [
+                    f"• ألغيت `{cancelled}` أمر معلّق — ما ينفتح ولا صفقة جديدة",
+                    "• أطفيت الشبكة والنظام (ويبقون مطفيين حتى بعد إعادة التشغيل)",
+                    f"• تركت `{len(held)}` صفقة مفتوحة مثل ما هي",
+                    "",
+                    "🛡 *وهذا يبقى شغّال عليها:*",
+                    "• وقف التعادل والتريلينغ — أي صفقة دخلت بالربح تبقى محروسة",
+                    "• ما ينغلق شي تلقائياً بخسارة — وقف الشبكة الكلي مطفي هو بعد",
+                    "",
+                    "للرجوع: `/grid on` ثم زر *النظام* من اللوحة.",
+                ]
+                await send_long("\n".join(lines), markup=keyboard())
+            elif text.startswith("/stop"):
+                # `global bot_active` is declared once, by the /pause branch above: a
+                # second declaration in the same function after an assignment is a
+                # SyntaxError, not a no-op.
+                bot_active = False
+                write_env_value("BOT_ACTIVE", "0")   # or the restart below turns it back on
                 lines = ["🛑 *إيقاف كامل*", ""]
                 if connection is not None:
                     try:
@@ -2276,6 +2343,7 @@ async def main():
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
+            BotCommand("pause", "تجميد: يوقف كل شي جديد ويخلي صفقاتك مفتوحة"),
             BotCommand("stop", "إيقاف كامل: يغلق كل شي ويطفي البوت"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),

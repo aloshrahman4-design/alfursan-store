@@ -606,6 +606,33 @@ closed. Price against the centre does not.
 
 ## Stopping
 
+Three different things, and until now only two of them existed.
+
+| | pending orders | open trades | system | survives a restart |
+|---|---|---|---|---|
+| panel switch | **left armed** | left open | off | yes (now) |
+| `/pause` | cancelled | **left open** | off | yes |
+| `/grid off` | cancelled | grid trades **closed** | grid only | yes |
+| `/stop` | cancelled | **all closed** | off | yes (now) |
+
+`/pause` is "stop the bot but keep my trades". It cancels the grid's pending orders so
+nothing new can open, switches the grid and the system off, and touches no position. The
+protection guard keeps running on what is open — it only ever tightens a stop in the
+user's favour, so there is no state in which leaving it on is unsafe.
+
+The panel switch alone is not a stop: it stops the *bot* managing, not the *broker*
+filling. Orders sitting at the broker still fire, and then nobody is watching them. The
+switch now says so and points at `/pause`.
+
+### The switch did not survive a restart
+
+`bot_active` was a hardcoded `True`. So `/stop` set it to `False`, announced
+"أطفيت النظام", and then called `os._exit(0)` — systemd restarted the process and the
+system came back **on**. The same hole applied to the panel switch and to any `/update`.
+
+It is read from `BOT_ACTIVE` now, and all three paths persist it.
+
+
 `/stop` is the full shutdown: close every position the bot owns, cancel the grid's pending
 orders, disable the grid, switch the system off, restart so nothing lingers in memory. It
 says what it could not do — with no broker connection it reports that rather than implying
