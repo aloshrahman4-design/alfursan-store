@@ -760,6 +760,7 @@ HELP_TEXT = (
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
     "**بدون ما يغلق ولا صفقة مفتوحة** (الحراسة تبقى شغالة عليها)\n"
+    "• `/resume` — رجوع للعمل بعد `/pause` (أمر واحد يرجّع كل شي)\n"
     "• `/stop` — إيقاف كامل: يغلق كل صفقات البوت ويطفي كل شي\n"
     "• `/lot 0.01` — تغيير حجم اللوت (والحدود تتعدل معه تلقائياً)\n"
     "• /signal — وضع الإشارات: البوت ينبّه وأنت تنفّذ بـ MT5 (مجاني تماماً)\n"
@@ -2024,6 +2025,10 @@ async def handle_callback(query):
 
 
 async def process_update(update):
+    # Declared once, at the top. Several branches below assign it (/resume, /pause,
+    # /stop), and a `global` further down after an earlier branch has already assigned
+    # the name is a SyntaxError that ast.parse does not catch - only compile() does.
+    global bot_active
     try:
         if update.message and update.message.text:
             cid = update.message.chat_id
@@ -2036,12 +2041,41 @@ async def process_update(update):
                 await safe_reply(bot.send_message, chat_id=chat_id_active, text="🎯 **لوحة تحكم Range Harvester:**", reply_markup=keyboard(), parse_mode="Markdown")
             elif text.startswith("/capital"):
                 await handle_capital_setup(text, cid, update.message.message_id)
+            elif text.startswith("/resume") or text.startswith("/unpause"):
+                # The exact inverse of /pause, in one command. Shipping /pause without it
+                # left the way back as "/grid on, wait for the restart, then find the
+                # panel button" - two steps and a wait, for undoing one command.
+                bot_active = True
+                write_env_value("BOT_ACTIVE", "1")
+                lines = ["▶️ *رجّعت البوت للعمل*", ""]
+                held = []
+                if connection is not None:
+                    try:
+                        held = await open_bot_positions()
+                    except Exception:
+                        held = []
+                if grid is not None:
+                    grid.reset()          # clears any halt or stale armed flag
+                    write_env_value("GRID_ENABLED", "1")
+                    lines.append("• شغّلت الشبكة — تنصب نفسها على السعر الحالي أول ما أرجع")
+                lines.append("• شغّلت النظام 🟢")
+                if held:
+                    lines += [
+                        f"• `{len(held)}` صفقة مفتوحة رجعت تحت إدارة البوت",
+                        "",
+                        "⚠️ يعني رجع يشتغل عليها:",
+                        f"• حصاد الباسكت عند `+{grid.GRID_TP_CASH:g}$` — يغلق الكل سوا",
+                        "• ووقف الشبكة الكلي لو وصلته الخسارة العائمة",
+                    ]
+                lines.append("\n♻️ أعيد التشغيل...")
+                await send_long("\n".join(lines))
+                await asyncio.sleep(1.0)
+                os._exit(0)
             elif text.startswith("/pause") or text.startswith("/freeze"):
                 # "Stop the bot without closing my trades." /stop closes everything and
                 # /grid off closes the grid's trades, so there was no command for this at
                 # all - the panel switch left the broker's pending orders armed, and they
                 # kept opening new trades with nobody managing them.
-                global bot_active
                 bot_active = False
                 write_env_value("BOT_ACTIVE", "0")
                 lines = ["⏸ *جمّدت البوت — بدون ما أغلق ولا صفقة*", ""]
@@ -2075,13 +2109,10 @@ async def process_update(update):
                     "• وقف التعادل والتريلينغ — أي صفقة دخلت بالربح تبقى محروسة",
                     "• ما ينغلق شي تلقائياً بخسارة — وقف الشبكة الكلي مطفي هو بعد",
                     "",
-                    "للرجوع: `/grid on` ثم زر *النظام* من اللوحة.",
+                    "للرجوع: `/resume` — أمر واحد يرجّع كل شي.",
                 ]
                 await send_long("\n".join(lines), markup=keyboard())
             elif text.startswith("/stop"):
-                # `global bot_active` is declared once, by the /pause branch above: a
-                # second declaration in the same function after an assignment is a
-                # SyntaxError, not a no-op.
                 bot_active = False
                 write_env_value("BOT_ACTIVE", "0")   # or the restart below turns it back on
                 lines = ["🛑 *إيقاف كامل*", ""]
@@ -2344,6 +2375,7 @@ async def main():
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
             BotCommand("pause", "تجميد: يوقف كل شي جديد ويخلي صفقاتك مفتوحة"),
+            BotCommand("resume", "رجوع للعمل بعد التجميد"),
             BotCommand("stop", "إيقاف كامل: يغلق كل شي ويطفي البوت"),
             BotCommand("signal", "وضع الإشارات: أنت تنفّذ بـ MT5"),
             BotCommand("lot", "تغيير حجم اللوت: /lot 0.01"),

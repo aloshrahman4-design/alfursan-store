@@ -612,8 +612,15 @@ Three different things, and until now only two of them existed.
 |---|---|---|---|---|
 | panel switch | **left armed** | left open | off | yes (now) |
 | `/pause` | cancelled | **left open** | off | yes |
+| `/resume` | re-armed | left open | on | yes |
 | `/grid off` | cancelled | grid trades **closed** | grid only | yes |
 | `/stop` | cancelled | **all closed** | off | yes (now) |
+
+`/resume` is its exact inverse, in one command: system on, grid on, any halt cleared,
+restart. It was missing at first, which left the way back as "`/grid on`, wait for the
+restart, then find the panel button" — two steps and a wait to undo one command. It also
+lists what automatic behaviour comes back on the trades that stayed open, because that is
+the part the user is agreeing to again.
 
 `/pause` is "stop the bot but keep my trades". It cancels the grid's pending orders so
 nothing new can open, switches the grid and the system off, and touches no position. The
@@ -623,6 +630,15 @@ user's favour, so there is no state in which leaving it on is unsafe.
 The panel switch alone is not a stop: it stops the *bot* managing, not the *broker*
 filling. Orders sitting at the broker still fire, and then nobody is watching them. The
 switch now says so and points at `/pause`.
+
+### ast.parse is not a syntax check
+
+Adding `/resume` above `/pause` in the same handler put an assignment to `bot_active`
+before the `global` declaration further down — a real SyntaxError. `ast.parse()` accepted
+the file anyway: the rule is enforced when the symbol table is built, not when the source
+is parsed. Only `compile()` catches it.
+
+Everything verifies with `compile()` now, and `test_resume` compiles all six modules.
 
 ### The switch did not survive a restart
 
