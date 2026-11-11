@@ -117,6 +117,28 @@ detected and reported once, in plain language, instead of looping silently.
 curl -fsSL https://raw.githubusercontent.com/aloshrahman4-design/alfursan-store/claude/range-harvester-stability-fix-kfz55i/trading-bot/deploy.sh | bash
 ```
 
+## The official lot
+
+`GRID_BASE_LOT` is **0.02**. It was 0.01 through the period when the grid was being proved
+out, and moved up once the three ceilings — the position cap, the basket stop, and the
+per-trade break-even — had each been shown working on the live account.
+
+With `GRID_MAX_LOT` at 0.02 the ladder is flat at 0.02 rather than a doubling one. That is
+intentional and is not a downgrade: the doubling only ever ran to the cap anyway, and a
+flat ladder makes the margin and the worst case trivially predictable.
+
+What it costs, at a $4,000 gold price and 1:500:
+
+| levels | total lots | margin reserved | worst whipsaw (8 open) |
+|--------|-----------|-----------------|------------------------|
+| 12     | 0.24      | ~$386           | -$276                  |
+| 8      | 0.16      | ~$257           | -$276                  |
+| 6      | 0.12      | ~$193           | -$156                  |
+
+Levels beyond `GRID_MAX_POSITIONS` reserve margin they can never use, so 8 levels is the
+sensible maximum while the cap is 8. The whipsaw figure does not change between 12 and 8
+for exactly that reason.
+
 ## Keys
 
 ### A pasted pair of commands

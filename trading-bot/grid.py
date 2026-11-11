@@ -48,7 +48,13 @@ def _i(name, default):
 
 
 GRID_ENABLED = os.environ.get("GRID_ENABLED", "0") in ("1", "true", "yes")
-GRID_BASE_LOT = _f("GRID_BASE_LOT", 0.01)
+# The official base. It was 0.01 while the grid was being proved out; the owner moved it
+# to 0.02 once the ceilings (position cap, basket stop, per-trade break-even) had all been
+# shown to hold on the live account. Raising the base is the one change here that scales
+# every risk figure linearly, so it belongs in the code where it is read, not only in a
+# .env nobody re-reads: with GRID_MAX_LOT at 0.02 the ladder is a flat 0.02, and the
+# margin an 8-level ladder reserves goes from about $193 to about $257 at a $4,000 gold.
+GRID_BASE_LOT = _f("GRID_BASE_LOT", 0.02)
 GRID_MAX_LOT = _f("GRID_MAX_LOT", 0.03)       # the cap that makes the whole thing viable
 GRID_LEVELS = _i("GRID_LEVELS", 12)           # per side
 GRID_STEP = _f("GRID_STEP", 2.0)              # price distance between levels
