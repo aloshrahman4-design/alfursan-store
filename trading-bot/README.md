@@ -267,6 +267,39 @@ The peak lives in memory, not in the state file: it belongs to one basket, dies 
 and re-establishes itself after a restart rather than carrying a stale high into a new
 cycle.
 
+### A pinned direction (`/grid down`, `/grid up`, `/grid both`)
+
+The trend guard is a *reaction*. After every re-arm it starts from a clean slate and needs
+price to travel `GRID_TREND_STEPS` from the **new** centre and hold there before it stands
+a side down. In a market that has been falling for a day that is not enough: each cycle
+still lays a buy ladder, and still feeds it, until the guard catches up again.
+
+`/grid down` is the user's own standing judgement, and it does not expire on a re-arm:
+
+- `arm()` places only sell levels; the buy side is never armed
+- `refill_gaps()` will not add a buy either — otherwise the bias would be undone one
+  level at a time, which is exactly how the old one-way rule leaked
+- the margin a ladder reserves **halves**, because it occupies one side instead of two.
+  That is what lets a grid arm at all when `arm()` has been refusing it for want of margin
+- changing it cancels the standing ladder first. Leaving it armed would keep the side the
+  user just stood down filling at the broker — the same hole the panel switch had: the bot
+  stops deciding, the broker keeps executing
+- it closes nothing. Open trades keep their stop, their break-even and their trail
+
+`/grid both` restores two-sided arming. The guard keeps running underneath either setting.
+
+#### Saying it when the market turns
+
+A standing bias is a judgement, and markets change. Pinning "sells only" during a slide is
+sound; leaving it pinned through the reversal is how a good call becomes a bad position.
+
+`bias_watch()` compares the pin against what `trend_read()` actually measures, and when
+they contradict it says so once — naming the new direction, what is pinned, that every new
+trade is now on the losing side, and the one command that fixes it. It does **not** unpin
+anything. That is the user's decision; going quiet about it would be the worst of both.
+
+It warns once per turn, re-arming only after price settles back inside the band.
+
 ### The trend guard
 
 A grid earns in a range and bleeds in a trend. Price walks one way, every level it crosses

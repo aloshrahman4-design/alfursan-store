@@ -132,6 +132,17 @@ GRID_ADD_STOP_PCT = _f("GRID_ADD_STOP_PCT", 50.0)
 # price `GRID_TREND_STEPS` steps above the centre means the SELL ladder is the one being
 # run over, so the SELL side stands down and the BUY side keeps following price up.
 GRID_TREND = os.environ.get("GRID_TREND", "1") not in ("0", "false", "no")
+# A standing direction the user sets by hand, which the trend guard cannot give him.
+# The guard is a REACTION: after every re-arm it starts from a clean slate and needs
+# price to travel GRID_TREND_STEPS from the NEW centre and hold there, so in a market
+# that has been falling for a day the grid still lays a buy ladder each cycle and still
+# feeds it until the guard catches up. "both" keeps the old behaviour; "down" arms and
+# refills only the sell side; "up" only the buy side. One side also halves the margin
+# the ladder reserves, which is what lets a blocked grid arm at all.
+_BIAS_WORDS = {"both": "both", "all": "both", "2": "both", "الاثنين": "both", "كلها": "both",
+               "down": "down", "sell": "down", "short": "down", "هبوط": "down", "بيع": "down",
+               "up": "up", "buy": "up", "long": "up", "صعود": "up", "شراء": "up"}
+GRID_BIAS = _BIAS_WORDS.get(os.environ.get("GRID_BIAS", "both").strip().lower(), "both")
 # How far past the centre counts as a trend rather than a wiggle, in grid steps.
 GRID_TREND_STEPS = _f("GRID_TREND_STEPS", 3.0)
 # ...and it has to hold there this long. A single spike through three levels and straight
@@ -228,6 +239,25 @@ def whipsaw_case(lots=None, step=None, contract=None):
     return round(losing - winning, 2)
 
 
+def bias_allows(magic):
+    """Whether the standing bias lets this side be armed or refilled at all."""
+    if GRID_BIAS == "down":
+        return magic == MAGIC_GRID_SELL
+    if GRID_BIAS == "up":
+        return magic == MAGIC_GRID_BUY
+    return True
+
+
+def bias_sides():
+    """How many sides a ladder will occupy - the margin it reserves scales with this."""
+    return 2 if GRID_BIAS == "both" else 1
+
+
+def bias_text():
+    return {"down": "هبوط فقط (بيع) 🔻", "up": "صعود فقط (شراء) 🔺"}.get(
+        GRID_BIAS, "الاثنين ↔️")
+
+
 def exposure_lots(lots=None):
     """The lots that can actually be open at the same time.
 
@@ -312,6 +342,48 @@ def trend_stand_down(direction):
     if direction < 0:
         return MAGIC_GRID_BUY
     return None
+
+
+_bias_warned = 0        # the direction last warned about, so it is said once per turn
+
+
+def bias_reset():
+    global _bias_warned
+    _bias_warned = 0
+
+
+async def bias_watch(notify=None):
+    """Warn when the measured trend has turned against the direction the user pinned.
+
+    A standing bias is a judgement about the market, and markets change. Pinning "sells
+    only" during a two-day slide is sound; leaving it pinned through the reversal is how
+    a good call becomes a bad position. The bot cannot unpin it - that is the user's
+    decision - but going quiet about it would be the worst of both.
+    """
+    global _bias_warned
+    if GRID_BIAS == "both":
+        return False
+    direction = _trend["dir"]
+    against = (GRID_BIAS == "down" and direction > 0) or (GRID_BIAS == "up" and direction < 0)
+    if not against:
+        if _bias_warned and direction == 0:
+            _bias_warned = 0          # back inside the band: the warning re-arms
+        return False
+    if _bias_warned == direction:
+        return False                  # already said, and nothing has changed
+    _bias_warned = direction
+    if notify:
+        way = "صاعد" if direction > 0 else "هابط"
+        pinned = "هبوط فقط (بيع)" if GRID_BIAS == "down" else "صعود فقط (شراء)"
+        fix = "/grid up" if direction > 0 else "/grid down"
+        await notify(
+            f"🔄 *انتبه — السوق انقلب*\n"
+            f"• قياسي: الاتجاه صار *{way}* وثابت عليه\n"
+            f"• وانت مثبّت الشبكة على *{pinned}*\n"
+            f"• يعني صفقاتي الجديدة كلها بالجهة الخاسرة\n\n"
+            f"ما أغيّر قرارك لحالي. لو تريد تمشي مع السوق: `{fix}` "
+            f"أو `/grid both` للجهتين.")
+    return True
 
 
 async def trend_guard(conn, symbol, center, orders, notify=None, quote=None):
@@ -552,6 +624,8 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
+        (f"• 🎯 *اتجاه مثبّت يدوياً: {bias_text()}* — ما ينصب ولا يسدّ فجوة بالجهة الثانية"
+         if GRID_BIAS != "both" else "• ↔️ الجهتين شغالات"),
         (f"• 🧭 حارس الترند: إذا ابتعد السعر `{GRID_TREND_STEPS:g}` خطوات عن المركز وثبت "
          f"`{GRID_TREND_HOLD:g}` ثانية، يوقف الجهة اللي يدهسها ويمشي مع الحركة "
          f"(يرجّعها عند `{GRID_TREND_RELEASE:g}` خطوات)"
@@ -599,12 +673,13 @@ async def arm(conn, symbol, notify):
     # A fresh ladder is a fresh direction question: whatever was stood down was stood
     # down against the OLD centre, and keeping it would leave the new grid half-armed.
     trend_reset()
+    bias_reset()
 
     acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
     balance = float(acct.get("balance", 0) or 0)
     free = float(acct.get("freeMargin", acct.get("equity", balance)) or balance)
     leverage = float(acct.get("leverage", 500) or 500)
-    need = sum(lots) * 2 * center * GRID_CONTRACT / max(1.0, leverage)
+    need = sum(lots) * bias_sides() * center * GRID_CONTRACT / max(1.0, leverage)
     ceiling = balance * GRID_MARGIN_CEILING_PCT / 100.0
     if need > min(free, ceiling):
         return False, (f"الهامش المطلوب `{need:,.0f}$` أكبر من المسموح "
@@ -618,6 +693,8 @@ async def arm(conn, symbol, notify):
         for maker, price_at, magic, sign in (
                 (conn.create_stop_buy_order, up, MAGIC_GRID_BUY, 1),
                 (conn.create_stop_sell_order, down, MAGIC_GRID_SELL, -1)):
+            if not bias_allows(magic):
+                continue              # the user has stood this direction down by hand
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
                 await asyncio.wait_for(
@@ -635,6 +712,11 @@ async def arm(conn, symbol, notify):
                   "halted": False, "halt_reason": ""})
     save(state)
     note = f"\n⚠️ `{failed}` أمر ما انحط." if failed else ""
+    if GRID_BIAS != "both":
+        side_ar = "البيع" if GRID_BIAS == "down" else "الشراء"
+        other_ar = "الشراء" if GRID_BIAS == "down" else "البيع"
+        note += (f"\n🎯 *اتجاه واحد: {bias_text()}* — نصبت جهة {side_ar} بس، "
+                 f"وما لمست جهة {other_ar}.")
     rec = ""
     if base > round(min(GRID_BASE_LOT, GRID_MAX_LOT), 2):
         rec = (f"\n🔁 *استرداد محدود فعّال* — `{streak}` دورة خاسرة ورا بعض، "
@@ -806,6 +888,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             # centre, so it names the side that is actually losing - see trend_read.
             stood_down = await trend_guard(conn, symbol, state.get("center"), orders,
                                            notify, quote=quote)
+            await bias_watch(notify)
             if stood_down is not None:
                 orders = [o for o in orders if o.get("magic") != stood_down]
 
@@ -883,6 +966,8 @@ def status_text(balance=0.0):
         tail = (f" · اللوت الجاي `{nxt:g}`" if GRID_RECOVER and nxt > GRID_BASE_LOT
                 else " · اللوت ما يتغير (الاسترداد مطفي)" if not GRID_RECOVER else "")
         body.append(f"• 📉 دورات خاسرة ورا بعض: `{streak}`{tail}")
+    if GRID_BIAS != "both":
+        body.append(f"• 🎯 الاتجاه مثبّت على *{bias_text()}* — `/grid both` يرجّع الجهتين")
     if _trend["down"] is not None:
         side_ar = "البيع" if _trend["down"] == MAGIC_GRID_SELL else "الشراء"
         body.append(f"• 🧭 حارس الترند شغّال — جهة {side_ar} موقوفة مؤقتاً")
@@ -891,6 +976,8 @@ def status_text(balance=0.0):
                     f"`{round(GRID_BASE_LOT * 2 ** ((len(lots) - 1) // GRID_DOUBLE_EVERY), 2):g}`")
     body.append("\n`/grid on` · `/grid off` · `/grid rearm` (إعادة نصب بدون إغلاق) · "
                 "`/grid center` (مع إغلاق)")
+    body.append("🎯 الاتجاه: `/grid down` (بيع فقط) · `/grid up` (شراء فقط) · "
+                "`/grid both` (الجهتين)")
     return "\n".join(body)
 
 
@@ -1017,8 +1104,10 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
     for magic, maker, ref, sign in (
             (MAGIC_GRID_BUY, conn.create_stop_buy_order, ask, 1),
             (MAGIC_GRID_SELL, conn.create_stop_sell_order, bid, -1)):
+        if not bias_allows(magic):
+            continue                      # the user stood this direction down by hand
         if magic == skip_magic:
-            continue                      # one-way stood this side down; leave it down
+            continue                      # the trend guard stood it down; leave it down
         if room is not None and added >= room:
             break
         side_orders = [o for o in orders if o.get("magic") == magic]

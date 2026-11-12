@@ -113,6 +113,7 @@ SETTABLE_KEYS = {
     "GRID_TP_PER_TRADE": "هدف كل صفقة لحالها بالدولار (0 = مطفي)",
     "GRID_TRAIL_PCT": "ارتداد إغلاق الشبكة % من القمة (0 = فوري)",
     "GRID_TRAIL_MIN": "أقل ارتداد بالدولار قبل إغلاق الشبكة",
+    "GRID_BIAS": "اتجاه مثبّت: both أو down أو up",
     "GRID_TREND": "حارس الترند: يوقف الجهة اللي يدهسها السعر (1 أو 0)",
     "GRID_TREND_STEPS": "كم خطوة يبتعد السعر عن المركز حتى يعتبرها ترند",
     "GRID_TREND_HOLD": "كم ثانية لازم يثبت السعر قبل ما يوقف الجهة",
@@ -158,7 +159,7 @@ KEY_ALIASES = {
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
-    "trend": "GRID_TREND", "gridtrend": "GRID_TREND", "trendsteps": "GRID_TREND_STEPS",
+    "bias": "GRID_BIAS", "direction": "GRID_BIAS", "trend": "GRID_TREND", "gridtrend": "GRID_TREND", "trendsteps": "GRID_TREND_STEPS",
     "trendhold": "GRID_TREND_HOLD", "trendback": "GRID_TREND_RELEASE",
     "recover": "GRID_RECOVER", "recoverafter": "GRID_RECOVER_AFTER",
     "recoverstep": "GRID_RECOVER_STEP", "recovermax": "GRID_RECOVER_MAX",
@@ -1630,6 +1631,53 @@ async def handle_grid_command(text):
         grid.reset()
         write_env_value("GRID_ENABLED", "0")
         await send_long("🛑 أطفيت الشبكة.\n♻️ أعيد التشغيل...")
+        os._exit(0)
+    if arg in ("down", "sell", "short", "هبوط", "بيع",
+               "up", "buy", "long", "صعود", "شراء",
+               "both", "all", "الاثنين", "كلها"):
+        want = {"down": "down", "sell": "down", "short": "down", "هبوط": "down", "بيع": "down",
+                "up": "up", "buy": "up", "long": "up", "صعود": "up", "شراء": "up"}.get(arg, "both")
+        if want == grid.GRID_BIAS:
+            await send_long(f"الاتجاه مثبّت أصلاً على *{grid.bias_text()}* — ما غيّرت شي.",
+                            markup=keyboard())
+            return
+        # Pull the standing ladder first. Leaving it armed would keep the side the user
+        # just stood down filling at the broker, which is the same hole the panel switch
+        # had: the bot stops deciding, the broker keeps executing.
+        cancelled = 0
+        if connection is not None:
+            try:
+                cancelled = await grid.cancel_all(connection)
+            except Exception as e:
+                await send_long(f"⚠️ ما كدرت ألغي الأوامر القديمة: `{str(e)[:150]}`\n"
+                                "ما غيّرت الاتجاه — ألغها من المنصة وجرّب مرة ثانية.",
+                                markup=keyboard())
+                return
+        held = await grid.grid_positions(connection) if connection is not None else []
+        write_env_value("GRID_BIAS", want)
+        st = grid.load()
+        st["armed"] = False
+        st["crowded"] = False
+        st["halted"] = False
+        st["halt_reason"] = ""
+        grid.save(st)
+        label = {"down": "هبوط فقط (بيع) 🔻", "up": "صعود فقط (شراء) 🔺"}.get(want, "الاثنين ↔️")
+        lines = [f"🎯 *ثبّتت الاتجاه على: {label}*", ""]
+        if want != "both":
+            side_ar = "بيع" if want == "down" else "شراء"
+            other_ar = "الشراء" if want == "down" else "البيع"
+            lines += [f"• من الآن ما أفتح ولا صفقة {other_ar} — لا نصب ولا سدّ فجوات",
+                      f"• السلّم الجاي كله أوامر {side_ar} ويتبع السعر",
+                      "• والهامش ينص لأن جهة وحدة بس"]
+        else:
+            lines.append("• رجعت أنصب الجهتين مثل الأول")
+        lines.append(f"• ألغيت `{cancelled}` أمر معلّق")
+        if held:
+            lines += [f"• تركت `{len(held)}` صفقة مفتوحة مثل ما هي — بوقفها وتأمينها",
+                      "  (ما أغلق شي عند تغيير الاتجاه)"]
+        lines.append("\n♻️ أعيد التشغيل وأنصب من جديد...")
+        await send_long("\n".join(lines))
+        await asyncio.sleep(1.0)
         os._exit(0)
     if arg in ("rearm", "relay", "نصب", "تنصيب", "جديد"):
         # Re-lay the ladder around the current price without touching what is open. The
