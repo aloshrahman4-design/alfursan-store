@@ -267,6 +267,42 @@ The peak lives in memory, not in the state file: it belongs to one basket, dies 
 and re-establishes itself after a restart rather than carrying a stale high into a new
 cycle.
 
+### Halving a trade price has run away from
+
+The owner's rule, and the exact mirror of the martingale: when a trade is proved wrong,
+make it **smaller**. Every `HALF_DISTANCE` ($5) of adverse travel from the entry, half the
+remaining volume is closed. What is left keeps its own break-even, trail and $2 floor.
+
+The distance is measured on the price that would *close* the trade — a buy at bid, a sell
+at ask — so the spread counts against it, exactly as the broker's own P/L does.
+
+It is deliberately **not** funded out of grid profit. This is risk control, and it is
+needed precisely when the account is losing; tying it to a profit balance would switch it
+off at the moment it matters.
+
+What it costs and what it buys, on one 0.02 sell:
+
+| price travels | without halving | with halving |
+|---|---|---|
+| back to entry | $0 | **−$5** (the premium) |
+| $15 against | −$30 | −$20 |
+| $30 against | −$60 | **−$35** |
+
+So it is insurance: about $5 in the ordinary case, roughly half the damage in the bad one.
+
+**The broker's floor decides how often it can fire.** 0.01 is the smallest tradable
+volume, so a 0.02 trade halves exactly once and then stops; 0.04 stages twice. The split
+rounds *down* to the lot step, so it always closes less rather than more, and it never
+leaves a remainder under one lot step.
+
+It never touches: a winning trade, the anchor magics, a trade released to the user, or
+anything already at the floor. A failed partial close records nothing, so it is simply
+retried on the next tick rather than half-applied. `/setkey half 0` switches it off.
+
+It runs inside the grid engine, not in the protection guard. The guard's invariant is that
+it only ever tightens a stop in the user's favour and so is safe in every state; closing
+part of a position is an action, and belongs where `/pause` can stop it.
+
 ### A pinned direction (`/grid down`, `/grid up`, `/grid both`)
 
 The trend guard is a *reaction*. After every re-arm it starts from a clean slate and needs

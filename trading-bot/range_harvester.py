@@ -113,6 +113,9 @@ SETTABLE_KEYS = {
     "GRID_TP_PER_TRADE": "هدف كل صفقة لحالها بالدولار (0 = مطفي)",
     "GRID_TRAIL_PCT": "ارتداد إغلاق الشبكة % من القمة (0 = فوري)",
     "GRID_TRAIL_MIN": "أقل ارتداد بالدولار قبل إغلاق الشبكة",
+    "HALF_ENABLED": "تنصيف الصفقة المبتعدة (1 أو 0)",
+    "HALF_DISTANCE": "كم دولار يبتعد السعر حتى ينصّف الصفقة",
+    "HALF_MIN_LOT": "أصغر لوت يقبله وسيطك — ما ينقسم تحته",
     "GRID_BIAS": "اتجاه مثبّت: both أو down أو up",
     "GRID_TREND": "حارس الترند: يوقف الجهة اللي يدهسها السعر (1 أو 0)",
     "GRID_TREND_STEPS": "كم خطوة يبتعد السعر عن المركز حتى يعتبرها ترند",
@@ -159,6 +162,7 @@ KEY_ALIASES = {
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
+    "half": "HALF_ENABLED", "halfdist": "HALF_DISTANCE", "halfmin": "HALF_MIN_LOT",
     "bias": "GRID_BIAS", "direction": "GRID_BIAS", "trend": "GRID_TREND", "gridtrend": "GRID_TREND", "trendsteps": "GRID_TREND_STEPS",
     "trendhold": "GRID_TREND_HOLD", "trendback": "GRID_TREND_RELEASE",
     "recover": "GRID_RECOVER", "recoverafter": "GRID_RECOVER_AFTER",
@@ -679,7 +683,8 @@ async def handle_setkey(text, chat_id, message_id):
     if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
                "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
             or key.startswith("BE_") \
-            or key.startswith("GRID_"):
+            or key.startswith("GRID_") \
+            or key.startswith("HALF_"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. "
                         f"أعيد التشغيل الآن...{extra}")
         await asyncio.sleep(1.5 if extra else 0)   # let the warning land before the exit

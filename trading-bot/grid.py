@@ -19,6 +19,7 @@ refuses to re-arm. The second one is the account saver and it does not restart b
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 
@@ -153,6 +154,21 @@ GRID_TREND_HOLD = _f("GRID_TREND_HOLD", 60.0)
 # many steps of the centre. Without the gap, one candle either side of the threshold
 # cancels and re-places the same ladder every minute.
 GRID_TREND_RELEASE = _f("GRID_TREND_RELEASE", 1.5)
+
+# --- staged halving of a trade price has run away from -------------------------------
+# The owner's rule, and the mirror image of the martingale: when a trade is proved wrong,
+# make it SMALLER. Every HALF_DISTANCE dollars that price travels against the entry, half
+# the remaining volume is closed. What is left keeps its own break-even and trail.
+#
+# It is deliberately NOT funded by grid profit the way the cleanup cut is. This is risk
+# control, and it is needed exactly when the account is losing - tying it to a profit
+# balance would switch it off at the moment it matters.
+#
+# On a 0.02 ladder this fires once (0.02 -> 0.01) because 0.01 is the broker's minimum
+# and cannot be split. On a bigger lot it stages: 0.04 at $5, again at $10.
+HALF_ENABLED = os.environ.get("HALF_ENABLED", "1") not in ("0", "false", "no")
+HALF_DISTANCE = _f("HALF_DISTANCE", 5.0)      # dollars of adverse travel per halving
+HALF_MIN_LOT = _f("HALF_MIN_LOT", 0.01)       # the broker's smallest tradable volume
 
 # --- bounded recovery ----------------------------------------------------------------
 # The one idea worth taking from the hedge-recovery bots, with the ruin removed: after a
@@ -624,6 +640,9 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
+        (f"• ✂️ التنصيف: كل `{HALF_DISTANCE:g}$` يبتعد السعر عن صفقة خاسرة، "
+         f"يغلق نصها (لحد `{HALF_MIN_LOT:g}`)"
+         if HALF_ENABLED else "• ⚠️ التنصيف مطفي — الصفقة تبقى بحجمها مهما ابتعدت"),
         (f"• 🎯 *اتجاه مثبّت يدوياً: {bias_text()}* — ما ينصب ولا يسدّ فجوة بالجهة الثانية"
          if GRID_BIAS != "both" else "• ↔️ الجهتين شغالات"),
         (f"• 🧭 حارس الترند: إذا ابتعد السعر `{GRID_TREND_STEPS:g}` خطوات عن المركز وثبت "
@@ -674,6 +693,7 @@ async def arm(conn, symbol, notify):
     # down against the OLD centre, and keeping it would leave the new grid half-armed.
     trend_reset()
     bias_reset()
+    halves_reset()
 
     acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
     balance = float(acct.get("balance", 0) or 0)
@@ -883,6 +903,16 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             except Exception as e:
                 log.warning(f"tick has no price: {e}")
                 quote = None
+
+            # Shrink what price has run away from, before anything else looks at the
+            # book. It returns True when it closed part of a position, and then the
+            # lists above are stale, so the tick restarts rather than acting on them.
+            if quote is not None:
+                _b = float(quote.get("bid", 0) or 0)
+                _a = float(quote.get("ask", 0) or 0)
+                if _b and _a and await halve_distant(conn, positions, _b, _a, notify):
+                    await asyncio.sleep(0.2)
+                    continue
 
             # Stop feeding the side price is running over. Read off price against the
             # centre, so it names the side that is actually losing - see trend_read.
@@ -1146,6 +1176,101 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
         await notify(f"🧩 *سدّيت فجوة بالشبكة* — أضفت `{added}` أمر قرب السعر الحالي، "
                      f"الصفقات المفتوحة ما لمستها.{extra}")
     return added
+
+
+_halves = {}          # position id -> how many times it has already been halved
+
+
+def halves_reset():
+    _halves.clear()
+
+
+def adverse_distance(p, bid, ask):
+    """How far price has travelled AGAINST this position, in dollars. 0 if it is winning.
+
+    Measured on the price that would close the trade - a buy closes at bid, a sell at ask -
+    so the spread counts against it, exactly as the broker's own P/L does.
+    """
+    try:
+        entry = float(p.get("openPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not entry:
+        return 0.0
+    if p.get("type") == "POSITION_TYPE_BUY":
+        return max(0.0, entry - float(bid))
+    return max(0.0, float(ask) - entry)
+
+
+def half_volume(volume, min_lot=None):
+    """Half of `volume`, rounded DOWN to the lot step, or None if it cannot be split.
+
+    Rounding down keeps more of the trade open than rounding up would: on a split this
+    tool should err toward doing less, not more.
+    """
+    min_lot = HALF_MIN_LOT if min_lot is None else min_lot
+    try:
+        volume = float(volume)
+    except (TypeError, ValueError):
+        return None
+    if min_lot <= 0 or volume < min_lot * 2:
+        return None                   # splitting it would leave less than one lot step
+    step = min_lot
+    cut = math.floor((volume / 2.0) / step) * step
+    cut = round(cut, 2)
+    if cut < min_lot or round(volume - cut, 2) < min_lot:
+        return None
+    return cut
+
+
+async def halve_distant(conn, positions, bid, ask, notify=None):
+    """Close half of any losing grid trade price has run HALF_DISTANCE against.
+
+    Acts on at most ONE position per call and returns True when it did, so the caller can
+    re-read the book instead of working from a list that is now wrong.
+    """
+    if not (HALF_ENABLED and HALF_DISTANCE > 0):
+        return False
+    if not hasattr(conn, "close_position_partially"):
+        return False
+    live = {p.get("id") for p in positions}
+    for gone in [k for k in _halves if k not in live]:
+        _halves.pop(gone, None)
+    for p in positions:
+        try:
+            profit = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if profit >= 0:
+            continue                  # never cut a winner down
+        pid = p.get("id")
+        done = _halves.get(pid, 0)
+        dist = adverse_distance(p, bid, ask)
+        if dist < HALF_DISTANCE * (done + 1):
+            continue                  # not another whole step away yet
+        cut = half_volume(p.get("volume"))
+        if cut is None:
+            continue                  # already at the smallest tradable size
+        try:
+            await asyncio.wait_for(
+                conn.close_position_partially(pid, cut), timeout=8.0)
+        except Exception as e:
+            log.warning(f"could not halve {pid}: {e}")
+            continue                  # nothing recorded, so it is retried next tick
+        _halves[pid] = done + 1
+        left = round(float(p.get("volume", 0) or 0) - cut, 2)
+        booked = round(profit * (cut / float(p.get("volume", 1) or 1)), 2)
+        if notify:
+            side = "شراء" if p.get("type") == "POSITION_TYPE_BUY" else "بيع"
+            tail = ("" if half_volume(left) else
+                    "\n• وصلت أصغر حجم — ما تنقسم بعد")
+            await notify(
+                f"✂️ *نصّفت صفقة مبتعدة*\n"
+                f"• {side} من `{p.get('openPrice')}` — ابتعد عنها السعر `{dist:.2f}$`\n"
+                f"• أغلقت `{cut:g}` بـ`{booked:g}$` · باقي `{left:g}`\n"
+                f"• مخاطرتها انقصّت للنص{tail}")
+        return True
+    return False
 
 
 _be_peaks = {}        # best profit each secured position has shown; dies with the position

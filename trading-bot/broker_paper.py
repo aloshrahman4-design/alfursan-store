@@ -165,6 +165,30 @@ class PaperBroker:
     async def create_market_sell_order(self, symbol=None, volume=None, options=None):
         return await self._open("SELL", volume, options)
 
+    async def close_position_partially(self, position_id, volume, options=None):
+        """Book part of a position and shrink what stays open, keeping the same id."""
+        state = _load()
+        price = await self._mid()
+        for p in state["positions"]:
+            if p["id"] != position_id:
+                continue
+            vol = float(p.get("volume", 0) or 0)
+            cut = round(min(float(volume), vol), 2)
+            left = round(vol - cut, 2)
+            if cut <= 0 or left < 0:
+                raise RuntimeError("invalid partial volume")
+            if left == 0:
+                return await self.close_position(position_id)
+            booked = round(profit_of(p, price) * (cut / vol), 2)
+            p["volume"] = left
+            state["balance"] = round(state.get("balance", 0.0) + booked, 2)
+            state.setdefault("closed", []).append(
+                {"id": p["id"], "volume": cut, "profit": booked, "partial": True})
+            _save(state)
+            log.info(f"paper partial close {position_id}: {cut} booked {booked}")
+            return {"orderId": p["id"], "volume": cut, "profit": booked}
+        raise RuntimeError(f"no such position {position_id}")
+
     async def close_position(self, position_id):
         state = _load()
         pos = next((p for p in state["positions"] if p["id"] == str(position_id)), None)
