@@ -92,6 +92,69 @@ TICK_SECS_METERED = _f("TICK_SECS_METERED", 15.0)
 # So a quota refusal puts all reads to sleep for a while instead of retrying at tick rate.
 QUOTA_COOLDOWN_SECS = _f("QUOTA_COOLDOWN_SECS", 300.0)
 _quota = {"until": 0.0, "hits": 0, "last": ""}
+# A pending order at the broker fills BY ITSELF, with no request from us. Managing what
+# it opens needs reads - price, positions - and those are exactly what a quota refusal
+# blocks. So a blind bot is a one-way valve: trades keep opening and nothing ever closes.
+# If we cannot see for this long, we pull every order we placed. Cancelling is a trade
+# operation on its own budget, and the ids come from our own record, so it needs no read.
+BLIND_SECS = _f("BLIND_SECS", 120.0)
+_reads = {"ok": 0.0}
+_blind = {"cut": False}
+
+
+def note_read_ok():
+    _reads["ok"] = time.time()
+    _blind["cut"] = False
+
+
+def blind_for():
+    """Seconds since the last read that actually worked."""
+    if not _reads["ok"]:
+        _reads["ok"] = time.time()
+    return max(0.0, time.time() - _reads["ok"])
+
+
+def remember_order(order_id):
+    if not order_id:
+        return
+    st = load()
+    ids = st.setdefault("pending_ids", [])
+    if order_id not in ids:
+        ids.append(order_id)
+        save(st)
+
+
+def forget_orders():
+    st = load()
+    if st.get("pending_ids"):
+        st["pending_ids"] = []
+        save(st)
+
+
+async def cancel_known(conn, notify=None):
+    """Cancel every order we recorded placing. Uses no read, so it works while blind."""
+    ids = list(load().get("pending_ids", []))
+    if not ids:
+        return 0
+    killed = 0
+    for oid in ids:
+        try:
+            await asyncio.wait_for(conn.cancel_order(oid), timeout=8.0)
+            killed += 1
+        except Exception as e:
+            # Already filled or already gone is the common case and not a problem.
+            log.info(f"blind cancel of {oid}: {e}")
+    forget_orders()
+    if notify:
+        await notify(
+            f"🕶 *ما أكدر أشوف السوق — سحبت أوامري*\n"
+            f"• صار `{blind_for()/60:.0f}` دقيقة وأنا ما أقدر أقرأ السعر ولا الصفقات\n"
+            f"• الأمر المعلّق ينفتح لحاله عند الوسيط حتى لو أنا أعمى — "
+            f"يعني تنفتح صفقات وما أكدر أتابعها ولا أغلقها\n"
+            f"• فألغيت `{killed}` أمر من `{len(ids)}` حتى ما يزيد تعرّضك\n"
+            f"• الصفقات المفتوحة ما لمستها — هي عند الوسيط بوقفها\n"
+            f"• أرجع أنصب لحالي أول ما أرجع أشوف")
+    return killed
 
 
 def is_quota_error(err):
@@ -527,7 +590,7 @@ def loss_limit(balance=0.0):
 def _blank():
     return {"armed": False, "center": None, "armed_at": 0, "cycles": 0,
             "realized": 0.0, "halted": False, "halt_reason": "", "released": [],
-            "loss_streak": 0}
+            "loss_streak": 0, "pending_ids": []}
 
 
 def load():
@@ -537,6 +600,7 @@ def load():
             state.update(json.load(f))
             state.setdefault("released", [])
             state.setdefault("loss_streak", 0)
+            state.setdefault("pending_ids", [])
             return state
     except Exception:
         return _blank()
@@ -573,6 +637,7 @@ async def grid_positions(conn, exclude=None):
     """Grid trades the bot still owns. Released ones are the user's and stay invisible."""
     exclude = set(exclude if exclude is not None else load().get("released", []))
     pos = await asyncio.wait_for(conn.get_positions(), timeout=6.0)
+    note_read_ok()
     return [p for p in pos if p.get("magic") in MAGICS and p.get("id") not in exclude]
 
 
@@ -649,7 +714,7 @@ async def grid_orders(conn):
     return [o for o in orders if o.get("magic") in MAGICS]
 
 
-async def cancel_all(conn):
+async def cancel_all(conn):   # noqa: D401 - the record is cleared with the orders
     cancelled = 0
     for o in await grid_orders(conn):
         try:
@@ -657,6 +722,7 @@ async def cancel_all(conn):
             cancelled += 1
         except Exception as e:
             log.warning(f"could not cancel {o.get('id')}: {e}")
+    forget_orders()
     return cancelled
 
 
@@ -781,9 +847,10 @@ async def arm(conn, symbol, notify):
                 continue              # the user has stood this direction down by hand
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
-                await asyncio.wait_for(
+                res = await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
                           take_profit=tp, options={"magic": magic}), timeout=8.0)
+                remember_order((res or {}).get("orderId"))
                 placed += 1
             except Exception as e:
                 failed += 1
@@ -845,6 +912,13 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 continue
             global _last_conn
             _last_conn = conn
+            # Blind for too long? Pull the orders before they open anything else.
+            if not reads_free(conn) and blind_for() > BLIND_SECS and not _blind["cut"]:
+                _blind["cut"] = True
+                try:
+                    await cancel_known(conn, notify)
+                except Exception as e:
+                    log.warning(f"blind cancel failed: {e}")
             wait = cooling_down()
             if wait and not reads_free(conn):
                 await asyncio.sleep(min(wait, 30.0))
@@ -1241,10 +1315,11 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
                 log.warning(f"could not recycle {furthest.get('id')}: {e}")
                 continue
         try:
-            await asyncio.wait_for(
+            res = await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
                       take_profit=round(at + sign * dist, 2) if dist else None,
                       options={"magic": magic}), timeout=8.0)
+            remember_order((res or {}).get("orderId"))
             added += 1
             log.info(f"refilled {'buy' if sign > 0 else 'sell'} level at {at}")
         except Exception as e:

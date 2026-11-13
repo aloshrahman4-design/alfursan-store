@@ -538,6 +538,30 @@ fallback — where it keeps spending and never earns its way back. `ensure_conne
 therefore timestamps the fallback and retries streaming every `STREAM_RETRY_SECS` (15
 min), tearing the old connection down first.
 
+### A blind bot is a one-way valve
+
+The user's own words: *"the bot keeps opening trades but doesn't follow them and close
+them."* That is exactly right, and it is the most dangerous thing in this whole episode.
+
+- **Opening is passive.** A pending order sits at the broker and fills by itself. It costs
+  us nothing and happens whether or not the bot can see.
+- **Closing is active.** Harvesting, trailing, break-even, the basket stop — every one of
+  them needs to read a price and a position list, and those are precisely what a quota
+  refusal blocks.
+
+So a blind bot keeps accumulating positions and never closes one. With the basket stop
+switched off (the owner had set `GRID_MAX_LOSS` to 99999 to take manual control) there is
+nothing left to stop it at all.
+
+The fix is a dead man's switch. `arm()` and `refill_gaps()` record every order id they
+place into `pending_ids`; if no read has succeeded for `BLIND_SECS` (2 min),
+`cancel_known()` cancels all of them **from that record**, so it needs no read to work —
+and cancelling is a trade operation on its own budget, which is why it still goes through
+when the read methods are refused.
+
+It fires once, never touches an open position, and re-arms itself the moment a read
+succeeds.
+
 ### Backing off when the broker says to wait
 
 A later `/check` showed all three reads refused, not just one. The worst response to

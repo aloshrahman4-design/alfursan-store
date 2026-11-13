@@ -1918,6 +1918,7 @@ async def protect_engine():
                 await asyncio.sleep(min(wait, 30.0))
                 continue
             price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=6.0)
+            grid.note_read_ok()
             bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
             if not bid or not ask:
                 await asyncio.sleep(2 if reads_are_free() else RPC_TICK_SECS)
