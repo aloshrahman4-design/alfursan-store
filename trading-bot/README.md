@@ -530,6 +530,22 @@ dropped when it closes, and stale ids are swept each tick against what is actual
 The anchor price still comes from the newest trade, which is what the re-entry logic means
 by "the anchor".
 
+## A hard stop on the order, for the hedge side only
+
+*"Any sell that reverses a dollar, close it — so if price rises we are not left holding
+hanging sells. Only for this period, while we are targeting the sell side."*
+
+That is not the per-trade stop he turned down earlier, and the difference is the reason.
+He is already deep on one side. The hedge is meant to work quickly or be cut; what he
+does not want is a second pile of stranded trades on top of the first.
+
+`GRID_STOP_DIST` is written onto the order at placement, so the **broker** holds it: no
+polling, and it fires while the API is throttled. A sell's stop sits above its entry, a
+buy's below.
+
+It is never applied to a position that is already open. Writing a $1 stop onto trades
+sitting $20 under water would shut them all at once, and nothing he asked for means that.
+
 ## Give the rule to the server, stop polling for it
 
 Everything else in this file protects a trade by **looking** at it: read the price, read

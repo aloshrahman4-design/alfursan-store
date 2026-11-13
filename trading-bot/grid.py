@@ -829,6 +829,9 @@ def plan_text(balance=0.0):
            f"(وما أقل من `{GRID_TRAIL_MIN:g}$` حتى ما يغلق على ضجيج)" if GRID_TRAIL_PCT > 0
            else "يغلق فوراً عند الهدف"),
         f"• وقف الشبكة: `-{limit:g}$`",
+        (f"• 🔪 *وقف ثابت `{GRID_STOP_DIST:g}$` على كل أمر جديد* — تنحط عند الوسيط لحظة "
+         f"الفتح، وما تُطبّق أبداً على صفقة مفتوحة من قبل"
+         if GRID_STOP_DIST > 0 else "• ماكو وقف ثابت — الصفقة تمشي لحد ما تقرر انت"),
         (f"• ✂️ التنصيف: كل `{HALF_DISTANCE:g}$` يبتعد السعر عن صفقة خاسرة، "
          f"يغلق نصها (لحد `{HALF_MIN_LOT:g}`)"
          if HALF_ENABLED else "• ⚠️ التنصيف مطفي — الصفقة تبقى بحجمها مهما ابتعدت"),
@@ -918,6 +921,7 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
                     opts["trailingStopLoss"] = _tsl   # protected from the first tick
                 res = await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
+                          stop_loss=entry_stop(price_at, sign > 0),
                           take_profit=tp, options=opts), timeout=8.0)
                 remember_order((res or {}).get("orderId"))
                 placed += 1
@@ -1501,6 +1505,7 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
                 _opts["trailingStopLoss"] = _tsl
             res = await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
+                      stop_loss=entry_stop(at, sign > 0),
                       take_profit=round(at + sign * dist, 2) if dist else None,
                       options=_opts), timeout=8.0)
             remember_order((res or {}).get("orderId"))
@@ -1669,6 +1674,26 @@ async def broker_stop_gap(conn, symbol):
 # RELATIVE_CURRENCY means the numbers are DOLLARS of profit, not price - so one config
 # is correct at 0.01 lots and at 0.05 lots with no arithmetic on our side.
 SERVER_TRAIL = os.environ.get("SERVER_TRAIL", "1") not in ("0", "false", "no")
+
+# A hard stop, in DOLLARS OF PRICE, written onto the order when it is placed. 0 = none.
+#
+# The owner asked for this with a reason worth recording: he is already deep on one side
+# and does not want the hedge turning into a second pile of stranded trades. A sell that
+# does not work within a dollar is to be cut, not carried. That is a different thing from
+# the per-trade stop he turned down earlier, which would have been applied to everything.
+#
+# Two properties matter. It goes on the ORDER, so the broker holds it - no polling, works
+# while the API is throttled. And it is NEVER applied to a position that is already open:
+# writing a $1 stop onto trades that are $20 under water would shut them all at once, and
+# nothing he has asked for means that.
+GRID_STOP_DIST = _f("GRID_STOP_DIST", 0.0)
+
+
+def entry_stop(price_at, is_buy):
+    """The protective stop for a new order at `price_at`, or None when switched off."""
+    if GRID_STOP_DIST <= 0:
+        return None
+    return round(price_at - GRID_STOP_DIST, 2) if is_buy else round(price_at + GRID_STOP_DIST, 2)
 
 
 def server_trail():
