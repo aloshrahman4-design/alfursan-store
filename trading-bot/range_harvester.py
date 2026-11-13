@@ -71,6 +71,8 @@ STREAM_ONLY = os.environ.get("STREAM_ONLY", "1") not in ("0", "false", "no")
 # ...but not for ever. After this many failed handshakes, run metered rather than dead.
 STREAM_GIVEUP_TRIES = int(os.environ.get("STREAM_GIVEUP_TRIES", "6"))
 stream_fails = 0
+stream_giveup_said = False
+last_stream_try = 0.0
 rpc_since = 0.0
 # How long after boot a missing connection is still "connecting" rather than "broken".
 BOOT_GRACE_SECS = float(os.environ.get("BOOT_GRACE_SECS", "90"))
@@ -1186,7 +1188,7 @@ async def ensure_connection():
     # rpc_since is read at the top of the loop and written further down, so the
     # declaration belongs here - a `global` after the first read is a SyntaxError.
     global connection, account_instance, api_instance, last_price_ok, rpc_since
-    global stream_fails
+    global stream_fails, stream_giveup_said, last_stream_try
     fail_streak, hinted = 0, None
     while True:
         try:
@@ -1251,7 +1253,13 @@ async def ensure_connection():
             # bot off the air. RPC stays as the fallback, and the engines slow right
             # down when they are on it, because there every read is metered.
             conn = None
-            if STREAM_READS:
+            # Once we have given up and are running metered, the handshake must still be
+            # retried - but on the same 15-minute clock, not on every pass of this loop.
+            # Without this the give-up path tried it again every few seconds, spending
+            # the very credits it was waiting to get back.
+            due = (not stream_fails) or (time.time() - last_stream_try >= STREAM_RETRY_SECS)
+            if STREAM_READS and due:
+                last_stream_try = time.time()
                 try:
                     stream = account_instance.get_streaming_connection()
                     await stream.connect()
@@ -1279,13 +1287,21 @@ async def ensure_connection():
                                 "• لو تريد تأمين فوري حط ستوب يدوي من MT5")
                         await asyncio.sleep(STREAM_RETRY_SECS)
                         continue
-                    if STREAM_ONLY:
+                    # Giving up on streaming for now. This branch had no `continue` and
+                    # no sleep, so the loop came straight back, failed again, and sent
+                    # the same notice - 24 of them in fifteen minutes. Say it ONCE, and
+                    # never let a failure path run without a wait in it.
+                    if STREAM_ONLY and not stream_giveup_said:
+                        stream_giveup_said = True
                         await notify(
                             f"⚠️ فشلت القناة المجانية `{stream_fails}` مرات — "
-                            "راح أشتغل على المدفوعة بأبطأ وتيرة ممكنة.\n"
+                            "راح أشتغل على المدفوعة بأبطأ وتيرة ممكنة، "
+                            f"وأبقى أجرّب المجانية كل `{STREAM_RETRY_SECS/60:.0f}` "
+                            "دقيقة بالسكوت.\n"
                             "`/setkey streamonly 0` يوقف هذا الانتظار نهائياً.")
                 else:
                     stream_fails = 0
+                    stream_giveup_said = False
             if conn is None:
                 conn = account_instance.get_rpc_connection()
                 await conn.connect()
