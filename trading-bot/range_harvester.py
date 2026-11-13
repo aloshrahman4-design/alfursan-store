@@ -64,6 +64,9 @@ DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
 # for ever, still spending, never recovering.
 STREAM_RETRY_SECS = float(os.environ.get("STREAM_RETRY_SECS", "900"))
 rpc_since = 0.0
+# How long after boot a missing connection is still "connecting" rather than "broken".
+BOOT_GRACE_SECS = float(os.environ.get("BOOT_GRACE_SECS", "90"))
+started_at = time.time()
 # Read positions and prices from MetaApi's streamed local cache instead of polling the
 # metered API. Off only as an escape hatch if a broker's stream misbehaves.
 STREAM_READS = os.environ.get("STREAM_READS", "1") not in ("0", "false", "no")
@@ -414,7 +417,15 @@ async def broker_check():
     """One place that answers 'is the bot actually able to trade right now?'"""
     lines = [f"🔎 *فحص الاتصال* — المنصة: `{BROKER}`"]
     if connection is None:
-        lines.append("❌ ماكو اتصال حالياً.")
+        # A restart takes a few seconds to reconnect, and /check sent inside that window
+        # answered with a hard X one line under "تم الاتصال بنجاح". That reads like a
+        # failure when it is just the handshake still running, so say which it is.
+        booting = (time.time() - started_at) < BOOT_GRACE_SECS and not last_connection_error
+        if booting:
+            lines.append("⏳ جاري الاتصال — البوت لسه يشبّك بعد إعادة التشغيل.\n"
+                         "أرسل `/check` بعد لحظات.")
+        else:
+            lines.append("❌ ماكو اتصال حالياً.")
         if last_connection_error:
             # the MetaApi billing advice only makes sense while MetaApi is the platform
             hint = billing_hint(last_connection_error) if BROKER == "metaapi" else None
@@ -450,9 +461,25 @@ async def broker_check():
         lines.append("⚠️ *بعض القراءات فشلت:*")
         for e in read_errors:
             lines.append(f"• {e}")
-        if any("cpu credits" in e for e in read_errors):
-            lines.append("• 💡 هذي حصة MetaApi انتهت — تتجدد خلال 6 ساعات، "
-                         "والبوت صار يقرأ من البث المجاني أول ما يقدر يتزامن.")
+        if any(grid is not None and grid.is_quota_error(e) for e in read_errors):
+            lines.append("• 💡 حصة MetaApi انتهت. تتجدد على نافذة 6 ساعات متحركة.")
+            lines.append("• البوت وقّف استعلاماته حتى ما يطوّل الانتظار — كل طلب مرفوض "
+                         "يحسب عليك بعد.")
+            lines.append("• ويجرّب البث المجاني كل ربع ساعة؛ أول ما ينجح تخلص المشكلة "
+                         "نهائياً.")
+    if grid is not None:
+        note = grid.quota_note()
+        if note:
+            lines.append(note)
+    if len(read_errors) == 3:
+        # Saying "the connection works" over three None values is worse than useless:
+        # it sends the user looking for a trading problem that does not exist.
+        lines.append("❌ *ما كدرت أقرأ ولا شي من الوسيط* — ماكو أرقام أعرضها.")
+        lines.append("• الصفقات المفتوحة بأمان عند الوسيط، بس أنا ما أشوفها الآن.")
+        lines.append("• لو تريد تأمين فوري، حط ستوب يدوي من MT5 — أحترمه وما ألمسه.")
+        if datafeed:
+            lines.append(f"• {datafeed.calibration_line()}")
+        return "\n".join(lines)
     try:
         ours = [p for p in pos if p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
         gridded = [p for p in pos if grid is not None and p.get("magic") in grid.MAGICS]
@@ -1886,6 +1913,10 @@ async def protect_engine():
             if not (connection and getattr(grid, "BE_ENABLED", False)):
                 await asyncio.sleep(3)
                 continue
+            wait = grid.cooling_down()
+            if wait and not reads_are_free():
+                await asyncio.sleep(min(wait, 30.0))
+                continue
             price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=6.0)
             bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
             if not bid or not ask:
@@ -1913,6 +1944,9 @@ async def protect_engine():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if grid is not None and grid.note_api_error(e):
+                await asyncio.sleep(10)
+                continue
             log.warning(f"protect pass failed: {e}")
             await asyncio.sleep(5)
 

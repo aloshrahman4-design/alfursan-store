@@ -87,6 +87,48 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
 # How long a tick waits when every read is billed by the broker's API.
 TICK_SECS_METERED = _f("TICK_SECS_METERED", 15.0)
+# When the broker answers "you have spent your quota, wait", the worst thing to do is
+# keep asking: every refused call still counts against the window it is waiting to clear.
+# So a quota refusal puts all reads to sleep for a while instead of retrying at tick rate.
+QUOTA_COOLDOWN_SECS = _f("QUOTA_COOLDOWN_SECS", 300.0)
+_quota = {"until": 0.0, "hits": 0, "last": ""}
+
+
+def is_quota_error(err):
+    text = str(err or "").lower()
+    return ("cpu credits" in text or "rate limit" in text
+            or "too many requests" in text or "429" in text)
+
+
+def note_api_error(err):
+    """Returns True when this was the broker refusing on quota, and starts the wait."""
+    if not is_quota_error(err):
+        return False
+    _quota["until"] = time.time() + QUOTA_COOLDOWN_SECS
+    _quota["hits"] += 1
+    _quota["last"] = str(err)[:200]
+    log.warning(f"quota refusal #{_quota['hits']}: holding off reads for "
+                f"{QUOTA_COOLDOWN_SECS:.0f}s")
+    return True
+
+
+def cooling_down():
+    """Seconds still to wait before it is worth asking the broker anything."""
+    return max(0.0, _quota["until"] - time.time())
+
+
+def quota_note():
+    if not _quota["hits"]:
+        return ""
+    left = cooling_down()
+    if left:
+        return (f"⏸ *متوقف مؤقتاً عن الاستعلام* — الوسيط رفض `{_quota['hits']}` مرة "
+                f"لتجاوز الحصة. أعيد المحاولة بعد `{left/60:.0f}` دقيقة.")
+    return f"• تجاوزنا الحصة `{_quota['hits']}` مرة من آخر تشغيل — الاستعلام شغال الآن."
+
+
+def quota_clear():
+    _quota.update({"until": 0.0, "hits": 0, "last": ""})
 
 
 def reads_free(conn=None):
@@ -803,6 +845,10 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 continue
             global _last_conn
             _last_conn = conn
+            wait = cooling_down()
+            if wait and not reads_free(conn):
+                await asyncio.sleep(min(wait, 30.0))
+                continue
             if not hasattr(conn, "create_stop_buy_order"):
                 if not warned_unsupported:
                     warned_unsupported = True
@@ -997,6 +1043,10 @@ async def grid_engine(get_conn, symbol, notify, is_active):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if note_api_error(e):
+                log.warning("grid engine paused on a quota refusal")
+                await asyncio.sleep(10)
+                continue
             log.error(f"grid engine error: {e}", exc_info=True)
             await asyncio.sleep(5)
 

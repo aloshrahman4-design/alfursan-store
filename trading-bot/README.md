@@ -538,6 +538,18 @@ fallback — where it keeps spending and never earns its way back. `ensure_conne
 therefore timestamps the fallback and retries streaming every `STREAM_RETRY_SECS` (15
 min), tearing the old connection down first.
 
+### Backing off when the broker says to wait
+
+A later `/check` showed all three reads refused, not just one. The worst response to
+"you have spent your quota, wait" is to keep asking at tick rate: every refused call
+still counts against the window it is waiting to clear, so the bot can hold itself
+outside indefinitely.
+
+`note_api_error()` recognises a quota refusal and puts reads to sleep for
+`QUOTA_COOLDOWN_SECS` (5 min); both loops check `cooling_down()` before asking and
+treat a refusal as a pause rather than a crash. It applies only on the metered path —
+there is nothing to ration when reads are streamed.
+
 ### /check lost everything to one throttled read
 
 The three reads shared a single `try`, so when `getAccountInformation` alone was throttled
@@ -546,6 +558,12 @@ disappeared behind one error message, and the only question that mattered ("is a
 working?") went unanswered. They are read independently now, each failure is listed, a
 quota error is explained in plain words, and the first line of `/check` says whether reads
 are streamed or metered.
+
+It also stopped lying. With all three reads refused it still printed "✅ الاتصال شغال"
+over `None` for the balance, `None` for the price and zero positions — which sends the
+user hunting for a trading problem that does not exist. When nothing could be read it now
+says so, adds that the open trades are still safe at the broker, and points at the manual
+stop in MT5 as the way to protect them meanwhile.
 
 The lesson, and it is not the first time in this file: **a per-tick API call is a budget,
 not a free action.** The earlier version of it was eleven reconnects in twenty minutes
