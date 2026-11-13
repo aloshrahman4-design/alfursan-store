@@ -117,6 +117,7 @@ BLIND_SECS = _f("BLIND_SECS", 120.0)
 _reads = {"ok": 0.0}
 _blind = {"cut": False}
 _brake_said = 0.0
+_stranded_said = 0.0   # last "winner I cannot close" warning
 
 
 def note_read_ok():
@@ -535,9 +536,10 @@ def notices_reset():
     2:51 decided not to arm and said nothing, because the same notice had gone out at
     2:39. From his side the bot simply ignored him. Anything he types resets this.
     """
-    global _brake_said, _blocked_at
+    global _brake_said, _blocked_at, _stranded_said
     _brake_said = 0.0
     _blocked_at = 0.0
+    _stranded_said = 0.0
 
 
 async def bias_watch(notify=None):
@@ -727,6 +729,54 @@ def release(positions):
 
 def pnl(positions):
     return round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0) for p in positions), 2)
+
+
+async def ensure_entry_stops(conn, positions, bid, ask, notify=None):
+    """Put the hard stop on open trades that do not have one - where it is still safe.
+
+    Writing it only onto new orders left every trade opened before the setting with no
+    stop at all, which is what the owner saw: price reversed a dollar on a sell and
+    nothing happened, because that sell predated the rule.
+
+    The one case this must never do is apply a $1 stop to a trade that is already $20
+    the wrong way: that is not a stop, it is an instant close at the worst price. So a
+    position whose current price has already passed where the stop would sit is left
+    alone and reported, not silently shut.
+    """
+    if GRID_STOP_DIST <= 0 or not hasattr(conn, "modify_position"):
+        return 0
+    placed, skipped = 0, []
+    for p in positions:
+        if p.get("magic") not in (MAGIC_GRID_BUY, MAGIC_GRID_SELL):
+            continue          # anchors are the owner's, never the engine's to stop
+        is_buy = p.get("type") == "POSITION_TYPE_BUY"
+        entry = float(p.get("openPrice", 0) or 0)
+        if not entry:
+            continue
+        if has_protective_stop(p, max(0.0, float(ask) - float(bid))) or p.get("stopLoss"):
+            continue
+        want = entry_stop(entry, is_buy)
+        if want is None:
+            continue
+        # Already past it? Then this is a close, not a stop. Leave it to the user.
+        now = float(bid) if is_buy else float(ask)
+        if (is_buy and now <= want) or (not is_buy and now >= want):
+            skipped.append((p.get("id"), round((now - entry) * (1 if is_buy else -1), 2)))
+            continue
+        try:
+            await asyncio.wait_for(conn.modify_position(p["id"], stop_loss=want), timeout=8.0)
+            placed += 1
+        except Exception as e:
+            log.warning(f"entry stop refused on {p.get('id')}: {e}")
+    if notify and (placed or skipped):
+        lines = []
+        if placed:
+            lines.append(f"🔪 *حطيت وقف `{GRID_STOP_DIST:g}$` على `{placed}` صفقة مفتوحة*")
+        if skipped:
+            lines.append(f"• `{len(skipped)}` صفقة تجاوزت الوقف من زمان — ما حطيته عليها، "
+                         f"لأن معناه إغلاق فوري بأسوأ سعر مو حماية")
+        await notify("\n".join(lines))
+    return placed
 
 
 async def ensure_take_profits(conn, positions, notify=None):
@@ -1174,6 +1224,24 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 if here >= GRID_TP_CASH and here <= round(peaks[name] - give_back, 2):
                     taken = (name, group, other, peaks[name])
                     break
+
+            # A winner nobody can take. With side-harvest off the exit is the BASKET's
+            # net, so one trade at +$8 inside a basket at -$1900 can never be closed by
+            # any rule - it just sits there. He watched exactly that happen. Say it.
+            if (GRID_TP_PER_TRADE <= 0 and floating < 0 and not GRID_SIDE_HARVEST
+                    and any(float(p.get("unrealizedProfit", 0) or 0) >= GRID_TP_CASH
+                            for p in positions)):
+                global _stranded_said
+                if time.time() - _stranded_said > BLOCKED_NOTE_SECS:
+                    _stranded_said = time.time()
+                    await notify(
+                        f"⚠️ *عندك صفقة رابحة ما أقدر أغلقها*\n"
+                        f"• الحصاد مضبوط على *مجموع الشبكة* (`{floating:g}$`) مو على "
+                        f"الصفقة، والمجموع ما راح يوصل `+{GRID_TP_CASH:g}$`\n"
+                        f"• وماكو هدف لكل صفقة (`GRID_TP_PER_TRADE` = 0)\n"
+                        f"• يعني الرابحة رهينة الخاسرات\n"
+                        f"• الحل: `/setkey gridtpone {GRID_TP_CASH:g}` — كل صفقة تاخذ "
+                        f"هدفها عند الوسيط وتنغلق لحالها")
 
             if taken:
                 name, group, other, rode = taken

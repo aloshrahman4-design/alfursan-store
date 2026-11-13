@@ -2062,6 +2062,7 @@ async def protect_engine():
                 # Hand the rule to MetaApi first. Once a position carries it, its
                 # protection no longer depends on this loop running at all.
                 await grid.ensure_server_trail(connection, mine, notify)
+                await grid.ensure_entry_stops(connection, mine, bid, ask, notify)
                 gap_floor = await grid.broker_stop_gap(connection, SYMBOL)
                 await grid.apply_breakeven(connection, mine, bid, ask, notify, "",
                                            gap_floor=gap_floor)
