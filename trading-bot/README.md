@@ -530,6 +530,22 @@ needs is safe against a local cache, and `TICK_SECS_METERED` (15s) applies when 
 `PaperBroker` declares `streaming = True` because its reads are a local file — without
 that, demo mode would crawl at 15 seconds a look and a $2 grid cannot work that way.
 
+### Refusing the metered path at all
+
+Retrying streaming every 15 minutes was not enough, because in between the bot kept
+running on RPC — and that is what keeps the quota empty, which is what stops the
+handshake from succeeding. The bot was feeding the loop it was trying to leave.
+
+`STREAM_ONLY` (on by default) makes a failed handshake **wait** instead of falling back.
+Waiting costs nothing and lets the window clear; running metered costs credits and does
+not work. It is the better failure. The bot says so once, notes that open trades at the
+broker are unaffected, and points at a manual stop in MT5 for anyone who wants cover
+right now.
+
+It is not stubborn about it: after `STREAM_GIVEUP_TRIES` (6, so about 90 minutes) it
+runs metered rather than stay dead, and says which it is doing. `/setkey streamonly 0`
+turns the waiting off for good.
+
 ### Getting back off the metered path
 
 Streaming has to synchronize once, and that synchronization itself costs credits. So when

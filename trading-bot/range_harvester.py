@@ -63,6 +63,14 @@ DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
 # exhausted the first attempt fails and the bot would otherwise stay on the metered path
 # for ever, still spending, never recovering.
 STREAM_RETRY_SECS = float(os.environ.get("STREAM_RETRY_SECS", "900"))
+# Refuse to run on metered reads. The RPC path is what drained the quota, and once the
+# quota is gone the streaming handshake cannot get through either - so falling back to
+# RPC keeps the bot blind AND keeps it spending, which is the loop it cannot leave.
+# Waiting costs nothing and lets the window clear, so waiting is the better failure.
+STREAM_ONLY = os.environ.get("STREAM_ONLY", "1") not in ("0", "false", "no")
+# ...but not for ever. After this many failed handshakes, run metered rather than dead.
+STREAM_GIVEUP_TRIES = int(os.environ.get("STREAM_GIVEUP_TRIES", "6"))
+stream_fails = 0
 rpc_since = 0.0
 # How long after boot a missing connection is still "connecting" rather than "broken".
 BOOT_GRACE_SECS = float(os.environ.get("BOOT_GRACE_SECS", "90"))
@@ -145,6 +153,8 @@ SETTABLE_KEYS = {
     "BE_LOCK_CASH": "الربح المضمون بعد التأمين",
     "BE_TRAIL_CASH": "كم يتبع الوقف خلف القمة بالدولار",
     "BE_FLOOR_CASH": "الربح اللي ما ينزل الوقف تحته بعد ما يعبره",
+    "STREAM_ONLY": "يرفض القناة المدفوعة وينتظر المجانية (1 أو 0)",
+    "STREAM_RETRY_SECS": "كم ثانية ينتظر قبل ما يعيد محاولة القناة المجانية",
     "BE_MIN_GAP": "هامش أمان فوق مسافة الوسيط",
     "BE_SOFT": "حراسة برمجية قبل ما ينفع الستوب (1 أو 0)",
     "BE_SOFT_EXIT": "الربح اللي عنده يغلقها بالحراسة البرمجية",
@@ -176,7 +186,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
     "half": "HALF_ENABLED", "halfdist": "HALF_DISTANCE", "halfmin": "HALF_MIN_LOT",
@@ -457,6 +467,10 @@ async def broker_check():
     read_errors = [e for e in (e1, e2, e3) if e]
     lines.append("📡 القراءة: " + ("*بث مباشر* — مجانية ✅" if reads_are_free()
                  else "*استعلام مدفوع* — محدودة بحصة ⚠️"))
+    if stream_fails:
+        lines.append(f"• حاولت أفتح القناة المجانية `{stream_fails}` مرة وما نجحت بعد"
+                     + (" — أعيد المحاولة كل "
+                        f"`{STREAM_RETRY_SECS/60:.0f}` دقيقة" if STREAM_ONLY else ""))
     if read_errors:
         lines.append("⚠️ *بعض القراءات فشلت:*")
         for e in read_errors:
@@ -1171,6 +1185,7 @@ async def ensure_connection():
     # rpc_since is read at the top of the loop and written further down, so the
     # declaration belongs here - a `global` after the first read is a SyntaxError.
     global connection, account_instance, api_instance, last_price_ok, rpc_since
+    global stream_fails
     fail_streak, hinted = 0, None
     while True:
         try:
@@ -1247,8 +1262,29 @@ async def ensure_connection():
                     conn = StreamingView(stream)
                     log.info("Connected MetaApi in STREAMING mode - reads are free")
                 except Exception as e:
-                    log.warning(f"streaming connection failed, falling back to RPC: {e}")
+                    stream_fails += 1
+                    log.warning(f"streaming handshake failed ({stream_fails}): {e}")
                     conn = None
+                    if STREAM_ONLY and stream_fails < STREAM_GIVEUP_TRIES:
+                        # Do NOT fall back. Running metered is what keeps the quota
+                        # empty, which is what stops the handshake from working.
+                        if stream_fails == 1:
+                            await notify(
+                                "🕶 *ما كدرت أفتح القناة المجانية* — وأرفض أشتغل على "
+                                "القناة المدفوعة لأنها هي اللي استهلكت الحصة.\n"
+                                f"• أنتظر `{STREAM_RETRY_SECS/60:.0f}` دقيقة وأعيد "
+                                "المحاولة — السكوت يخلي الحصة تتجدد\n"
+                                "• صفقاتك المفتوحة عند الوسيط بوقفها، ما تأثرت\n"
+                                "• لو تريد تأمين فوري حط ستوب يدوي من MT5")
+                        await asyncio.sleep(STREAM_RETRY_SECS)
+                        continue
+                    if STREAM_ONLY:
+                        await notify(
+                            f"⚠️ فشلت القناة المجانية `{stream_fails}` مرات — "
+                            "راح أشتغل على المدفوعة بأبطأ وتيرة ممكنة.\n"
+                            "`/setkey streamonly 0` يوقف هذا الانتظار نهائياً.")
+                else:
+                    stream_fails = 0
             if conn is None:
                 conn = account_instance.get_rpc_connection()
                 await conn.connect()
