@@ -58,6 +58,12 @@ WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
 # broker before it can quote anything. That is minutes on the first run, so a 30s wait made
 # a perfectly healthy new account report "Timed out waiting for MetaApi to synchronize".
 DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
+# When the fallback is in use, how long before trying for a streaming connection again.
+# Streaming has to synchronize once, and that costs credits - so if the quota is already
+# exhausted the first attempt fails and the bot would otherwise stay on the metered path
+# for ever, still spending, never recovering.
+STREAM_RETRY_SECS = float(os.environ.get("STREAM_RETRY_SECS", "900"))
+rpc_since = 0.0
 # Read positions and prices from MetaApi's streamed local cache instead of polling the
 # metered API. Off only as an escape hatch if a broker's stream misbehaves.
 STREAM_READS = os.environ.get("STREAM_READS", "1") not in ("0", "false", "no")
@@ -424,13 +430,33 @@ async def broker_check():
                 if "DEPLOYING" in state_line:
                     lines.append("⏳ خليه يكمّل التجهيز — ممكن ياخذ لحد ١٠ دقائق بأول مرة.")
         return "\n".join(lines)
+    # Each read on its own. They used to share one try, so a single throttled call -
+    # getAccountInformation, which MetaApi meters separately - hid the price, the
+    # positions and the connection mode behind one error, and the real question
+    # ("is anything working?") went unanswered.
+    async def _read(what, coro, default=None):
+        try:
+            return await asyncio.wait_for(coro, timeout=10), None
+        except Exception as e:
+            return default, f"{what}: {str(e)[:160]}"
+
+    acc, e1 = await _read("الرصيد", connection.get_account_information(), {})
+    price, e2 = await _read("السعر", connection.get_symbol_price(symbol=SYMBOL), {})
+    pos, e3 = await _read("الصفقات", connection.get_positions(), [])
+    read_errors = [e for e in (e1, e2, e3) if e]
+    lines.append("📡 القراءة: " + ("*بث مباشر* — مجانية ✅" if reads_are_free()
+                 else "*استعلام مدفوع* — محدودة بحصة ⚠️"))
+    if read_errors:
+        lines.append("⚠️ *بعض القراءات فشلت:*")
+        for e in read_errors:
+            lines.append(f"• {e}")
+        if any("cpu credits" in e for e in read_errors):
+            lines.append("• 💡 هذي حصة MetaApi انتهت — تتجدد خلال 6 ساعات، "
+                         "والبوت صار يقرأ من البث المجاني أول ما يقدر يتزامن.")
     try:
-        acc = await asyncio.wait_for(connection.get_account_information(), timeout=10)
-        price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=10)
-        pos = await asyncio.wait_for(connection.get_positions(), timeout=10)
         ours = [p for p in pos if p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
         gridded = [p for p in pos if grid is not None and p.get("magic") in grid.MAGICS]
-        floating = round(float(acc.get("equity", 0)) - float(acc.get("balance", 0)), 2)
+        floating = round(float(acc.get("equity", 0) or 0) - float(acc.get("balance", 0) or 0), 2)
         lines += [
             "✅ الاتصال شغال",
             f"• الرصيد: `{acc.get('balance')} {acc.get('currency','')}` | السيولة: `{acc.get('equity')}`",
@@ -1115,7 +1141,9 @@ async def teardown_connection():
 
 
 async def ensure_connection():
-    global connection, account_instance, api_instance, last_price_ok
+    # rpc_since is read at the top of the loop and written further down, so the
+    # declaration belongs here - a `global` after the first read is a SyntaxError.
+    global connection, account_instance, api_instance, last_price_ok, rpc_since
     fail_streak, hinted = 0, None
     while True:
         try:
@@ -1125,6 +1153,15 @@ async def ensure_connection():
             if connection:
                 if last_price_ok and (time.time() - last_price_ok) > CONNECTION_STALE_SECS:
                     log.warning("No successful price fetch recently -> connection considered stale, forcing reconnect")
+                    await teardown_connection()
+                    continue
+                # Stuck on the metered fallback: try for streaming again. The first
+                # attempt can fail simply because the quota was already spent, and
+                # without this the bot would stay on the expensive path for ever -
+                # still spending it, never earning its way back.
+                if (BROKER == "metaapi" and STREAM_READS and not reads_are_free()
+                        and rpc_since and time.time() - rpc_since > STREAM_RETRY_SECS):
+                    log.info("retrying a streaming connection to stop paying for reads")
                     await teardown_connection()
                     continue
                 await asyncio.sleep(3)
@@ -1195,6 +1232,7 @@ async def ensure_connection():
                     pass
                 log.warning("Connected MetaApi in RPC mode - every read is metered")
             connection = conn
+            rpc_since = 0.0 if reads_are_free() else time.time()
             last_price_ok = time.time()
             fail_streak, hinted = 0, None
             log.info("Connected MetaApi OK!")

@@ -530,6 +530,23 @@ needs is safe against a local cache, and `TICK_SECS_METERED` (15s) applies when 
 `PaperBroker` declares `streaming = True` because its reads are a local file — without
 that, demo mode would crawl at 15 seconds a look and a $2 grid cannot work that way.
 
+### Getting back off the metered path
+
+Streaming has to synchronize once, and that synchronization itself costs credits. So when
+the quota is *already* exhausted, the streaming attempt fails and the bot lands on the RPC
+fallback — where it keeps spending and never earns its way back. `ensure_connection`
+therefore timestamps the fallback and retries streaming every `STREAM_RETRY_SECS` (15
+min), tearing the old connection down first.
+
+### /check lost everything to one throttled read
+
+The three reads shared a single `try`, so when `getAccountInformation` alone was throttled
+— MetaApi meters it separately — the price, the positions and the connection mode all
+disappeared behind one error message, and the only question that mattered ("is anything
+working?") went unanswered. They are read independently now, each failure is listed, a
+quota error is explained in plain words, and the first line of `/check` says whether reads
+are streamed or metered.
+
 The lesson, and it is not the first time in this file: **a per-tick API call is a budget,
 not a free action.** The earlier version of it was eleven reconnects in twenty minutes
 from fetching account info every tick; this one was the whole quota.
