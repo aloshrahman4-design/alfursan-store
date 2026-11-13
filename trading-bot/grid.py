@@ -100,6 +100,7 @@ _quota = {"until": 0.0, "hits": 0, "last": ""}
 BLIND_SECS = _f("BLIND_SECS", 120.0)
 _reads = {"ok": 0.0}
 _blind = {"cut": False}
+_brake_said = 0.0
 
 
 def note_read_ok():
@@ -245,6 +246,13 @@ BE_SOFT_EXIT = _f("BE_SOFT_EXIT", 0.05)
 GRID_MAX_POSITIONS = _i("GRID_MAX_POSITIONS", 8)
 # And a soft ceiling in money: stop adding once the basket is most of the way to its stop.
 GRID_ADD_STOP_PCT = _f("GRID_ADD_STOP_PCT", 50.0)
+# GRID_ADD_STOP_PCT is a percentage OF GRID_MAX_LOSS, so setting the basket stop to
+# 99999 to take manual control silently disabled the expansion brake with it: 50% of
+# 99999 is a number no drawdown reaches. The brake that matters is measured against the
+# ACCOUNT, not against another setting, and nothing the user changes can switch it off.
+# Floating loss this far below balance and the grid adds nothing, arms nothing, and
+# pulls what is already armed.
+GRID_EQUITY_BRAKE_PCT = _f("GRID_EQUITY_BRAKE_PCT", 10.0)
 # --- the trend guard -----------------------------------------------------------------
 # A grid earns in a range and bleeds in a trend: price walks one way, every level it
 # crosses opens a trade that is immediately under water, and refill keeps putting new
@@ -878,16 +886,37 @@ async def arm(conn, symbol, notify):
     return True, None
 
 
-_balance_cache = {"at": 0.0, "value": 0.0}
+_balance_cache = {"at": 0.0, "value": 0.0, "equity": 0.0}
+
+
+async def cached_account(conn):
+    """(balance, equity) for the whole account, one cached read for both."""
+    now = time.time()
+    if now - _balance_cache["at"] < GRID_BALANCE_TTL and _balance_cache["value"]:
+        return _balance_cache["value"], _balance_cache["equity"]
+    acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
+    bal = float(acct.get("balance", 0) or 0)
+    eq = float(acct.get("equity", bal) or bal)
+    _balance_cache.update({"at": now, "value": bal, "equity": eq})
+    return bal, eq
 
 
 async def cached_balance(conn):
-    now = time.time()
-    if now - _balance_cache["at"] < GRID_BALANCE_TTL and _balance_cache["value"]:
-        return _balance_cache["value"]
-    acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
-    _balance_cache.update({"at": now, "value": float(acct.get("balance", 0) or 0)})
-    return _balance_cache["value"]
+    bal, _ = await cached_account(conn)
+    return bal
+
+
+def drawdown_brake(balance, equity):
+    """How far under water the WHOLE account is, and whether that forbids expansion.
+
+    Measured on balance minus equity, so it counts every open trade - grid, anchor and
+    anything handed over - because margin does not care which engine opened what.
+    """
+    if GRID_EQUITY_BRAKE_PCT <= 0 or balance <= 0:
+        return 0.0, 0.0, False
+    down = round(max(0.0, balance - equity), 2)
+    limit = round(balance * GRID_EQUITY_BRAKE_PCT / 100.0, 2)
+    return down, limit, down >= limit
 
 
 # How often the engine repeats "I cannot lay a ladder yet". Often enough to be seen,
@@ -936,6 +965,25 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 await asyncio.sleep(5)
                 continue
             if not state.get("armed"):
+                try:
+                    _b, _e = await cached_account(conn)
+                    _d, _lim, _braked = drawdown_brake(_b, _e)
+                except Exception:
+                    _braked = False
+                if _braked:
+                    # A new ladder is new exposure. Not while the account is this far
+                    # under - that is the moment it can least afford another level.
+                    global _brake_said
+                    if time.time() - _brake_said > 900:
+                        _brake_said = time.time()
+                        await notify(
+                            f"🛑 *ما أنصب شبكة جديدة — الحساب نازل `{_d:g}$` تحت رصيده*\n"
+                            f"• الحد `{_lim:g}$` (`{GRID_EQUITY_BRAKE_PCT:g}%` من الرصيد)\n"
+                            f"• ما أضيف ولا صفقة وأنت بهذا العمق\n"
+                            f"• أرجع أشتغل أول ما ترجع الخسارة تحت الحد\n"
+                            f"• `/setkey brake 0` يلغي هذا المكبح (ما أنصح)")
+                    await asyncio.sleep(10)
+                    continue
                 held = await grid_positions(conn)
                 if len(held) >= GRID_MAX_POSITIONS:
                     # It used to sleep here in total silence, which is how a changed lot
@@ -971,7 +1019,9 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             sells = [p for p in positions if p.get("magic") == MAGIC_GRID_SELL]
             floating = pnl(positions)
 
-            limit = loss_limit(await cached_balance(conn))
+            _bal, _eq = await cached_account(conn)
+            limit = loss_limit(_bal)
+            down, brake_at, braked = drawdown_brake(_bal, _eq)
 
             # Each side is judged on its own when side-harvesting, so a winning direction is
             # not held hostage by the other one bleeding at the same rate.
@@ -1071,8 +1121,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             # opening together while every individual rule was behaving correctly.
             room = max(0, GRID_MAX_POSITIONS - len(positions))
             near_stop = floating <= -(limit * GRID_ADD_STOP_PCT / 100.0)
-            if near_stop:
-                room = 0                  # already most of the way to the stop
+            if near_stop or braked:
+                room = 0                  # near the stop, or the account is too deep down
             if room == 0:
                 # The cap used to be checked only where the grid ADDED levels. But the
                 # ladder arms with GRID_LEVELS pendings a side and every one of them
@@ -1085,7 +1135,9 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 if not state.get("crowded"):
                     state["crowded"] = True
                     save(state)
-                    why = ("الخسارة قربت من الوقف" if near_stop
+                    why = (f"الحساب نازل `{down:g}$` تحت رصيده "
+                           f"(الحد `{brake_at:g}$` = `{GRID_EQUITY_BRAKE_PCT:g}%`)" if braked
+                           else "الخسارة قربت من الوقف" if near_stop
                            else f"وصلت سقف الصفقات `{GRID_MAX_POSITIONS}`")
                     await notify(f"🚧 *وقفت التوسّع* — {why}.\n"
                                  f"• عندي `{len(positions)}` صفقة مفتوحة\n"

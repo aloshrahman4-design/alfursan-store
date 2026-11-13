@@ -748,6 +748,24 @@ checks the room before promising anything.
 The rule this keeps re-teaching: **when the bot declines to act, that is information the
 user needs.** Silence reads as a bug in whatever they changed last.
 
+## A brake measured against the account, not against another setting
+
+`GRID_ADD_STOP_PCT` stops the grid expanding at 50% of `GRID_MAX_LOSS`. The owner set
+`GRID_MAX_LOSS` to 99999 to take manual control of when the basket closes — and silently
+turned the expansion brake off with it, because 50% of 99999 is a number no real
+drawdown reaches.
+
+The consequence showed up live: the account was $1,785 under water on a $3,919 balance,
+and the grid was still posting "سدّيت فجوة — أضفت 2 أمر" every minute.
+
+`GRID_EQUITY_BRAKE_PCT` (10%) is measured on **balance minus equity** — the whole
+account, every open trade, whichever engine opened it, because margin does not care. At
+or past that line the grid adds no level, lays no new ladder, and pulls what is already
+armed. It derives from nothing the user can switch off except itself.
+
+The lesson is about coupling, not about the number: **a safety limit must not be a
+percentage of another safety limit.** Raising one should never silently disarm the other.
+
 ## The position cap was advisory, and now is not
 
 `GRID_MAX_POSITIONS` was checked in two places: before laying a fresh ladder, and before
