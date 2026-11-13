@@ -687,10 +687,17 @@ Three changes:
 2. **Stop being silent.** Skipping in silence is what made this look like lateness with
    no reason. A trade that is eligible but not yet placeable now says so once, with the
    profit it needs and why.
-3. **Guard the rest in software.** Below `spread + gap` above entry, *any* stop would sit
-   under break-even and be a losing stop, so no broker can cover that window.
-   `soft_protect()` closes a trade there at about zero if it gives back everything it
-   showed, rather than letting it turn red.
+3. **Guard the rest in software — off by default.** Below `spread + gap` above entry,
+   *any* stop would sit under break-even and be a losing stop, so no broker can cover
+   that window. `soft_protect()` can close a trade there at about zero rather than let
+   it turn red.
+
+   The owner tried it and turned it down: he would rather a trade keep running than be
+   shut at zero on a wobble, and that is his call to make. It ships off. A feature that
+   **closes trades** does not get to be on by default because it seemed like a good idea;
+   `BE_SOFT=1` switches it on for anyone who wants it. What he actually asked for is
+   untouched — a stop at entry the moment the trade is in profit, then the trail, then
+   the $2 floor.
 
 `soft_protect` is gated on `bot_active`; `apply_breakeven` is not. Tightening a stop is
 safe in every state and must keep running when the system is off. Closing is an action,

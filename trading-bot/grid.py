@@ -238,7 +238,14 @@ BE_MIN_GAP = _f("BE_MIN_GAP", 0.10)
 # under break-even and be a LOSING stop, so none is placed and the trade is bare. In that
 # window only the bot itself can act: if a trade that showed BE_TRIGGER_CASH gives it all
 # back, close it at about break-even rather than let it turn red.
-BE_SOFT = os.environ.get("BE_SOFT", "1") not in ("0", "false", "no")
+#
+# OFF by default. It was my idea, not the owner's, and he turned it down once he saw it:
+# he would rather a trade keep running than be shut at zero on a wobble. That is a sound
+# preference and it is his to make - the thing CLOSES TRADES, and a feature that closes
+# trades has no business being on by default because someone thought it was clever.
+# What he asked for is still exactly what runs: a stop at entry the moment the trade is
+# in profit, then the trail, then the $2 floor. Nothing in that path changes here.
+BE_SOFT = os.environ.get("BE_SOFT", "0") not in ("0", "false", "no")
 BE_SOFT_EXIT = _f("BE_SOFT_EXIT", 0.05)
 # Hard ceilings on what the grid may be holding at once. The level cap only ever limited
 # PENDING orders per side; nothing limited open positions, so refilling and recycling kept
