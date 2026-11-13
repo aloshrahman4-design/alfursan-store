@@ -130,7 +130,9 @@ SETTABLE_KEYS = {
     "BE_LOCK_CASH": "الربح المضمون بعد التأمين",
     "BE_TRAIL_CASH": "كم يتبع الوقف خلف القمة بالدولار",
     "BE_FLOOR_CASH": "الربح اللي ما ينزل الوقف تحته بعد ما يعبره",
-    "BE_MIN_GAP": "أقل مسافة سعر بين الوقف والسوق",
+    "BE_MIN_GAP": "هامش أمان فوق مسافة الوسيط",
+    "BE_SOFT": "حراسة برمجية قبل ما ينفع الستوب (1 أو 0)",
+    "BE_SOFT_EXIT": "الربح اللي عنده يغلقها بالحراسة البرمجية",
     "GRID_MAX_POSITIONS": "أقصى عدد صفقات شبكة مفتوحة بنفس الوقت",
     "GRID_ADD_STOP_PCT": "يوقف فتح مستويات عند هذي النسبة من حد الخسارة",
     "GRID_REFILL": "سدّ فجوات الشبكة تلقائياً (1 أو 0)",
@@ -159,7 +161,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
     "half": "HALF_ENABLED", "halfdist": "HALF_DISTANCE", "halfmin": "HALF_MIN_LOT",
@@ -1781,7 +1783,17 @@ async def protect_engine():
                     if p.get("symbol") == SYMBOL and p.get("magic") in magics
                     and p.get("id") not in released]
             if mine:
-                await grid.apply_breakeven(connection, mine, bid, ask, notify, "")
+                gap_floor = await grid.broker_stop_gap(connection, SYMBOL)
+                await grid.apply_breakeven(connection, mine, bid, ask, notify, "",
+                                           gap_floor=gap_floor)
+                # The window no broker stop can reach. Gated on bot_active: tightening a
+                # stop is safe in any state, closing is not, and /pause must mean it.
+                mine = [p for p in await asyncio.wait_for(
+                            connection.get_positions(), timeout=6.0)
+                        if p.get("symbol") == SYMBOL and p.get("magic") in magics
+                        and p.get("id") not in released]
+                await grid.soft_protect(connection, mine, bid, ask, notify,
+                                        allowed=bot_active)
             await asyncio.sleep(1.0 if mine else 3.0)
         except asyncio.CancelledError:
             raise

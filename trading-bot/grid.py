@@ -111,7 +111,19 @@ BE_FLOOR_CASH = _f("BE_FLOOR_CASH", 2.0)
 # price on 0.01 lot and $0.10 on 0.05 - tighter than the spread, so the stop landed above
 # the market and was refused, leaving the big trades with no protection at all. The stop is
 # pulled back to a placeable distance instead of skipped, as long as it still locks a gain.
-BE_MIN_GAP = _f("BE_MIN_GAP", 0.25)
+# This is a SAFETY MARGIN on top of whatever the broker demands, not the demand itself.
+# It used to be max(spread, BE_MIN_GAP) - the spread standing in for the broker's minimum
+# stop distance, which it is not: the spread is buy-minus-sell, and has nothing to do with
+# how close a stop may sit to the market. Using it cost 0.32$ of price on gold, so on a
+# 0.02 lot no stop could be placed until the trade was 1.28$ up, while BE_TRIGGER_CASH
+# claimed it was protected from 0.35$. The broker's real number is asked for below.
+BE_MIN_GAP = _f("BE_MIN_GAP", 0.10)
+# The window the broker cannot cover. Below `spread + gap` above entry, any stop would sit
+# under break-even and be a LOSING stop, so none is placed and the trade is bare. In that
+# window only the bot itself can act: if a trade that showed BE_TRIGGER_CASH gives it all
+# back, close it at about break-even rather than let it turn red.
+BE_SOFT = os.environ.get("BE_SOFT", "1") not in ("0", "false", "no")
+BE_SOFT_EXIT = _f("BE_SOFT_EXIT", 0.05)
 # Hard ceilings on what the grid may be holding at once. The level cap only ever limited
 # PENDING orders per side; nothing limited open positions, so refilling and recycling kept
 # feeding a trend until twenty were open together and the basket stop took them all at once.
@@ -1273,10 +1285,112 @@ async def halve_distant(conn, positions, bid, ask, notify=None):
     return False
 
 
+# The broker's own minimum distance between a stop and the market, in PRICE. Asked for
+# once and kept: it is a contract term, not a quote. None means "never got an answer",
+# and the caller then keeps the old conservative behaviour rather than guessing.
+_stops = {"value": None, "asked": 0.0}
+STOPS_RETRY_SECS = _f("STOPS_RETRY_SECS", 600.0)
+
+
+def stops_reset():
+    _stops.update({"value": None, "asked": 0.0})
+
+
+async def broker_stop_gap(conn, symbol):
+    """Smallest gap the broker allows between a stop and the market, in price units.
+
+    `stopsLevel` is quoted in POINTS, so it is scaled by the symbol's digits: on gold with
+    2 digits, 20 points is 0.20$. Returns None when the broker has not told us, and the
+    answer is cached so this costs one request per session, not one per tick.
+    """
+    if _stops["value"] is not None:
+        return _stops["value"]
+    if time.time() - _stops["asked"] < STOPS_RETRY_SECS:
+        return None
+    _stops["asked"] = time.time()
+    if not hasattr(conn, "get_symbol_specification"):
+        return None
+    try:
+        spec = await asyncio.wait_for(
+            conn.get_symbol_specification(symbol), timeout=6.0)
+    except Exception as e:
+        log.warning(f"could not read the broker stop distance: {e}")
+        return None
+    try:
+        points = float((spec or {}).get("stopsLevel", 0) or 0)
+        digits = int((spec or {}).get("digits", 2) or 2)
+    except (TypeError, ValueError):
+        return None
+    gap = round(points * (10 ** -digits), 5)
+    _stops["value"] = gap
+    log.info(f"broker stop distance for {symbol}: {points} points = {gap}$")
+    return gap
+
+
 _be_peaks = {}        # best profit each secured position has shown; dies with the position
+_be_waiting = {}      # id -> True once the user has been told this one cannot be stopped yet
 
 
-async def apply_breakeven(conn, positions, bid, ask, notify=None, label=""):
+def has_protective_stop(p, spread):
+    """True when this trade already carries a stop at or better than break-even."""
+    try:
+        sl = float(p.get("stopLoss") or 0)
+        entry = float(p.get("openPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if not sl or not entry:
+        return False
+    if p.get("type") == "POSITION_TYPE_BUY":
+        return sl >= round(entry + spread, 2) - 0.001
+    return sl <= round(entry - spread, 2) + 0.001
+
+
+async def soft_protect(conn, positions, bid, ask, notify=None, allowed=True):
+    """Close a trade that showed profit, has no placeable stop, and gave the profit back.
+
+    This is the only thing that can cover the window below `spread + gap` above entry,
+    where any broker stop would sit under break-even. It closes at about zero rather than
+    letting a trade that was up turn red - the rule the user has stated more than once.
+
+    `allowed` is the system switch. The stop-tightening around it is safe in every state
+    and always runs; CLOSING is an action, so /pause must be able to stop it.
+    """
+    if not (allowed and BE_ENABLED and BE_SOFT):
+        return 0
+    spread = max(0.0, float(ask) - float(bid))
+    closed = []
+    for p in positions:
+        pid = p.get("id")
+        peak = _be_peaks.get(pid, 0.0)
+        if peak < BE_TRIGGER_CASH:
+            continue                      # never showed real profit; nothing to defend
+        if has_protective_stop(p, spread):
+            continue                      # the broker is holding it; leave it alone
+        try:
+            profit = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if profit > BE_SOFT_EXIT:
+            continue                      # still in profit; let it run
+        try:
+            await asyncio.wait_for(conn.close_position(pid), timeout=8.0)
+        except Exception as e:
+            log.warning(f"soft protect could not close {pid}: {e}")
+            continue
+        closed.append((pid, peak, profit))
+        _be_peaks.pop(pid, None)
+        _be_waiting.pop(pid, None)
+    if closed and notify:
+        for pid, peak, profit in closed:
+            await notify(
+                f"🛟 *أغلقتها على التعادل*\n"
+                f"• كانت رابحة `{peak:g}$` ورجعت `{profit:g}$`\n"
+                f"• ما كان ينفع ستوب عند الوسيط بعد — السعر قريب من الدخول\n"
+                f"• فحرستها بنفسي وما خليتها تصير خسارة")
+    return len(closed)
+
+
+async def apply_breakeven(conn, positions, bid, ask, notify=None, label="", gap_floor=None):
     """Move the stop of any position past the trigger to its entry, costs covered.
 
     Never loosens a stop and never sets one on a losing trade: the stop can only ever end
@@ -1312,11 +1426,26 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label=""):
         # A buy is opened at ask and closed at bid, so entry alone would close at -spread.
         target = round(entry + spread + lock, 2) if is_buy else round(entry - spread - lock, 2)
         # Keep it a placeable distance from the market rather than refusing outright.
-        gap = max(spread, BE_MIN_GAP)
+        # The broker's real requirement when we have it; otherwise the old conservative
+        # spread, because guessing low here means the modify is simply rejected.
+        gap = max(gap_floor, BE_MIN_GAP) if gap_floor is not None else max(spread, BE_MIN_GAP)
         target = min(target, round(bid - gap, 2)) if is_buy else max(target, round(ask + gap, 2))
         # ...but never at the cost of turning a protected trade into a losing one.
         floor_px = (round(entry + spread, 2) if is_buy else round(entry - spread, 2))
         if (is_buy and target < floor_px) or (not is_buy and target > floor_px):
+            # No stop can be placed above break-even yet. Say so once per trade instead
+            # of skipping in silence - the silence is what made this look like the
+            # protection "arriving late" with no reason given.
+            if notify and not _be_waiting.get(pid):
+                _be_waiting[pid] = True
+                need = round(abs((floor_px + (gap if is_buy else -gap)) - entry)
+                             * vol * GRID_CONTRACT, 2)
+                await notify(
+                    f"⏳ *صفقة ربحت `{profit:g}$` بس ما أكدر أحمّيها بعد*\n"
+                    f"• أي ستوب الآن ينزل تحت نقطة التعادل — يعني ستوب خاسر\n"
+                    f"• تنحمي عند `{need:g}$` (السبريد `{spread:.2f}$` + مسافة الوسيط "
+                    f"`{gap:.2f}$`)\n"
+                    f"• لين هذاك الوقت أحرسها بنفسي وأغلقها على التعادل لو رجعت")
             continue                      # not enough room yet to lock anything; wait
         current = p.get("stopLoss")
         try:
@@ -1333,6 +1462,10 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label=""):
     live = {p.get("id") for p in positions}
     for gone in [k for k in _be_peaks if k not in live]:
         _be_peaks.pop(gone, None)
+    for gone in [k for k in _be_waiting if k not in live]:
+        _be_waiting.pop(gone, None)
+    for pid, _ in moved:
+        _be_waiting.pop(pid, None)        # it is covered now; the warning can fire again
     if moved and notify:
         tail = (f"\nوالوقف يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة."
                 if BE_TRAIL_CASH > 0 else "")

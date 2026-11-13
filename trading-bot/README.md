@@ -544,6 +544,47 @@ whole ladder stranded far above price with nothing covering the near side, which
 dead zone all over again. The furthest level is cancelled to pay for the near one, so the
 count never grows and the ladder walks toward price instead of being abandoned by it.
 
+## Protection was arriving late, and the spread was why
+
+The owner reported the break-even guard "sometimes late". It was, measurably. Walking a
+price up a cent at a time through the real function:
+
+| lot | BE_TRIGGER_CASH says protected from | a stop is actually placed at | bare window |
+|---|---|---|---|
+| 0.01 | $0.35 | $0.64 | $0.29 |
+| 0.02 | $0.35 | **$1.28** | **$0.93** |
+| 0.05 | $0.35 | $3.20 | $2.85 |
+
+A 0.02 trade could reach +$1.27 and fall back to a loss with nothing holding it, while
+the configured trigger claimed it was covered from +$0.35.
+
+The cause was one line:
+
+    gap = max(spread, BE_MIN_GAP)
+
+The spread was standing in for the broker's minimum stop distance. It is not that: the
+spread is buy-minus-sell, and says nothing about how close a stop may sit to the market.
+On gold it cost $0.32 of price we did not owe. The real number is `stopsLevel`, which the
+broker publishes per symbol, and which is often far smaller.
+
+Three changes:
+
+1. **Ask the broker.** `broker_stop_gap()` reads `stopsLevel` from the symbol
+   specification once per session and scales points to price by the symbol's digits. With
+   it, a 0.02 trade is protected from $0.84 instead of $1.28. When the broker does not
+   answer, the old conservative spread stands — guessing low only earns a rejected modify.
+2. **Stop being silent.** Skipping in silence is what made this look like lateness with
+   no reason. A trade that is eligible but not yet placeable now says so once, with the
+   profit it needs and why.
+3. **Guard the rest in software.** Below `spread + gap` above entry, *any* stop would sit
+   under break-even and be a losing stop, so no broker can cover that window.
+   `soft_protect()` closes a trade there at about zero if it gives back everything it
+   showed, rather than letting it turn red.
+
+`soft_protect` is gated on `bot_active`; `apply_breakeven` is not. Tightening a stop is
+safe in every state and must keep running when the system is off. Closing is an action,
+and `/pause` has to mean it.
+
 ## Break-even
 
 A trade that climbed part of the way to its target and then turned around used to hand the
