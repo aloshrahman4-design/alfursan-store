@@ -470,6 +470,7 @@ async def broker_check():
     read_errors = [e for e in (e1, e2, e3) if e]
     lines.append("📡 القراءة: " + ("*بث مباشر* — مجانية ✅" if reads_are_free()
                  else "*استعلام مدفوع* — محدودة بحصة ⚠️"))
+    lines.append(price_source_line())
     if stream_fails:
         lines.append(f"• حاولت أفتح القناة المجانية `{stream_fails}` مرة وما نجحت بعد"
                      + (" — أعيد المحاولة كل "
@@ -1384,6 +1385,58 @@ class StreamingView:
         return self._conn.terminal_state.specification(symbol)
 
 
+_price_note = {"free_used": 0, "broker_used": 0, "last_free": 0.0}
+
+
+async def market_price(symbol=None):
+    """The price, from whichever source does not cost a metered read.
+
+    The broker's own quote while reads are free (streaming), the public feed otherwise.
+    datafeed keeps a running calibration against this broker - the offset is applied
+    inside get_candles - so the free number is not an approximation of a different
+    market, it is this broker's price shifted by a measured median.
+
+    This is the single biggest saving available: BOTH engines asked the broker for a
+    price on every tick, and the price is the one thing they needed that was never
+    worth paying for.
+    """
+    symbol = symbol or SYMBOL
+    if connection is not None and reads_are_free():
+        try:
+            q = await asyncio.wait_for(
+                connection.get_symbol_price(symbol=symbol), timeout=6.0)
+            if q and q.get("bid"):
+                _price_note["broker_used"] += 1
+                if datafeed is not None:
+                    # Keep the free feed honest while we can see the real thing.
+                    try:
+                        free = await datafeed.get_price_fast(symbol)
+                        mid_b = (float(q["bid"]) + float(q["ask"])) / 2.0
+                        mid_f = (float(free["bid"]) + float(free["ask"])) / 2.0
+                        datafeed.note_broker_price(symbol, mid_b, mid_f - datafeed.offset())
+                    except Exception:
+                        pass
+                return q
+        except Exception as e:
+            log.warning(f"broker price failed, falling back to the free feed: {e}")
+    if datafeed is None:
+        raise RuntimeError("no price source")
+    q = await datafeed.get_price_fast(symbol)
+    _price_note["free_used"] += 1
+    _price_note["last_free"] = time.time()
+    return q
+
+
+def price_source_line():
+    if reads_are_free():
+        return "• 💹 السعر: من الوسيط مباشرة (البث مجاني)"
+    if _price_note["free_used"]:
+        extra = f" · {datafeed.calibration_line()}" if datafeed else ""
+        return (f"• 💹 السعر: *من المصدر المجاني* — ما يكلف ولا طلب"
+                f" (`{_price_note['free_used']}` قراءة){extra}")
+    return "• 💹 السعر: من الوسيط (استعلام مدفوع)"
+
+
 def reads_are_free():
     """True when positions and prices come from the local cache instead of the API."""
     return bool(getattr(connection, "streaming", False))
@@ -1970,7 +2023,7 @@ async def protect_engine():
             if wait and not reads_are_free():
                 await asyncio.sleep(min(wait, 30.0))
                 continue
-            price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=6.0)
+            price = await market_price(SYMBOL)
             grid.note_read_ok()
             bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
             if not bid or not ask:
@@ -2668,6 +2721,12 @@ async def main():
         HOOK_SECRET = secrets.token_urlsafe(24)
         write_env_value("HOOK_SECRET", HOOK_SECRET)
         log.info("generated a webhook secret")
+    if grid is not None and datafeed is not None:
+        # One price source for both engines, and it is the free one unless the broker's
+        # reads happen to be free too. This is what lets the bot keep managing trades
+        # while the API is throttled: it can still see, and moving a stop is a write.
+        grid.PRICE_HOOK = market_price
+        log.info("grid price source: free feed (calibrated), broker only when streaming")
     log.info("Bot booting up (supervised mode)")
     tasks = [
         supervise("connection", ensure_connection),

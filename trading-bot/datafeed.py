@@ -217,6 +217,24 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
     raise RuntimeError("free data unavailable -> " + " | ".join(errors[:4]))
 
 
+async def get_price_fast(symbol="GOLD", spread=0.30):
+    """Bid/ask from the last ONE-MINUTE close, calibrated to the broker.
+
+    get_price() reads 15m candles, which is far too stale to trail a $0.50 stop with.
+    1m bars are cached for FAST_CACHE_SECS, so this is roughly a 15-second-old price
+    for the cost of nothing - and it keeps working when the broker's API is throttled,
+    which is the whole point: a bot that can still see the price can still move a stop,
+    and moving a stop is a WRITE, billed on a different budget from the reads.
+    """
+    candles = await get_candles(symbol, "1m", 5)
+    if not candles:
+        raise RuntimeError("no free candles")
+    last = float(candles[-1]["close"])
+    half = max(0.01, float(spread) / 2.0)
+    return {"bid": round(last - half, 2), "ask": round(last + half, 2),
+            "free": True, "at": int(time.time())}
+
+
 async def get_price(symbol="GOLD"):
     """Approximate bid/ask from the last free close (used while MetaApi sleeps)."""
     candles = await get_candles(symbol, "15m", 60)

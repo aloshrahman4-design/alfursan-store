@@ -498,6 +498,33 @@ dropped when it closes, and stale ids are swept each tick against what is actual
 The anchor price still comes from the newest trade, which is what the re-entry logic means
 by "the anchor".
 
+## The price was never worth paying for
+
+`datafeed.py` has been in this repo from the start, with this at the top of it:
+
+    free market data, so MetaApi is only needed to place orders.
+
+It pulls gold from Yahoo, Binance PAXG and Stooq, and it keeps a running calibration
+against the broker — `/check` reports the median offset, currently six cents over forty
+samples. And both engines were still asking **MetaApi** for a price on every tick, at a
+metered cost, for a number three public feeds give away and that the bot had already
+measured against this broker.
+
+`market_price()` takes the broker's quote while reads are free (streaming) and the public
+feed otherwise, and refreshes the calibration whenever it can see both. `grid.PRICE_HOOK`
+routes the grid engine and refill through the same source. `datafeed.get_price_fast()`
+reads 1m bars rather than `get_price()`'s 15m closes, so the quote is about fifteen
+seconds old instead of fifteen minutes.
+
+    before today (1s tick, everything from the broker)   151,200 per 6h
+    after the morning fix (15s tick)                       7,200     21x less
+    after moving the price off the meter                   4,320     35x less
+
+The part that matters more than the count: **the bot can now see a price while the broker
+is throttled.** It knows where the market is, and moving a stop is a *write* — billed on
+a different budget from the reads. So protection keeps working through a throttle instead
+of going dark, which was the failure the owner actually suffered.
+
 ## The quota ran out, and the bot went blind
 
 A screenshot showed two trades that had been +$4.60 and +$2.20 sitting at a loss with no

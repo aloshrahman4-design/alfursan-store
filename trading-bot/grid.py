@@ -87,6 +87,22 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
 # How long a tick waits when every read is billed by the broker's API.
 TICK_SECS_METERED = _f("TICK_SECS_METERED", 15.0)
+# Set by the main module to a price source that does not cost an API read. The engines
+# used to ask the broker for a price on every tick, which is a metered call for a number
+# that is free from three public feeds and already calibrated against this broker.
+PRICE_HOOK = None
+
+
+async def quote_now(conn, symbol):
+    """The tick's price: free feed when one is wired up, the broker otherwise."""
+    if PRICE_HOOK is not None:
+        try:
+            q = await PRICE_HOOK(symbol)
+            if q and q.get("bid") and q.get("ask"):
+                return q
+        except Exception as e:
+            log.warning(f"free price failed, asking the broker: {e}")
+    return await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
 # When the broker answers "you have spent your quota, wait", the worst thing to do is
 # keep asking: every refused call still counts against the window it is waiting to clear.
 # So a quota refusal puts all reads to sleep for a while instead of retrying at tick rate.
@@ -1106,8 +1122,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             # One price read per tick, shared by everything below it.
             try:
-                quote = await asyncio.wait_for(
-                    conn.get_symbol_price(symbol=symbol), timeout=6.0)
+                quote = await quote_now(conn, symbol)
             except Exception as e:
                 log.warning(f"tick has no price: {e}")
                 quote = None
@@ -1337,7 +1352,7 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
         return 0
     try:
         if quote is None:
-            quote = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
+            quote = await quote_now(conn, symbol)
     except Exception as e:
         log.warning(f"refill skipped, no price: {e}")
         return 0
