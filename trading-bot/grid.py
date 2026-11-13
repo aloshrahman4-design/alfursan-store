@@ -527,6 +527,19 @@ def bias_reset():
     _bias_warned = 0
 
 
+def notices_reset():
+    """Un-mute the 'why I am not arming' notices.
+
+    They are rate-limited so a stuck grid does not repeat itself every tick. But the
+    limit also silenced the answer to a command the USER had just typed: /grid on at
+    2:51 decided not to arm and said nothing, because the same notice had gone out at
+    2:39. From his side the bot simply ignored him. Anything he types resets this.
+    """
+    global _brake_said, _blocked_at
+    _brake_said = 0.0
+    _blocked_at = 0.0
+
+
 async def bias_watch(notify=None):
     """Warn when the measured trend has turned against the direction the user pinned.
 
@@ -655,6 +668,7 @@ def reset():
     quietly take them back: the bot would start counting them again, and the next teardown
     would close positions it had promised not to touch.
     """
+    notices_reset()
     fresh = _blank()
     old = load()
     fresh["released"] = old.get("released", [])

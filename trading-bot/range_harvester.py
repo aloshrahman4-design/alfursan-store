@@ -1877,6 +1877,7 @@ async def handle_grid_command(text):
     arg = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) > 1 else ""
     if arg in ("on", "تشغيل"):
         grid.reset()                       # clears any halt left over from a stop
+        grid.notices_reset()               # a command you typed always gets an answer
         write_env_value("GRID_ENABLED", "1")
         await send_long("🕸 *شغّلت الشبكة.*\nتنصب نفسها على السعر الحالي أول ما أرجع.\n"
                         "♻️ أعيد التشغيل...")
@@ -1922,6 +1923,7 @@ async def handle_grid_command(text):
         st["halted"] = False
         st["halt_reason"] = ""
         grid.save(st)
+        grid.notices_reset()
         label = {"down": "هبوط فقط (بيع) 🔻", "up": "صعود فقط (شراء) 🔺"}.get(want, "الاثنين ↔️")
         lines = [f"🎯 *ثبّتت الاتجاه على: {label}*", ""]
         if want != "both":
@@ -1957,6 +1959,7 @@ async def handle_grid_command(text):
         st["armed"] = False
         st["crowded"] = False
         grid.save(st)
+        grid.notices_reset()
         room = max(0, grid.GRID_MAX_POSITIONS - len(held))
         lots = grid.ladder(base=grid.recovery_base(st.get("loss_streak", 0)))
         shown = ", ".join(f"{x:g}" for x in lots[:6])
@@ -2386,6 +2389,7 @@ async def process_update(update):
                         held = []
                 if grid is not None:
                     grid.reset()          # clears any halt or stale armed flag
+                    grid.notices_reset()  # answer this command, do not mute it
                     write_env_value("GRID_ENABLED", "1")
                     lines.append("• شغّلت الشبكة — تنصب نفسها على السعر الحالي أول ما أرجع")
                 lines.append("• شغّلت النظام 🟢")
