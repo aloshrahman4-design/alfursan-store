@@ -763,7 +763,10 @@ async def handle_setkey(text, chat_id, message_id):
                "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
             or key.startswith("BE_") \
             or key.startswith("GRID_") \
-            or key.startswith("HALF_"):
+            or key.startswith("HALF_") \
+            or key.startswith("STREAM_") \
+            or key.startswith("RPC_") \
+            or key.startswith("BOOT_"):
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. "
                         f"أعيد التشغيل الآن...{extra}")
         await asyncio.sleep(1.5 if extra else 0)   # let the warning land before the exit
