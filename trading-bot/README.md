@@ -748,6 +748,22 @@ checks the room before promising anything.
 The rule this keeps re-teaching: **when the bot declines to act, that is information the
 user needs.** Silence reads as a bug in whatever they changed last.
 
+## Unable to arm is not unable to manage
+
+The brake above introduced a worse bug than the one it fixed. Both "cannot arm" paths —
+the new drawdown brake and the older position cap — ended in `continue`, which skips the
+rest of the tick. So a grid that was holding positions but was not *armed* (the state
+after `/pause` then `/resume`, or right after a harvest) silently stopped harvesting
+them, stopped checking the basket stop, stopped everything. The trades were dropped.
+
+Arming is about taking on **new** exposure. Managing is about what is already there. They
+must not share an exit. The engine now notifies and falls through, and only returns early
+in the two cases where there is genuinely nothing to do: the ladder armed fine, or nothing
+is armed and nothing is open.
+
+Both messages now say plainly that the open trades keep their protection, their trailing
+and their harvest while the grid itself stands down.
+
 ## A brake measured against the account, not against another setting
 
 `GRID_ADD_STOP_PCT` stops the grid expanding at 50% of `GRID_MAX_LOSS`. The owner set

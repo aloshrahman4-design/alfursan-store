@@ -964,31 +964,34 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             if state.get("halted"):
                 await asyncio.sleep(5)
                 continue
+            # Being unable to ARM must never stop us MANAGING what is already open.
+            # Both of the blocks below used to `continue`, so a braked or crowded grid
+            # that held positions skipped the harvest, the basket stop and everything
+            # else for as long as the condition lasted - the trades were simply dropped.
             if not state.get("armed"):
+                braked_now = False
                 try:
                     _b, _e = await cached_account(conn)
-                    _d, _lim, _braked = drawdown_brake(_b, _e)
-                except Exception:
-                    _braked = False
-                if _braked:
+                    _d, _lim, braked_now = drawdown_brake(_b, _e)
+                except Exception as e:
+                    log.warning(f"could not read the account for the brake: {e}")
+                held = await grid_positions(conn)
+                crowded_now = len(held) >= GRID_MAX_POSITIONS
+                if braked_now:
                     # A new ladder is new exposure. Not while the account is this far
                     # under - that is the moment it can least afford another level.
                     global _brake_said
-                    if time.time() - _brake_said > 900:
+                    if time.time() - _brake_said > BLOCKED_NOTE_SECS:
                         _brake_said = time.time()
                         await notify(
                             f"🛑 *ما أنصب شبكة جديدة — الحساب نازل `{_d:g}$` تحت رصيده*\n"
                             f"• الحد `{_lim:g}$` (`{GRID_EQUITY_BRAKE_PCT:g}%` من الرصيد)\n"
                             f"• ما أضيف ولا صفقة وأنت بهذا العمق\n"
-                            f"• أرجع أشتغل أول ما ترجع الخسارة تحت الحد\n"
-                            f"• `/setkey brake 0` يلغي هذا المكبح (ما أنصح)")
-                    await asyncio.sleep(10)
-                    continue
-                held = await grid_positions(conn)
-                if len(held) >= GRID_MAX_POSITIONS:
-                    # It used to sleep here in total silence, which is how a changed lot
-                    # looked like a setting that "did not work": the value was saved, the
-                    # ladder that would carry it simply could never be laid. Say it.
+                            f"• بس أبقى أدير `{len(held)}` صفقة مفتوحة: تأمين، تريلينغ، "
+                            f"وحصاد لو طلعت بالربح\n"
+                            f"• أرجع أنصب أول ما ترجع الخسارة تحت الحد\n"
+                            f"• `/setkey brake 0` يلغي المكبح (ما أنصح)")
+                elif crowded_now:
                     global _blocked_at
                     if time.time() - _blocked_at > BLOCKED_NOTE_SECS:
                         _blocked_at = time.time()
@@ -998,18 +1001,22 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                             f"وهذا سقف الصفقات (`{GRID_MAX_POSITIONS}`).\n"
                             f"• أي إعداد غيّرته للوت محفوظ وينطبق على السلّم الجاي: "
                             f"`{', '.join(f'{x:g}' for x in lots[:6])} …`\n"
-                            "• أنصبه تلقائياً أول ما تنفك صفقة وحدة\n"
+                            "• وأبقى أدير الصفقات المفتوحة عادي — تأمين وتريلينغ وحصاد\n"
+                            "• وأنصب السلّم تلقائياً أول ما تنفك صفقة وحدة\n"
                             "• تريده هسه؟ سكّر صفقة بالمنصة، أو `/grid off` ثم `/grid on`")
-                    await asyncio.sleep(5)   # too crowded to lay a new ladder
+                else:
+                    ok, err = await arm(conn, symbol, notify)
+                    if not ok:
+                        await notify(f"⚠️ ما كدرت أنصب الشبكة: {err}")
+                        state["halted"] = True
+                        state["halt_reason"] = err or "?"
+                        save(state)
+                    await asyncio.sleep(2)
                     continue
-                ok, err = await arm(conn, symbol, notify)
-                if not ok:
-                    await notify(f"⚠️ ما كدرت أنصب الشبكة: {err}")
-                    state["halted"] = True
-                    state["halt_reason"] = err or "?"
-                    save(state)
-                await asyncio.sleep(2)
-                continue
+                if not held:
+                    await asyncio.sleep(5)   # nothing armed and nothing open: just wait
+                    continue
+                # ...otherwise fall through and manage what is open.
 
             positions = await grid_positions(conn)
             if hasattr(conn, "modify_position"):
