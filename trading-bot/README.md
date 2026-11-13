@@ -139,6 +139,38 @@ Levels beyond `GRID_MAX_POSITIONS` reserve margin they can never use, so 8 level
 sensible maximum while the cap is 8. The whipsaw figure does not change between 12 and 8
 for exactly that reason.
 
+## The audit, and why the restart rule is inverted
+
+He asked how many times I had said "my mistake" today, and told me to stop fixing what
+he happens to trip over and go find the rest. Fair. So the sweep is nine machine checks
+over the whole codebase, hunting the *classes* of bug made that day rather than their
+instances — it runs with the suite, as `test_audit`:
+
+1. every module **compiles** — `ast.parse` accepts a `global` placed after an
+   assignment, only `compile()` rejects it, and that exact bug shipped twice
+2. no setting is saved into a **silent no-op**
+3. no safety limit is a **percentage of another safety limit**
+4. every `/command` a message names actually **exists**
+5. every alias resolves, every setting is **reachable**
+6. a reply to a typed command is never **rate-limited away**
+7. being unable to arm never stops it **managing** open trades
+8. no test file can pass **without asserting**
+9. no hot loop **buys a price** it can get free
+
+It found thirteen things on the first run. Twelve were one bug wearing twelve hats:
+`/setkey` only restarted for a hand-kept list of keys, and `HOOK_*`, `BOT_ACTIVE`,
+`CAPITAL_DEMO`, `META_API_TOKEN` and `SERVER_TRAIL` had all been forgotten into it — the
+command answered "تم" and changed nothing. `SERVER_TRAIL` was mine from the same morning.
+
+A list you have to remember to extend is a bug generator. So the rule is inverted:
+**everything restarts unless `LIVE_KEYS` exempts it**, and a key earns that exemption
+only by appearing in the body of a `refresh_keys()`. A needless restart costs two
+seconds; a missed one is a setting that silently does nothing.
+
+My first `LIVE_KEYS` had seven names. Four were an assumption I had not checked, and all
+four are read once at import. The audit verifies the list against `refresh_keys()` now,
+so it cannot drift back.
+
 ## Keys
 
 ### A pasted pair of commands

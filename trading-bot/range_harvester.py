@@ -176,6 +176,19 @@ SETTABLE_KEYS = {
     "STOP_LOSS_DIST": "مسافة وقف الخسارة بالدولار",
     "TAKE_PROFIT_DIST": "مسافة الهدف بالدولار",
 }
+# Settings that are re-read while the bot runs, so changing them needs no restart.
+# Everything else restarts. Add to this only with a line of proof that it is re-read.
+# Exactly the keys that intel.refresh_keys() re-reads, which handle_setkey calls on
+# every save. The first version of this list had seven entries; four of them were an
+# assumption of mine that nothing checked, and all four are in fact read once at import.
+# The audit now verifies every name here against the body of a refresh_keys(), so the
+# list cannot drift back into wishful thinking.
+LIVE_KEYS = {
+    "ANTHROPIC_API_KEY",
+    "FINNHUB_API_KEY",
+    "CLAUDE_MODEL",
+}
+
 KEY_ALIASES = {
     "metaapi": "META_API_TOKEN", "token": "META_API_TOKEN", "meta": "META_API_TOKEN",
     "account": "ACCOUNT_ID", "acc": "ACCOUNT_ID", "id": "ACCOUNT_ID",
@@ -189,6 +202,7 @@ KEY_ALIASES = {
     "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
+    "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "servertrail": "SERVER_TRAIL", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT", "brake": "GRID_EQUITY_BRAKE_PCT",
@@ -762,14 +776,13 @@ async def handle_setkey(text, chat_id, message_id):
     await forget_message()
     # These are read once at import into module-level constants, so writing .env alone would
     # save the value and change nothing until the next restart. Restart now instead.
-    if key in ("BROKER", "FORCE_IPV4", "ACCOUNT_ID", "SYMBOL", "LEAN", "SIGNAL",
-               "TRADE_LOT", "MIN_CASH_PROFIT", "PULLBACK_CASH", "PULLBACK_PCT", "BREAKOUT_DIST") \
-            or key.startswith("BE_") \
-            or key.startswith("GRID_") \
-            or key.startswith("HALF_") \
-            or key.startswith("STREAM_") \
-            or key.startswith("RPC_") \
-            or key.startswith("BOOT_"):
+    # Inverted on purpose. This used to be a list of what DOES restart, and every new
+    # setting read at import had to be remembered into it - HOOK_*, BOT_ACTIVE,
+    # SERVER_TRAIL and others were all missed, so /setkey wrote the value, answered
+    # "تم", and changed nothing at all. The default is now "restart", and the exceptions
+    # are the handful of keys something genuinely re-reads while running. A needless
+    # restart costs two seconds; a missed one is a setting that silently does nothing.
+    if key not in LIVE_KEYS:
         await send_long(f"🔁 تم ضبط *{SETTABLE_KEYS[key]}* على `{value}`. "
                         f"أعيد التشغيل الآن...{extra}")
         await asyncio.sleep(1.5 if extra else 0)   # let the warning land before the exit
