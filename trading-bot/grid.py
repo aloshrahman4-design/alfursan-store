@@ -85,6 +85,16 @@ GRID_MARGIN_CEILING_PCT = _f("GRID_MARGIN_CEILING_PCT", 40.0)
 # it on every tick was a third of the request load on its own, which slowed the price reads
 # enough that the connection kept being declared stale and rebuilt.
 GRID_BALANCE_TTL = _f("GRID_BALANCE_TTL", 30.0)
+# How long a tick waits when every read is billed by the broker's API.
+TICK_SECS_METERED = _f("TICK_SECS_METERED", 15.0)
+
+
+def reads_free(conn=None):
+    """True when positions and prices come from a local cache rather than the API."""
+    return bool(getattr(conn if conn is not None else _last_conn, "streaming", False))
+
+
+_last_conn = None
 # Levels that fill and close leave holes. The grid only re-arms once every position AND
 # every order is gone, so price can end up sitting in an $18 dead zone - nearest buy stop
 # far above, nearest sell stop far below - doing nothing for hours. Top the ladder back up
@@ -791,6 +801,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             if conn is None:
                 await asyncio.sleep(3)
                 continue
+            global _last_conn
+            _last_conn = conn
             if not hasattr(conn, "create_stop_buy_order"):
                 if not warned_unsupported:
                     warned_unsupported = True
@@ -977,7 +989,11 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             # A trailing exit is only as tight as how often it looks. While a basket is in
             # the money the give-back threshold is live, so watch it three times as closely;
             # the rest of the time there is nothing to miss.
-            await asyncio.sleep(0.5 if floating >= GRID_TP_CASH else 1.5)
+            # Sub-second ticking is only safe against a local cache. On the metered API
+            # it is what burned 150,000 requests through a six-hour quota, after which
+            # every read failed and the bot looked asleep.
+            fast = 0.5 if floating >= GRID_TP_CASH else 1.5
+            await asyncio.sleep(fast if reads_free() else TICK_SECS_METERED)
         except asyncio.CancelledError:
             raise
         except Exception as e:

@@ -498,6 +498,42 @@ dropped when it closes, and stale ids are swept each tick against what is actual
 The anchor price still comes from the newest trade, which is what the re-entry logic means
 by "the anchor".
 
+## The quota ran out, and the bot went blind
+
+A screenshot showed two trades that had been +$4.60 and +$2.20 sitting at a loss with no
+stop on either. `/check` gave the reason:
+
+    The ws:getAccountInformation API allows 4320000 cpu credits per 6h ...
+    Please wait some time and retry your request
+
+Nothing was wrong with the protection logic. It could not read a price.
+
+Counting the calls: `protect_engine` asked for positions and a price every second, and
+`grid_engine` for positions, orders and a price roughly as often — about **150,000
+metered requests per six-hour window**. Worse, the soft-guard change the day before had
+added a *second* `get_positions()` per protect tick, so the fix for one blind spot helped
+exhaust the quota that caused a bigger one.
+
+MetaApi has the right answer built in. A **streaming connection** is pushed updates over
+a websocket and keeps them in a local `terminal_state`: positions, orders, prices, account
+information and symbol specifications are all read from memory, cost nothing, and are
+fresher than a poll. Trades still go over the API, which is correct — they are rare.
+
+`StreamingView` wraps the streaming connection so every existing call site is unchanged:
+the five read methods are served from the cache, everything else passes through via
+`__getattr__` (so `hasattr(conn, "modify_position")` and friends still work). RPC remains
+the fallback if streaming will not synchronize, and the connection logs which mode it is
+in.
+
+Both engines now pace themselves by what a read costs: the sub-second tick a trailing exit
+needs is safe against a local cache, and `TICK_SECS_METERED` (15s) applies when it is not.
+`PaperBroker` declares `streaming = True` because its reads are a local file — without
+that, demo mode would crawl at 15 seconds a look and a $2 grid cannot work that way.
+
+The lesson, and it is not the first time in this file: **a per-tick API call is a budget,
+not a free action.** The earlier version of it was eleven reconnects in twenty minutes
+from fetching account info every tick; this one was the whole quota.
+
 ## Request load and reconnect noise
 
 The grid asked the broker for account information on every tick to work out its loss limit

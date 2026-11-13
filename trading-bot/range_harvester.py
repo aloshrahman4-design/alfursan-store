@@ -58,6 +58,12 @@ WAKE_TIMEOUT_SECS = int(os.environ.get("WAKE_TIMEOUT_SECS", "120"))
 # broker before it can quote anything. That is minutes on the first run, so a 30s wait made
 # a perfectly healthy new account report "Timed out waiting for MetaApi to synchronize".
 DEPLOY_TIMEOUT_SECS = int(os.environ.get("DEPLOY_TIMEOUT_SECS", "600"))
+# Read positions and prices from MetaApi's streamed local cache instead of polling the
+# metered API. Off only as an escape hatch if a broker's stream misbehaves.
+STREAM_READS = os.environ.get("STREAM_READS", "1") not in ("0", "false", "no")
+# How long an engine tick waits when reads ARE metered. The fast paths below are safe
+# only against a local cache; against the API they are what exhausted the quota.
+RPC_TICK_SECS = float(os.environ.get("RPC_TICK_SECS", "15"))
 # --- TradingView webhook ------------------------------------------------------------
 # TradingView posts alerts to ports 80/443 only, over IPv4, and cancels a request that
 # takes more than three seconds. It sends no headers we could authenticate with, so the
@@ -1161,13 +1167,33 @@ async def ensure_connection():
                              "خليه وأنا أكتب لك أول ما يخلص.")
                 await account_instance.wait_deployed(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
             await account_instance.wait_connected(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
-            conn = account_instance.get_rpc_connection()
-            await conn.connect()
-            await conn.wait_synchronized(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
-            try:
-                await conn.subscribe_to_market_data(symbol=SYMBOL)
-            except Exception:
-                pass
+            # Streaming first: its reads are free and the API quota is what took the
+            # bot off the air. RPC stays as the fallback, and the engines slow right
+            # down when they are on it, because there every read is metered.
+            conn = None
+            if STREAM_READS:
+                try:
+                    stream = account_instance.get_streaming_connection()
+                    await stream.connect()
+                    await stream.wait_synchronized(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
+                    try:
+                        await stream.subscribe_to_market_data(symbol=SYMBOL)
+                    except Exception as e:
+                        log.warning(f"market data subscribe failed: {e}")
+                    conn = StreamingView(stream)
+                    log.info("Connected MetaApi in STREAMING mode - reads are free")
+                except Exception as e:
+                    log.warning(f"streaming connection failed, falling back to RPC: {e}")
+                    conn = None
+            if conn is None:
+                conn = account_instance.get_rpc_connection()
+                await conn.connect()
+                await conn.wait_synchronized(timeout_in_seconds=DEPLOY_TIMEOUT_SECS)
+                try:
+                    await conn.subscribe_to_market_data(symbol=SYMBOL)
+                except Exception:
+                    pass
+                log.warning("Connected MetaApi in RPC mode - every read is metered")
             connection = conn
             last_price_ok = time.time()
             fail_streak, hinted = 0, None
@@ -1192,6 +1218,57 @@ async def ensure_connection():
             # An empty balance or a rejected token is a wall, not a blip: retrying every few
             # seconds cannot fix it and only buries the user in repeats of the same message.
             await asyncio.sleep(600 if hint else min(5 * fail_streak, 60))
+
+
+class StreamingView:
+    """Reads served from MetaApi's local terminal-state cache; everything else passes on.
+
+    This exists because the bot was polling itself off the air. Every tick asked the
+    broker for positions and a price over the API, which is metered: roughly 150,000
+    requests per six hours between the two engines, against a 4,320,000 CPU-credit
+    quota. The quota ran out, every read started failing, and the protection guard went
+    quiet - not because its logic was wrong, but because it could no longer see a price.
+
+    A streaming connection is pushed updates over a websocket and keeps them in memory.
+    Reading positions or a price out of that cache costs nothing and is fresher than a
+    poll. Trades still go through the API, which is as it should be: those are rare.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)   # trades, cancels, close, wait_synchronized...
+
+    @property
+    def streaming(self):
+        return True
+
+    async def get_positions(self):
+        return list(self._conn.terminal_state.positions or [])
+
+    async def get_orders(self, **kw):
+        return list(self._conn.terminal_state.orders or [])
+
+    async def get_symbol_price(self, symbol=None, **kw):
+        price = self._conn.terminal_state.price(symbol or SYMBOL)
+        if not price:
+            raise RuntimeError(f"no streamed price for {symbol or SYMBOL} yet")
+        return price
+
+    async def get_account_information(self):
+        info = self._conn.terminal_state.account_information
+        if not info:
+            raise RuntimeError("account information has not streamed in yet")
+        return info
+
+    async def get_symbol_specification(self, symbol):
+        return self._conn.terminal_state.specification(symbol)
+
+
+def reads_are_free():
+    """True when positions and prices come from the local cache instead of the API."""
+    return bool(getattr(connection, "streaming", False))
 
 
 async def safe_close_position(pos_id: str):
@@ -1774,7 +1851,7 @@ async def protect_engine():
             price = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=6.0)
             bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
             if not bid or not ask:
-                await asyncio.sleep(2)
+                await asyncio.sleep(2 if reads_are_free() else RPC_TICK_SECS)
                 continue
             released = set(grid.load().get("released", []))
             magics = (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS
@@ -1788,13 +1865,13 @@ async def protect_engine():
                                            gap_floor=gap_floor)
                 # The window no broker stop can reach. Gated on bot_active: tightening a
                 # stop is safe in any state, closing is not, and /pause must mean it.
-                mine = [p for p in await asyncio.wait_for(
-                            connection.get_positions(), timeout=6.0)
-                        if p.get("symbol") == SYMBOL and p.get("magic") in magics
-                        and p.get("id") not in released]
+                # The same `mine` is reused on purpose - re-reading cost a whole extra
+                # API call per tick, and anything apply_breakeven has just protected is
+                # far above BE_SOFT_EXIT, so soft_protect skips it on profit alone.
                 await grid.soft_protect(connection, mine, bid, ask, notify,
                                         allowed=bot_active)
-            await asyncio.sleep(1.0 if mine else 3.0)
+            fast = 1.0 if mine else 3.0
+            await asyncio.sleep(fast if reads_are_free() else RPC_TICK_SECS)
         except asyncio.CancelledError:
             raise
         except Exception as e:

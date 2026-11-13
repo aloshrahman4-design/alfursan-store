@@ -89,6 +89,11 @@ def profit_of(pos, price):
 class PaperBroker:
     """Same surface as the real brokers, backed by a JSON file instead of a broker."""
 
+    # Its reads are a local JSON file: no API, no quota, nothing metered. Saying so is
+    # what keeps the engines on their fast tick in paper mode - without it they fall back
+    # to the slow pace meant for a billed API, and a $2 grid cannot work at 15s a look.
+    streaming = True
+
     async def connect(self):
         state = _load()
         _save(state)
