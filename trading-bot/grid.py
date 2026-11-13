@@ -878,9 +878,13 @@ async def arm(conn, symbol, notify):
                 continue              # the user has stood this direction down by hand
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
+                opts = {"magic": magic}
+                _tsl = server_trail()
+                if _tsl:
+                    opts["trailingStopLoss"] = _tsl   # protected from the first tick
                 res = await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
-                          take_profit=tp, options={"magic": magic}), timeout=8.0)
+                          take_profit=tp, options=opts), timeout=8.0)
                 remember_order((res or {}).get("orderId"))
                 placed += 1
             except Exception as e:
@@ -1396,10 +1400,14 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
                 log.warning(f"could not recycle {furthest.get('id')}: {e}")
                 continue
         try:
+            _opts = {"magic": magic}
+            _tsl = server_trail()
+            if _tsl:
+                _opts["trailingStopLoss"] = _tsl
             res = await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
                       take_profit=round(at + sign * dist, 2) if dist else None,
-                      options={"magic": magic}), timeout=8.0)
+                      options=_opts), timeout=8.0)
             remember_order((res or {}).get("orderId"))
             added += 1
             log.info(f"refilled {'buy' if sign > 0 else 'sell'} level at {at}")
@@ -1547,6 +1555,86 @@ async def broker_stop_gap(conn, symbol):
     _stops["value"] = gap
     log.info(f"broker stop distance for {symbol}: {points} points = {gap}$")
     return gap
+
+
+# --- the owner's rule, handed to the server instead of polled for -------------------
+# Everything above this line protects a trade by LOOKING at it: read the price, read the
+# position, decide, write a new stop. That is a loop, and a loop needs the API to be
+# answering - which is exactly what it was not, for most of today.
+#
+# MetaApi takes the whole rule as data and runs it itself. One write per trade and the
+# protection is server-side: it holds when the bot is off, when the VM is down, when the
+# quota is spent, when the phone is in a drawer. The polling guard becomes a backstop
+# rather than the thing the money depends on.
+#
+# The rule, in his words, mapped to MetaApi's own fields:
+#   "مجرد ما تدخل بالربح خلي وقف عند نقطة الدخول"  -> threshold 0.35 -> stopLoss 0.10
+#   "وبعدها تمشي معاها بالربح"                      -> distance 0.50 behind
+#   "تعدّي 2 دولار ما ينزل الوقف تحتها"              -> threshold 2.00 -> stopLoss 2.00
+# RELATIVE_CURRENCY means the numbers are DOLLARS of profit, not price - so one config
+# is correct at 0.01 lots and at 0.05 lots with no arithmetic on our side.
+SERVER_TRAIL = os.environ.get("SERVER_TRAIL", "1") not in ("0", "false", "no")
+
+
+def server_trail():
+    """His protection rule as a MetaApi trailingStopLoss, or None if switched off."""
+    if not (SERVER_TRAIL and BE_ENABLED):
+        return None
+    steps = []
+    if BE_TRIGGER_CASH > 0:
+        steps.append({"threshold": round(BE_TRIGGER_CASH, 2),
+                      "stopLoss": round(BE_LOCK_CASH, 2)})
+    if BE_FLOOR_CASH > 0 and BE_FLOOR_CASH > BE_LOCK_CASH:
+        steps.append({"threshold": round(BE_FLOOR_CASH, 2),
+                      "stopLoss": round(BE_FLOOR_CASH, 2)})
+    cfg = {}
+    if steps:
+        cfg["threshold"] = {"thresholds": steps,
+                            "units": "RELATIVE_CURRENCY",
+                            "stopPriceBase": "OPEN_PRICE"}
+    if BE_TRAIL_CASH > 0:
+        # MetaApi takes whichever of distance and threshold ends up CLOSEST to price,
+        # so the trail tightens past the floor and the floor holds under it. That is
+        # the rule as he stated it, with no extra logic from us.
+        cfg["distance"] = {"distance": round(BE_TRAIL_CASH, 2),
+                           "units": "RELATIVE_CURRENCY"}
+    return cfg or None
+
+
+def has_server_trail(p):
+    tsl = (p or {}).get("trailingStopLoss")
+    return bool(tsl and (tsl.get("threshold") or tsl.get("distance")))
+
+
+async def ensure_server_trail(conn, positions, notify=None):
+    """Hand the rule to the server for any position that is not already carrying it.
+
+    One write each, once in the life of the position. After this the trade is protected
+    by MetaApi whether or not this process is alive.
+    """
+    cfg = server_trail()
+    if not cfg or not hasattr(conn, "modify_position"):
+        return 0
+    done = 0
+    for p in positions:
+        if has_server_trail(p):
+            continue
+        try:
+            await asyncio.wait_for(
+                conn.modify_position(p["id"], trailing_stop_loss=cfg), timeout=8.0)
+            done += 1
+        except Exception as e:
+            log.warning(f"server trail refused on {p.get('id')}: {e}")
+    if done and notify:
+        floor = (f" ولا ينزل تحت `{BE_FLOOR_CASH:g}$` بعد ما تعديها"
+                 if BE_FLOOR_CASH > 0 else "")
+        await notify(
+            f"🔐 *سلّمت حراسة `{done}` صفقة للسيرفر*\n"
+            f"• أول ما تربح `{BE_TRIGGER_CASH:g}$` ينتقل وقفها لنقطة الدخول\n"
+            f"• وبعدها يمشي وراها على بُعد `{BE_TRAIL_CASH:g}$`{floor}\n"
+            f"• *ينفّذها MetaApi نفسه* — تشتغل حتى لو البوت مطفي أو السيرفر واقف "
+            f"أو الحصة منتهية")
+    return done
 
 
 _be_peaks = {}        # best profit each secured position has shown; dies with the position

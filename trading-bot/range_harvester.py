@@ -158,6 +158,7 @@ SETTABLE_KEYS = {
     "STREAM_ONLY": "يرفض القناة المدفوعة وينتظر المجانية (1 أو 0)",
     "STREAM_RETRY_SECS": "كم ثانية ينتظر قبل ما يعيد محاولة القناة المجانية",
     "BE_MIN_GAP": "هامش أمان فوق مسافة الوسيط",
+    "SERVER_TRAIL": "وقف متحرك ينفّذه السيرفر بدل البوت (1 أو 0)",
     "BE_SOFT": "حراسة برمجية قبل ما ينفع الستوب (1 أو 0)",
     "BE_SOFT_EXIT": "الربح اللي عنده يغلقها بالحراسة البرمجية",
     "GRID_MAX_POSITIONS": "أقصى عدد صفقات شبكة مفتوحة بنفس الوقت",
@@ -189,7 +190,7 @@ KEY_ALIASES = {
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
-    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
+    "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "servertrail": "SERVER_TRAIL", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT", "brake": "GRID_EQUITY_BRAKE_PCT",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
     "half": "HALF_ENABLED", "halfdist": "HALF_DISTANCE", "halfmin": "HALF_MIN_LOT",
@@ -471,6 +472,8 @@ async def broker_check():
     lines.append("📡 القراءة: " + ("*بث مباشر* — مجانية ✅" if reads_are_free()
                  else "*استعلام مدفوع* — محدودة بحصة ⚠️"))
     lines.append(price_source_line())
+    if grid is not None and grid.server_trail():
+        lines.append("🔐 الحراسة: *عند السيرفر* — تشتغل حتى لو البوت مطفي")
     if stream_fails:
         lines.append(f"• حاولت أفتح القناة المجانية `{stream_fails}` مرة وما نجحت بعد"
                      + (" — أعيد المحاولة كل "
@@ -2039,6 +2042,9 @@ async def protect_engine():
                     if p.get("symbol") == SYMBOL and p.get("magic") in magics
                     and p.get("id") not in released]
             if mine:
+                # Hand the rule to MetaApi first. Once a position carries it, its
+                # protection no longer depends on this loop running at all.
+                await grid.ensure_server_trail(connection, mine, notify)
                 gap_floor = await grid.broker_stop_gap(connection, SYMBOL)
                 await grid.apply_breakeven(connection, mine, bid, ask, notify, "",
                                            gap_floor=gap_floor)

@@ -498,6 +498,39 @@ dropped when it closes, and stale ids are swept each tick against what is actual
 The anchor price still comes from the newest trade, which is what the re-entry logic means
 by "the anchor".
 
+## Give the rule to the server, stop polling for it
+
+Everything else in this file protects a trade by **looking** at it: read the price, read
+the position, decide, write a new stop. That is a loop, and a loop only works while the
+API is answering — which, for most of one day, it was not. Every fix up to here reduced
+how much the loop cost. None of them removed the dependency, and the owner said so.
+
+MetaApi takes the whole rule as data and runs it itself. `trailingStopLoss` is accepted
+on `CreateMarketTradeOptions`, on `PendingTradeOptions`, and on `modify_position()`, and
+his rule maps onto it field for field:
+
+| his words | the field |
+|---|---|
+| "مجرد ما تدخل بالربح خلي وقف عند نقطة الدخول" | threshold `0.35` → stopLoss `0.10` |
+| "وبعدها تمشي معاها بالربح" | distance `0.50` behind |
+| "تعدّي 2 دولار ما ينزل الوقف تحتها" | threshold `2.00` → stopLoss `2.00` |
+
+`units: RELATIVE_CURRENCY` means those numbers are **dollars of profit**, not price. One
+config is therefore correct at 0.01 lots and at 0.05 lots with no arithmetic on our side
+— which is precisely the thing the hand-rolled version kept getting wrong, from
+`BE_TRAIL_CASH` being tighter than the spread on a big lot to the whole `BE_MIN_GAP`
+episode. And MetaApi resolves distance against threshold by taking whichever ends up
+closest to price, so the trail tightens past the floor and the floor holds beneath it —
+his rule exactly, with no logic of ours in the middle.
+
+Every order is now born carrying it, and `ensure_server_trail()` hands it to any position
+that is not already holding one: one write, once, per trade.
+
+What that buys, and it is the whole point: **the protection no longer depends on this
+program.** It holds when the bot is off, when the VM is down, when the quota is spent,
+when the phone is in a drawer. The polling guard is still there and still useful as a
+backstop, but the money no longer rides on it.
+
 ## The price was never worth paying for
 
 `datafeed.py` has been in this repo from the start, with this at the top of it:
