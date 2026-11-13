@@ -831,6 +831,36 @@ is armed and nothing is open.
 Both messages now say plainly that the open trades keep their protection, their trailing
 and their harvest while the grid itself stands down.
 
+## Hedging is not expanding, and the brake had to learn the difference
+
+The owner, after the brake had locked him out: *"I want the bot working on the way down.
+If it goes up, it just holds — I have trades above, and if price comes back I'm in
+profit."*
+
+That is a coherent book, and the brake was refusing the half of it that helps. He is net
+long and losing. A **sell** does not add risk to that account, it cancels some. Blocking
+it pinned him to the only direction that was hurting him, which is the opposite of what
+a brake is for.
+
+`net_exposure()` signs every position on the symbol — grid, anchor and handed-over alike,
+because direction no more cares which engine opened a trade than margin does.
+`hedge_side()` names the side that moves the account toward flat. While braked, the
+engine arms **that side only**, capped at `abs(net)` lots so it can never run past flat
+and start building fresh exposure in the other direction.
+
+Flat and braked still arms nothing: there is no hedge left to place, and anything further
+would be new risk.
+
+`book()` returns the grid's own positions and the account's net from a single read.
+
+### And the blind guard had to learn it too
+
+Six sell orders he had just asked for were pulled by the blind guard, on the reasoning
+that a fill nobody can watch is a fill nobody can close. That reasoning expired the
+moment orders started being born with a server-side trailing stop: MetaApi protects
+whatever those orders open, seen or unseen. The guard now stands down whenever
+`server_trail()` is active, and says so in the message when it does fire.
+
 ## A brake measured against the account, not against another setting
 
 `GRID_ADD_STOP_PCT` stops the grid expanding at 50% of `GRID_MAX_LOSS`. The owner set

@@ -165,6 +165,7 @@ async def cancel_known(conn, notify=None):
     if notify:
         await notify(
             f"🕶 *ما أكدر أشوف السوق — سحبت أوامري*\n"
+            f"• (لو كان وقف السيرفر مفعّل ما كنت سحبتها — الصفقة تولد محمية)\n"
             f"• صار `{blind_for()/60:.0f}` دقيقة وأنا ما أقدر أقرأ السعر ولا الصفقات\n"
             f"• الأمر المعلّق ينفتح لحاله عند الوسيط حتى لو أنا أعمى — "
             f"يعني تنفتح صفقات وما أكدر أتابعها ولا أغلقها\n"
@@ -664,6 +665,19 @@ def reset():
     trend_reset()
 
 
+async def book(conn, symbol=None, exclude=None):
+    """One read, two answers: the grid's own trades, and the account's net direction.
+
+    The net must count EVERY position on the symbol - anchor and handed-over trades
+    included - because that is what decides whether a new order hedges or adds.
+    """
+    exclude = set(exclude if exclude is not None else load().get("released", []))
+    pos = await asyncio.wait_for(conn.get_positions(), timeout=6.0)
+    note_read_ok()
+    mine = [p for p in pos if p.get("magic") in MAGICS and p.get("id") not in exclude]
+    return mine, net_exposure(pos, symbol)
+
+
 async def grid_positions(conn, exclude=None):
     """Grid trades the bot still owns. Released ones are the user's and stay invisible."""
     exclude = set(exclude if exclude is not None else load().get("released", []))
@@ -838,8 +852,8 @@ def plan_text(balance=0.0):
     return "\n".join(lines)
 
 
-async def arm(conn, symbol, notify):
-    """Place the ladder on both sides of the current price."""
+async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
+    """Place the ladder. `only_magic` and `max_lots` restrict it to a hedging pass."""
     price = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
     bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
     if not bid or not ask:
@@ -860,13 +874,15 @@ async def arm(conn, symbol, notify):
     balance = float(acct.get("balance", 0) or 0)
     free = float(acct.get("freeMargin", acct.get("equity", balance)) or balance)
     leverage = float(acct.get("leverage", 500) or 500)
-    need = sum(lots) * bias_sides() * center * GRID_CONTRACT / max(1.0, leverage)
+    _sides = 1 if only_magic is not None else bias_sides()
+    _total = min(sum(lots), max_lots) if max_lots is not None else sum(lots)
+    need = _total * _sides * center * GRID_CONTRACT / max(1.0, leverage)
     ceiling = balance * GRID_MARGIN_CEILING_PCT / 100.0
     if need > min(free, ceiling):
         return False, (f"الهامش المطلوب `{need:,.0f}$` أكبر من المسموح "
                        f"`{min(free, ceiling):,.0f}$` — قلّل المستويات أو اللوت")
 
-    placed, failed = 0, 0
+    placed, failed, placed_lots = 0, 0, 0.0
     for i, lot in enumerate(lots, start=1):
         up = round(center + i * GRID_STEP, 2)
         down = round(center - i * GRID_STEP, 2)
@@ -876,6 +892,10 @@ async def arm(conn, symbol, notify):
                 (conn.create_stop_sell_order, down, MAGIC_GRID_SELL, -1)):
             if not bias_allows(magic):
                 continue              # the user has stood this direction down by hand
+            if only_magic is not None and magic != only_magic:
+                continue              # hedging pass: one side only
+            if max_lots is not None and placed_lots + lot > max_lots + 1e-9:
+                continue              # never hedge past flat and open fresh exposure
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
                 opts = {"magic": magic}
@@ -887,6 +907,7 @@ async def arm(conn, symbol, notify):
                           take_profit=tp, options=opts), timeout=8.0)
                 remember_order((res or {}).get("orderId"))
                 placed += 1
+                placed_lots = round(placed_lots + lot, 2)
             except Exception as e:
                 failed += 1
                 log.warning(f"grid level {i} at {price_at} failed: {e}")
@@ -908,7 +929,8 @@ async def arm(conn, symbol, notify):
         rec = (f"\n🔁 *استرداد محدود فعّال* — `{streak}` دورة خاسرة ورا بعض، "
                f"فبديت من `{base:g}` بدل `{GRID_BASE_LOT:g}`. "
                f"السقف `{round(min(GRID_RECOVER_MAX, GRID_MAX_LOT), 2):g}` وما يتعداه أبداً.")
-    await notify(f"🕸 *نصبت الشبكة حول* `{center}`\n\n{plan_text(balance)}\n"
+    head = why or f"🕸 *نصبت الشبكة حول* `{center}`"
+    await notify(f"{head}\n\n{plan_text(balance)}\n"
                  f"• أوامر معلّقة: `{placed}`{note}{rec}")
     return True, None
 
@@ -931,6 +953,40 @@ async def cached_account(conn):
 async def cached_balance(conn):
     bal, _ = await cached_account(conn)
     return bal
+
+
+def net_exposure(positions, symbol=None):
+    """Signed lots across every position given: + is net long, - is net short.
+
+    Counts everything on the symbol - grid, anchor, trades handed over - because
+    direction, like margin, does not care which engine opened what.
+    """
+    net = 0.0
+    for p in positions or []:
+        if symbol and p.get("symbol") != symbol:
+            continue
+        try:
+            vol = float(p.get("volume", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        net += vol if p.get("type") == "POSITION_TYPE_BUY" else -vol
+    return round(net, 2)
+
+
+def hedge_side(net):
+    """The side that moves an account TOWARD flat, or None when it already is.
+
+    This is the correction the owner pointed out. The drawdown brake blocked every new
+    order while the account was under water, on the reasoning that a new order is new
+    exposure. For one side of the book that is simply false: he is long and losing, so
+    a SELL does not add risk - it cancels some. Blocking it kept him pinned to the only
+    direction that was hurting him, which is the opposite of what a brake is for.
+    """
+    if net > 0:
+        return MAGIC_GRID_SELL      # long and hurting: selling moves toward flat
+    if net < 0:
+        return MAGIC_GRID_BUY
+    return None
 
 
 def drawdown_brake(balance, equity):
@@ -968,8 +1024,14 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 continue
             global _last_conn
             _last_conn = conn
-            # Blind for too long? Pull the orders before they open anything else.
-            if not reads_free(conn) and blind_for() > BLIND_SECS and not _blind["cut"]:
+            # Blind for too long? Pull the orders - but only if a fill would actually
+            # be unmanaged. Once every order is born carrying a server-side trailing
+            # stop, MetaApi protects whatever it opens whether or not we can see it, so
+            # cancelling would just throw away the user's position for no safety gained.
+            # That is what happened at 2:43: six sell orders he wanted, pulled because
+            # the premise "a fill is unwatched" was no longer true.
+            if (not reads_free(conn) and server_trail() is None
+                    and blind_for() > BLIND_SECS and not _blind["cut"]):
                 _blind["cut"] = True
                 try:
                     await cancel_known(conn, notify)
@@ -1002,8 +1064,27 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     _d, _lim, braked_now = drawdown_brake(_b, _e)
                 except Exception as e:
                     log.warning(f"could not read the account for the brake: {e}")
-                held = await grid_positions(conn)
+                held, net = await book(conn, symbol)
                 crowded_now = len(held) >= GRID_MAX_POSITIONS
+                # Under water, but one direction still REDUCES the hole. Let that one
+                # through, capped so it can never run past flat into fresh exposure.
+                hedge = hedge_side(net) if braked_now else None
+                if hedge is not None and bias_allows(hedge) and not crowded_now:
+                    room_lots = round(abs(net), 2)
+                    side_ar = "بيع" if hedge == MAGIC_GRID_SELL else "شراء"
+                    ok, err = await arm(
+                        conn, symbol, notify, only_magic=hedge, max_lots=room_lots,
+                        why=(f"🛡 *نصبت سلّم {side_ar} للتحوّط*\n"
+                             f"• الحساب نازل `{_d:g}$` وصافي تعرّضك "
+                             f"`{abs(net):g}` لوت {'شراء' if net > 0 else 'بيع'}\n"
+                             f"• كل صفقة {side_ar} تنقّص تعرّضك، ما تزيده\n"
+                             f"• ما أتعدى `{room_lots:g}` لوت — عند هذا الحد تصير متعادل، "
+                             f"وبعدها أي زيادة تكون مخاطرة جديدة فأوقف"))
+                    if not ok:
+                        log.warning(f"hedge arm refused: {err}")
+                    else:
+                        await asyncio.sleep(2)
+                        continue
                 if braked_now:
                     # A new ladder is new exposure. Not while the account is this far
                     # under - that is the moment it can least afford another level.
@@ -1013,7 +1094,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                         await notify(
                             f"🛑 *ما أنصب شبكة جديدة — الحساب نازل `{_d:g}$` تحت رصيده*\n"
                             f"• الحد `{_lim:g}$` (`{GRID_EQUITY_BRAKE_PCT:g}%` من الرصيد)\n"
-                            f"• ما أضيف ولا صفقة وأنت بهذا العمق\n"
+                            f"• ما أضيف ولا صفقة تزيد تعرّضك وأنت بهذا العمق\n"
                             f"• بس أبقى أدير `{len(held)}` صفقة مفتوحة: تأمين، تريلينغ، "
                             f"وحصاد لو طلعت بالربح\n"
                             f"• أرجع أنصب أول ما ترجع الخسارة تحت الحد\n"
