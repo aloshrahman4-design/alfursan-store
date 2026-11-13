@@ -731,6 +731,37 @@ def pnl(positions):
     return round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0) for p in positions), 2)
 
 
+async def clear_loss_stops(conn, positions, bid, ask, notify=None):
+    """Remove loss-side stops from grid trades, leaving any profit trail untouched.
+
+    MT5 clears a stop when it is set to 0, and the SDK forwards a numeric 0 as
+    stopLoss while dropping None - so 0 is the clear and None is "leave it".
+    """
+    cleared = 0
+    for p in positions:
+        if p.get("magic") not in (MAGIC_GRID_BUY, MAGIC_GRID_SELL):
+            continue
+        sl = p.get("stopLoss")
+        entry = float(p.get("openPrice", 0) or 0)
+        if not sl or not entry:
+            continue
+        is_buy = p.get("type") == "POSITION_TYPE_BUY"
+        pad = max(0.0, float(ask) - float(bid))
+        # Worse than entry by more than the spread => a loss stop, not a trail.
+        if not ((is_buy and float(sl) < entry - pad) or
+                (not is_buy and float(sl) > entry + pad)):
+            continue
+        try:
+            await asyncio.wait_for(conn.modify_position(p["id"], stop_loss=0), timeout=8.0)
+            cleared += 1
+        except Exception as e:
+            log.warning(f"could not clear loss stop on {p.get('id')}: {e}")
+    if cleared and notify:
+        await notify(f"🧹 *شلت وقف الخسارة عن `{cleared}` صفقة* — بقى ستوب متابعة "
+                     f"الربح بس")
+    return 0
+
+
 async def ensure_entry_stops(conn, positions, bid, ask, notify=None):
     """Put the hard stop on open trades that do not have one - where it is still safe.
 
@@ -742,9 +773,19 @@ async def ensure_entry_stops(conn, positions, bid, ask, notify=None):
     the wrong way: that is not a stop, it is an instant close at the worst price. So a
     position whose current price has already passed where the stop would sit is left
     alone and reported, not silently shut.
+
+    Setting GRID_STOP_DIST to 0 means "no hard stop, only the profit trail" - and that
+    has to UNDO the stops already written, not just stop writing new ones. A broker
+    keeps a stop until something clears it, so turning the setting off while old stops
+    sat on live trades would have left them armed and the owner believing they were
+    gone. Clearing is narrow on purpose: only a stop sitting on the LOSING side of the
+    entry is removed. A profit trail never sits there - it only exists at or past
+    break-even - so this can never eat the protection he wants to keep.
     """
-    if GRID_STOP_DIST <= 0 or not hasattr(conn, "modify_position"):
+    if not hasattr(conn, "modify_position"):
         return 0
+    if GRID_STOP_DIST <= 0:
+        return await clear_loss_stops(conn, positions, bid, ask, notify)
     placed, skipped = 0, []
     for p in positions:
         if p.get("magic") not in (MAGIC_GRID_BUY, MAGIC_GRID_SELL):
