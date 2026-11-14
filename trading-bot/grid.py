@@ -874,10 +874,8 @@ async def ensure_take_profits(conn, positions, notify=None):
     """
     if GRID_TP_PER_TRADE <= 0:
         return 0
-    fixed = []
+    fixed, moved = [], 0
     for p in positions:
-        if p.get("takeProfit"):
-            continue
         dist = tp_distance(p.get("volume", 0))
         if not dist:
             continue
@@ -886,14 +884,27 @@ async def ensure_take_profits(conn, positions, notify=None):
             continue
         is_buy = p.get("type") == "POSITION_TYPE_BUY"
         tp = round(entry + dist, 2) if is_buy else round(entry - dist, 2)
+        # Skipping anything that already HAS a target is the same mistake the trailing
+        # stop made: change the figure from $5 to $1 and every live position keeps the
+        # old, far one forever. What matters is whether the target is the CURRENT one.
+        have = p.get("takeProfit")
+        try:
+            if have is not None and abs(float(have) - tp) < 0.01:
+                continue
+        except (TypeError, ValueError):
+            pass
+        if have:
+            moved += 1
         try:
             await asyncio.wait_for(conn.modify_position(p["id"], take_profit=tp), timeout=8.0)
             fixed.append((p["id"], tp))
         except Exception as e:
             log.warning(f"could not set take profit on {p.get('id')}: {e}")
     if fixed and notify:
-        await notify(f"🎯 *حطيت هدف `+{GRID_TP_PER_TRADE:g}$` على `{len(fixed)}` صفقة شبكة "
-                     "كانت بلا هدف* — صارت تغلق لحالها عند الوسيط.")
+        what = (f"نقلت هدف `{moved}` صفقة للرقم الجديد و" if moved else "")
+        await notify(f"🎯 *{what}حطيت هدف `+{GRID_TP_PER_TRADE:g}$` على "
+                     f"`{len(fixed) - moved}` صفقة كانت بلا هدف* — "
+                     f"تغلق لحالها عند الوسيط.")
     return len(fixed)
 
 
