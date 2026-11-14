@@ -895,7 +895,7 @@ async def teardown(conn):
     return closed, booked, cancelled
 
 
-def plan_text(balance=0.0):
+def plan_text(balance=0.0, price=0.0):
     """Everything the user needs to judge the configuration before arming it."""
     lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
     total = round(sum(lots), 2)
@@ -907,7 +907,18 @@ def plan_text(balance=0.0):
     worst, best, whip = worst_case(risk), best_case(risk), whipsaw_case(risk)
     limit = loss_limit(balance)
     shown = ", ".join(f"{x:g}" for x in lots[:10]) + (" …" if len(lots) > 10 else "")
+    unit = UNIT_WORD.get(float(GRID_CONTRACT), f"{GRID_CONTRACT:g} وحدة")
+    head_line = f"• 🎯 الأداة: `{GRID_SYMBOL}` · اللوت = `{unit}`"
+    if price:
+        pct = GRID_STEP / float(price) * 100.0
+        ok_step, floor, nice = step_sane(price)
+        head_line += f"\n• السعر `{float(price):,.0f}$` · الخطوة `{pct:.3f}%` منه"
+        if not ok_step:
+            head_line += (f"\n• ⛔️ *الخطوة صغيرة على هذا السعر — ما أنصب*\n"
+                          f"  الحد `{floor:g}$` · المنصوح `{nice:g}$` · "
+                          f"`/setkey gridstep {nice:g}`")
     lines = [
+        head_line,
         f"• المستويات: `{len(lots)}` لكل جهة · المسافة `{GRID_STEP:g}$`",
         f"• السلّم: `{shown}`",
         f"• أكبر لوت: `{max(lots) if lots else 0:g}` · المجموع `{total:g}` لوت",
@@ -1424,7 +1435,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             await asyncio.sleep(5)
 
 
-def status_text(balance=0.0):
+def status_text(balance=0.0, price=0.0):
     state = load()
     lots = ladder(base=recovery_base(state.get("loss_streak", 0)))
     head = "🕸 *شبكة المضاعفة المكبوحة*"
@@ -1436,7 +1447,7 @@ def status_text(balance=0.0):
         head += f" — ✅ منصوبة حول `{state.get('center')}`"
     else:
         head += " — ⏳ تنتظر النصب"
-    body = [head, "", plan_text(balance), "",
+    body = [head, "", plan_text(balance, price), "",
             f"• دورات مكتملة: `{state.get('cycles', 0)}` · محصّلة: `{state.get('realized', 0.0):g}$`"]
     freed = len(state.get("released", []))
     if freed:
@@ -1811,6 +1822,9 @@ GRID_STOP_DIST = _f("GRID_STOP_DIST", 0.0)
 # under gold's own ratio, so an existing gold setup keeps working untouched, while a
 # step that cannot work on a dearer instrument is refused with the number to use.
 GRID_STEP_MIN_PCT = _f("GRID_STEP_MIN_PCT", 0.02)     # of price, per step
+GRID_SYMBOL = os.environ.get("SYMBOL", "GOLD").strip()
+# What a lot is, in words, so the panel can say it instead of printing a bare 100.
+UNIT_WORD = {100.0: "100 أونصة", 1.0: "وحدة واحدة", 1000.0: "1000 وحدة"}
 
 
 def step_floor(price):

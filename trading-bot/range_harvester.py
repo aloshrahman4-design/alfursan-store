@@ -2058,14 +2058,19 @@ async def handle_grid_command(text):
             "• صفقاتك المسلّمة ما لمستها\n\n"
             "🕸 أنصبها من جديد على السعر الحالي خلال ثواني...")
         return
-    balance = 0.0
+    balance, px = 0.0, 0.0
     if connection is not None:
         try:
             acct = await asyncio.wait_for(connection.get_account_information(), timeout=6.0)
             balance = float(acct.get("balance", 0) or 0)
         except Exception:
             pass
-    await send_long(grid.status_text(balance), markup=keyboard())
+    try:   # free when reads are free, and the panel is useless without it on crypto
+        q = await market_price(SYMBOL)
+        px = (float(q.get("bid", 0) or 0) + float(q.get("ask", 0) or 0)) / 2.0
+    except Exception:
+        pass
+    await send_long(grid.status_text(balance, px), markup=keyboard())
 
 
 async def protect_engine():
