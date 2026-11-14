@@ -2087,8 +2087,14 @@ FLOOR_HEADROOM_CASH = _f("FLOOR_HEADROOM_CASH", 0.0) or None
 
 
 def _floor_headroom():
-    return FLOOR_HEADROOM_CASH if FLOOR_HEADROOM_CASH else max(0.25 * BE_FLOOR_CASH,
-                                                               BE_TRIGGER_CASH)
+    """A quarter of the floor, and nothing cleverer.
+
+    The first version took max(quarter, BE_TRIGGER_CASH), which made the arming point
+    depend on an unrelated setting: with a $2 floor and a $1.20 trigger it armed at
+    $3.20, not the $2.50 the owner had been told. A protection rule he cannot predict
+    from his own numbers is a rule he cannot trust.
+    """
+    return FLOOR_HEADROOM_CASH if FLOOR_HEADROOM_CASH else max(0.25 * BE_FLOOR_CASH, 0.05)
 
 
 def server_trail():
@@ -2126,6 +2132,37 @@ def has_server_trail(p):
     return bool(tsl and (tsl.get("threshold") or tsl.get("distance")))
 
 
+def _trail_shape(tsl):
+    """The numbers that define a trail, so two of them can be compared."""
+    # A broker can hand back any shape at all, including a plain string where a dict
+    # is expected. Anything unreadable returns None, which the caller treats as
+    # "leave it alone" rather than rewriting the position on every tick.
+    try:
+        tsl = tsl or {}
+        th = (tsl.get("threshold") or {}).get("thresholds") or []
+        steps = tuple(sorted((round(float(x.get("threshold", 0)), 2),
+                              round(float(x.get("stopLoss", 0)), 2)) for x in th))
+        d = (tsl.get("distance") or {}).get("distance")
+        return steps, (round(float(d), 2) if d is not None else None)
+    except (TypeError, ValueError, AttributeError, KeyError):
+        return None
+
+
+def trail_is_current(p, cfg):
+    """True when the position already carries THIS rule, not merely some rule.
+
+    has_server_trail only ever asked "is there a trail?". So the moment the owner
+    changed his protection - from locking $0.10 to locking $1.00 - every position
+    already running kept the old rule forever, silently, because something was there.
+    A rule he can change is a rule that has to be pushed when it changes.
+    """
+    have = _trail_shape((p or {}).get("trailingStopLoss"))
+    want = _trail_shape(cfg)
+    if have is None or want is None:
+        return has_server_trail(p)      # cannot compare: leave it rather than thrash
+    return have == want
+
+
 async def ensure_server_trail(conn, positions, notify=None):
     """Hand the rule to the server for any position that is not already carrying it.
 
@@ -2135,10 +2172,12 @@ async def ensure_server_trail(conn, positions, notify=None):
     cfg = server_trail()
     if not cfg or not hasattr(conn, "modify_position"):
         return 0
-    done = 0
+    done, upgraded = 0, 0
     for p in positions:
-        if has_server_trail(p):
+        if trail_is_current(p, cfg):
             continue
+        if has_server_trail(p):
+            upgraded += 1
         try:
             await asyncio.wait_for(
                 conn.modify_position(p["id"], trailing_stop_loss=cfg), timeout=8.0)
@@ -2148,6 +2187,9 @@ async def ensure_server_trail(conn, positions, notify=None):
     if done and notify:
         floor = (f" ولا ينزل تحت `{BE_FLOOR_CASH:g}$` بعد ما تعديها"
                  if BE_FLOOR_CASH > 0 else "")
+        if upgraded:
+            await notify(f"♻️ *حدّثت الحماية على `{upgraded}` صفقة شغالة* "
+                         f"— كانت على القاعدة القديمة.")
         await notify(
             f"🔐 *سلّمت حراسة `{done}` صفقة للسيرفر*\n"
             f"• أول ما تربح `{BE_TRIGGER_CASH:g}$` ينتقل وقفها لنقطة الدخول\n"
