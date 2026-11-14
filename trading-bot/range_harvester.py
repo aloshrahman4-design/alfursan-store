@@ -670,7 +670,7 @@ async def handle_gold_symbol(arg=""):
         hint = ("\n\nالموجود بحسابك من هذا النوع:\n"
                 + "\n".join(f"• `/asset {x}`" for x in near)) if near else \
                f"\n\nعدد أدوات حسابك `{len(symbols)}` وماكو ولا وحدة قريبة من هذا النوع."
-        await send_long(f"⚠️ ما لكيت أي أداة {hunt['ar']} بهذا الحساب — "
+        await send_long(f"⚠️ ما لكيت أداة {hunt['ar']} بهذا الحساب — "
                         f"يعني وسيطك ما يوفرها على الأغلب.{hint}", markup=keyboard())
         return
     # XAUEUR and BTCEUR are the same asset against another currency, not the one we trade.
