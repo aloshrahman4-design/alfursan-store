@@ -1779,6 +1779,66 @@ def stops_reset():
     _stops.update({"value": None, "asked": 0.0})
 
 
+async def spec_report(conn, symbol, price=0.0):
+    """Ask the broker its own rules for this symbol and check our settings against them.
+
+    Written after a third round of guessing at why not one order would place on
+    bitcoin: minimum lot? lot step? stops level? Every one of those answers lives in
+    the symbol specification, one call away, and we were reading screenshots instead.
+    """
+    if not hasattr(conn, "get_symbol_specification"):
+        return "هذا الوسيط ما يعطي مواصفات الأداة."
+    try:
+        sp = await asyncio.wait_for(conn.get_symbol_specification(symbol), timeout=8.0)
+    except Exception as e:
+        return f"⚠️ ما كدرت أجيب مواصفات `{symbol}`: `{str(e)[:200]}`"
+    sp = sp or {}
+    mn = float(sp.get("minVolume", 0) or 0)
+    mx = float(sp.get("maxVolume", 0) or 0)
+    st = float(sp.get("volumeStep", 0) or 0)
+    cs = float(sp.get("contractSize", 0) or 0)
+    dg = int(sp.get("digits", 2) or 2)
+    lvl = float(sp.get("stopsLevel", 0) or 0)
+    gap = round(lvl / (10.0 ** dg) * 10, 6) if lvl else 0.0   # points -> price
+
+    lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
+    lot = lots[0] if lots else GRID_BASE_LOT
+    bad = []
+    if mn and lot < mn - 1e-9:
+        bad.append(f"❌ لوتك `{lot:g}` أصغر من حد الوسيط `{mn:g}` — "
+                   f"`/setkey gridlot {mn:g}` و `/setkey gridmax {mn:g}`")
+    if st and abs(round(lot / st) * st - lot) > 1e-6:
+        bad.append(f"❌ لوتك `{lot:g}` مو من مضاعفات خطوة الوسيط `{st:g}`")
+    if mx and lot > mx + 1e-9:
+        bad.append(f"❌ لوتك `{lot:g}` أكبر من حد الوسيط `{mx:g}`")
+    if cs and abs(cs - GRID_CONTRACT) > 1e-9:
+        bad.append(f"❌ العقد عندك `{GRID_CONTRACT:g}` والوسيط يقول `{cs:g}` — "
+                   f"`/setkey gridcontract {cs:g}`")
+    if gap and GRID_STOP_DIST > 0 and GRID_STOP_DIST < gap:
+        bad.append(f"❌ وقفك الثابت `{GRID_STOP_DIST:g}$` أقرب من حد الوسيط "
+                   f"`{gap:g}$` — `/setkey gridstop 0`")
+    if gap and BE_ENABLED and lot and GRID_CONTRACT:
+        trail_px = BE_TRAIL_CASH / (lot * GRID_CONTRACT) if BE_TRAIL_CASH > 0 else 0.0
+        if trail_px and trail_px < gap:
+            bad.append(f"❌ تريلينغ `{BE_TRAIL_CASH:g}$` = `{trail_px:.2f}$` سعر، "
+                       f"أقرب من حد الوسيط `{gap:g}$` — "
+                       f"`/setkey betrail {round(gap * lot * GRID_CONTRACT * 1.5, 2):g}`")
+    if price:
+        ok_step, floor, nice = step_sane(price)
+        if not ok_step:
+            bad.append(f"❌ الخطوة `{GRID_STEP:g}$` أصغر من `{floor:g}$` — "
+                       f"`/setkey gridstep {nice:g}`")
+
+    return ("\n".join([
+        f"🔎 *قواعد الوسيط لـ* `{symbol}`",
+        f"• أقل لوت `{mn:g}` · خطوة اللوت `{st:g}` · أقصى `{mx:g}`",
+        f"• حجم العقد `{cs:g}` · الخانات `{dg}` · أقرب وقف `{gap:g}$`",
+        "",
+        f"⚙️ *إعداداتك:* لوت `{lot:g}` · عقد `{GRID_CONTRACT:g}` · "
+        f"خطوة `{GRID_STEP:g}$` · وقف ثابت `{GRID_STOP_DIST:g}$`",
+        ""] + (bad if bad else ["✅ كل الإعدادات متوافقة مع الوسيط."])))
+
+
 async def broker_stop_gap(conn, symbol):
     """Smallest gap the broker allows between a stop and the market, in price units.
 
