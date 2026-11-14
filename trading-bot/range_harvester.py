@@ -617,7 +617,23 @@ async def handle_gold_symbol(arg=""):
     if not hasattr(connection, "get_symbols"):
         await send_long("هذا الأمر يشتغل بوضع MetaApi فقط. أرسل /live أول.", markup=keyboard())
         return
-    which = ASSET_WORDS.get(str(arg).strip().lower(), "gold")
+    word = str(arg).strip().lower().lstrip("/")
+    # Defaulting an unrecognised word to gold was the silent failure that cost him an
+    # evening: "/asset <anything I do not know>" hunted GOLD, found GOLD, and answered
+    # "already correct" - a success message for a switch that never happened. A word
+    # this does not know is now a refusal, never a substitution.
+    if not word:
+        opts = " · ".join(f"`/asset {k}`" for k in ASSET_HUNT)
+        await send_long(f"{whoami_line()}\n\nتريد تبدّلها؟ {opts}", markup=keyboard())
+        return
+    which = ASSET_WORDS.get(word)
+    if which is None:
+        opts = " · ".join(f"`/asset {k}`" for k in ASSET_HUNT)
+        await send_long(f"⚠️ ما أعرف أداة اسمها `{arg}` — وما راح أخمّن.\n"
+                        f"المتاح: {opts}\n"
+                        f"وإذا تعرف اسمها عند وسيطك بالضبط: `/setkey symbol <الاسم>`",
+                        markup=keyboard())
+        return
     hunt = ASSET_HUNT[which]
     await send_long(f"⏳ أدوّر على أداة {hunt['ar']} بحسابك...")
     try:
@@ -627,8 +643,16 @@ async def handle_gold_symbol(arg=""):
         return
     matches = [s for s in symbols if any(w in s.upper() for w in hunt["want"])]
     if not matches:
-        await send_long(f"⚠️ ما لكيت أي أداة {hunt['ar']} بهذا الحساب. "
-                        f"تأكد إنها مفعّلة عند الوسيط.", markup=keyboard())
+        # "Not found" with nothing else is a dead end. Show what the account actually
+        # carries that is even vaguely related, so he can pick a name instead of
+        # guessing whether the broker offers it at all.
+        near = [x for x in symbols if any(k in x.upper() for k in
+                ("BTC", "ETH", "CRYPTO", "COIN", "XAU", "XAG", "GOLD", "SILVER"))][:15]
+        hint = ("\n\nالموجود بحسابك من هذا النوع:\n"
+                + "\n".join(f"• `/setkey symbol {x}`" for x in near)) if near else \
+               f"\n\nعدد أدوات حسابك `{len(symbols)}` وماكو ولا وحدة قريبة من هذا النوع."
+        await send_long(f"⚠️ ما لكيت أي أداة {hunt['ar']} بهذا الحساب — "
+                        f"يعني وسيطك ما يوفرها على الأغلب.{hint}", markup=keyboard())
         return
     # XAUEUR and BTCEUR are the same asset against another currency, not the one we trade.
     def _stripped(name):
@@ -1068,6 +1092,24 @@ def savings_line():
     return line
 
 
+def whoami_line():
+    """What instrument am I on, right now. The single line this evening needed.
+
+    The owner switched to bitcoin, the switch failed, and nothing anywhere said so. He
+    then read a gold panel, got a gold weekend message and a gold grid, and had no way
+    to tell. Every connect, every /grid on and every panel now leads with this.
+    """
+    unit = "؟"
+    try:
+        unit = grid.UNIT_WORD.get(float(grid.GRID_CONTRACT), f"{grid.GRID_CONTRACT:g} وحدة")
+    except Exception:
+        pass
+    shut = market_closed()
+    mkt = ("🟢 مفتوح 24/7" if always_open()
+           else "🔴 مغلق (عطلة نهاية الأسبوع)" if shut else "🟢 مفتوح")
+    return f"🎯 *الأداة: `{SYMBOL}`* · اللوت = `{unit}` · السوق {mkt}"
+
+
 async def our_positions_open():
     """Anything of ours the broker is holding — positions or armed pending orders.
 
@@ -1415,7 +1457,7 @@ async def ensure_connection():
             global last_connect_note
             if time.time() - last_connect_note > CONNECT_NOTE_QUIET_SECS:
                 last_connect_note = time.time()
-                await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**")
+                await notify("✅ **تم الاتصال بـ MetaApi بنجاح.**\n" + whoami_line())
         except Exception as e:
             global last_connection_error
             log.error(f"Connection error: {e}", exc_info=True)
@@ -1966,7 +2008,14 @@ async def handle_grid_command(text):
         grid.reset()                       # clears any halt left over from a stop
         grid.notices_reset()               # a command you typed always gets an answer
         write_env_value("GRID_ENABLED", "1")
-        await send_long("🕸 *شغّلت الشبكة.*\nتنصب نفسها على السعر الحالي أول ما أرجع.\n"
+        # "It will arm at the current price as soon as I am back" was said on a Saturday,
+        # on gold, with the market shut until Sunday evening. True in the end, wildly
+        # misleading in the moment - and it hid the fact that the instrument was still
+        # gold when he believed he had moved to bitcoin.
+        when = ("" if not market_closed() else
+                "\n⏳ *بس السوق مغلق الآن* — ما راح تنصب شي قبل ما يفتح.")
+        await send_long(f"🕸 *شغّلت الشبكة.*\n{whoami_line()}\n"
+                        f"تنصب نفسها على السعر الحالي أول ما أرجع.{when}\n"
                         "♻️ أعيد التشغيل...")
         os._exit(0)
     if arg in ("off", "stop", "ايقاف", "إيقاف"):
@@ -2594,7 +2643,10 @@ async def process_update(update):
             elif text.startswith("/live"):
                 await handle_go_live()
             elif text.startswith("/gold") or text.startswith("/asset"):
-                await handle_gold_symbol(text.split(maxsplit=1)[1] if len(text.split()) > 1 else "")
+                _parts = text.split(maxsplit=1)
+                _arg = _parts[1] if len(_parts) > 1 else (
+                    "" if _parts[0].startswith("/asset") else "gold")
+                await handle_gold_symbol(_arg)
             elif text.startswith("/paper"):
                 write_env_value("BROKER", "paper")
                 await send_long("📄 *تحويل إلى الحساب التجريبي الداخلي*\n"
