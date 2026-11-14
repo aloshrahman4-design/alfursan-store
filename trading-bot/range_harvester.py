@@ -1007,9 +1007,25 @@ async def fetch_candles(symbol, timeframe, limit=200):
     return await datafeed.get_candles(symbol, timeframe, limit)
 
 
+def always_open(symbol=None):
+    """True for an instrument that has no weekend - crypto."""
+    if datafeed is None:
+        return False
+    try:
+        return datafeed.crypto_pair(symbol or SYMBOL) is not None
+    except Exception:
+        return False
+
+
 def market_closed(now=None):
     """Gold is shut from Friday close to Sunday open. MetaApi bills per deployed hour,
-    so those ~49 hours are pure waste unless we undeploy the account."""
+    so those ~49 hours are pure waste unless we undeploy the account.
+
+    Crypto has no weekend. Keeping gold's calendar after switching to bitcoin would
+    undeploy the account every Saturday straight through a live, moving market.
+    """
+    if always_open():
+        return False
     now = now or datetime.now(timezone.utc)
     wd, hour = now.weekday(), now.hour  # Mon=0 … Fri=4, Sat=5, Sun=6
     if wd == 4 and hour >= WEEKEND_CLOSE_HOUR_UTC:
@@ -1061,7 +1077,12 @@ async def our_positions_open():
     either way: what sleeping actually removes is the basket stop and every pair of eyes.
     """
     if not connection:
-        return False
+        # Unknown, not empty. Reading this as "nothing is open" is what undeployed the
+        # account at 5:40 while a position was live: the connection was down for a
+        # redeploy, the saver took silence for an all-clear and slept, then woke a
+        # minute later because work was obviously pending. Same rule as the exception
+        # path below - when we cannot see, we stay awake.
+        return True
     try:
         magics = (MAGIC_BUY, MAGIC_SELL) + (grid.MAGICS if grid is not None else ())
         pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
@@ -1160,6 +1181,9 @@ async def wake_up(message):
         await notify(message)
 
 
+CLOSED_WARN_SECS = int(os.environ.get("CLOSED_WARN_SECS", "21600"))   # at most once every 6h
+
+
 async def cost_governor():
     """Keep the MetaApi account deployed only while it is actually needed.
 
@@ -1173,9 +1197,9 @@ async def cost_governor():
     if not WEEKEND_SAVER:
         log.info("cost governor disabled")
         return
-    warned_positions = False
     idle_since = None
     last_calibration = 0.0
+    last_closed_warn = 0.0
     while True:
         try:
             closed = market_closed()
@@ -1186,9 +1210,16 @@ async def cost_governor():
                     idle_since = None
                     await go_to_sleep("😴 *توفير العطلة:* السوق مغلق، أوقفت حساب MetaApi.\n"
                                       "راح أرجّعه تلقائياً قبل الفتح.")
-                elif closed and not warned_positions:
-                    warned_positions = True
-                    await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فبقيت شغّال. سكّرها إذا تريد توفير الكلفة.")
+                elif closed:
+                    # This used to fall through to the else below on the NEXT tick -
+                    # same conditions, flag cleared, warn again - so one unchanged
+                    # situation printed the same line every single minute. The flag now
+                    # clears only when the market actually reopens, and a hard clock
+                    # sits under it so no future wiring can turn this into a flood.
+                    if time.time() - last_closed_warn > CLOSED_WARN_SECS:
+                        last_closed_warn = time.time()
+                        await notify("⚠️ السوق سكّر وعندك صفقة مفتوحة، فبقيت شغّال. "
+                                     "سكّرها إذا تريد توفير الكلفة.")
                 elif not closed and ONDEMAND and not fast_now() and not needed:
                     idle_since = idle_since or time.time()
                     if time.time() - idle_since >= IDLE_SLEEP_MINUTES * 60:
@@ -1198,7 +1229,7 @@ async def cost_governor():
                             "فأوقفت حساب MetaApi.\nالتحليل والأخبار مستمرة بالمصدر المجاني، وأي زر تداول يرجّعه بثواني.")
                 else:
                     idle_since = None
-                    warned_positions = False
+                    last_closed_warn = 0.0   # reopened: the next close may speak again
 
             elif saver_sleeping and (needed or (not closed and (fast_now() or not ONDEMAND))):
                 await wake_up("🌅 *رجعت أشتغل:* الحساب يشتغل والاتصال جارٍ.\n" + savings_line())
