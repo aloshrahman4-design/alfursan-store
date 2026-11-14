@@ -29,7 +29,11 @@ log = logging.getLogger("harvester.paper")
 
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 START_BALANCE = float(os.environ.get("PAPER_BALANCE", "10000"))
-CONTRACT_SIZE = float(os.environ.get("PAPER_CONTRACT_SIZE", "100"))
+# Mirror the live engine. Defaulting to gold's 100 while the engine ran bitcoin at 1
+# made every paper P/L a hundred times too big - a demo that lies in the owner's
+# favour is worse than no demo, because he would size real trades from it.
+CONTRACT_SIZE = float(os.environ.get("PAPER_CONTRACT_SIZE")
+                      or os.environ.get("GRID_CONTRACT") or "100")
 PAPER_TF = os.environ.get("PAPER_TF", "1m")
 SPREAD = float(os.environ.get("PAPER_SPREAD", "0.30"))
 ENGINE_SYMBOL = os.environ.get("SYMBOL", "GOLD").strip()
@@ -39,7 +43,8 @@ def refresh_keys():
     """Kept for symmetry with the other brokers; paper trading has nothing to configure."""
     global START_BALANCE, CONTRACT_SIZE, SPREAD, ENGINE_SYMBOL
     START_BALANCE = float(os.environ.get("PAPER_BALANCE", "10000"))
-    CONTRACT_SIZE = float(os.environ.get("PAPER_CONTRACT_SIZE", "100"))
+    CONTRACT_SIZE = float(os.environ.get("PAPER_CONTRACT_SIZE")
+                          or os.environ.get("GRID_CONTRACT") or "100")
     SPREAD = float(os.environ.get("PAPER_SPREAD", "0.30"))
     ENGINE_SYMBOL = os.environ.get("SYMBOL", "GOLD").strip()
 
@@ -120,13 +125,21 @@ class PaperBroker:
         mid = await self._mid()
         return {"bid": round(mid - SPREAD / 2, 2), "ask": round(mid + SPREAD / 2, 2)}
 
+    _last_floating = 0.0      # last P/L we could actually compute
+    _last_pnl = {}            # per position, same idea
+
     async def get_account_information(self):
         state = _load()
         try:
             mid = await self._mid()
             floating = sum(profit_of(p, mid) for p in state["positions"])
-        except Exception:
-            floating = 0.0
+        except Exception as e:
+            # Reporting 0.0 here says "nothing is floating", which is a statement
+            # about the market. The truth is "I could not price it" - and the
+            # difference matters: the equity brake reads this number, and a zero
+            # tells it the account is whole when it may be deeply under.
+            log.warning(f"paper: cannot price the book, equity unknown: {e}")
+            floating = self._last_floating
         return {"balance": round(state["balance"], 2),
                 "equity": round(state["balance"] + floating, 2), "currency": "USD"}
 
@@ -136,13 +149,21 @@ class PaperBroker:
         state = _load()
         try:
             mid = await self._mid()
-        except Exception:
+        except Exception as e:
+            log.warning(f"paper: cannot price positions, holding last known P/L: {e}")
             mid = None
         out = []
         for p in state["positions"]:
             item = dict(p)
-            item["unrealizedProfit"] = profit_of(p, mid) if mid else 0.0
+            # Last known rather than zero. A position whose P/L reads 0 because the
+            # feed hiccuped looks harmless to every rule that reads it.
+            item["unrealizedProfit"] = (profit_of(p, mid) if mid
+                                        else self._last_pnl.get(p["id"], 0.0))
+            if mid:
+                self._last_pnl[p["id"]] = item["unrealizedProfit"]
             out.append(item)
+        if mid:
+            self._last_floating = round(sum(x["unrealizedProfit"] for x in out), 2)
         return out
 
     async def _open(self, direction, volume, options, symbol=None):

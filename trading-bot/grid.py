@@ -335,6 +335,21 @@ GRID_TREND_RELEASE = _f("GRID_TREND_RELEASE", 1.5)
 # and cannot be split. On a bigger lot it stages: 0.04 at $5, again at $10.
 HALF_ENABLED = os.environ.get("HALF_ENABLED", "1") not in ("0", "false", "no")
 HALF_DISTANCE = _f("HALF_DISTANCE", 5.0)      # dollars of adverse travel per halving
+
+
+def half_distance(price=0.0):
+    """How far price must run against a trade before half of it is cut.
+
+    HALF_DISTANCE is a PRICE distance, and $5 is a considered number on gold near
+    $4,000 - a tenth of a percent. The same $5 on bitcoin near $66,000 is 0.008%,
+    which the market crosses in seconds: every losing trade would be halved almost
+    at once, repeatedly, until it hit the minimum lot. The setting keeps its meaning
+    by holding its RATIO to price, exactly as the grid step does.
+    """
+    if not price or HALF_DISTANCE <= 0:
+        return HALF_DISTANCE
+    gold_ratio = HALF_DISTANCE / 4000.0            # what the number meant when chosen
+    return max(HALF_DISTANCE, round(float(price) * gold_ratio, 2))
 HALF_MIN_LOT = _f("HALF_MIN_LOT", 0.01)       # the broker's smallest tradable volume
 
 # --- bounded recovery ----------------------------------------------------------------
@@ -964,7 +979,7 @@ def plan_text(balance=0.0, price=0.0):
         (f"• 🔪 *وقف ثابت `{GRID_STOP_DIST:g}$` على كل أمر جديد* — تنحط عند الوسيط لحظة "
          f"الفتح، وما تُطبّق أبداً على صفقة مفتوحة من قبل"
          if GRID_STOP_DIST > 0 else "• ماكو وقف ثابت — الصفقة تمشي لحد ما تقرر انت"),
-        (f"• ✂️ التنصيف: كل `{HALF_DISTANCE:g}$` يبتعد السعر عن صفقة خاسرة، "
+        (f"• ✂️ التنصيف: كل `{half_distance(price):g}$` يبتعد السعر عن صفقة خاسرة، "
          f"يغلق نصها (لحد `{HALF_MIN_LOT:g}`)"
          if HALF_ENABLED else "• ⚠️ التنصيف مطفي — الصفقة تبقى بحجمها مهما ابتعدت"),
         (f"• 🎯 *اتجاه مثبّت يدوياً: {bias_text()}* — ما ينصب ولا يسدّ فجوة بالجهة الثانية"
@@ -1001,7 +1016,8 @@ def plan_text(balance=0.0, price=0.0):
     return "\n".join(lines)
 
 
-async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
+async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
+              max_orders=None):
     """Place the ladder. `only_magic` and `max_lots` restrict it to a hedging pass."""
     price = await asyncio.wait_for(conn.get_symbol_price(symbol=symbol), timeout=6.0)
     bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
@@ -1039,6 +1055,11 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
 
     placed, failed, placed_lots = 0, 0, 0.0
     reasons = []                      # what the broker actually said, for the user
+    # GRID_MAX_POSITIONS is a promise about OPEN trades, but what enforces it is how
+    # many triggers are sitting in the market. Arming six levels a side on both sides
+    # leaves twelve, against a cap of eight - and a whipsaw fills them faster than the
+    # engine's three-second tick can pull the rest. Simulated: nine open against a cap
+    # of eight. Placing no more than the cap allows makes the number mean what it says.
     for i, lot in enumerate(lots, start=1):
         up = round(center + i * GRID_STEP, 2)
         down = round(center - i * GRID_STEP, 2)
@@ -1052,6 +1073,8 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
                 continue              # hedging pass: one side only
             if max_lots is not None and placed_lots + lot > max_lots + 1e-9:
                 continue              # never hedge past flat and open fresh exposure
+            if max_orders is not None and placed >= max_orders:
+                continue              # see below: never leave more triggers than the cap
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
                 opts = {"magic": magic}
@@ -1275,7 +1298,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     if not ok:
                         log.warning(f"hedge arm refused: {err}")
                     else:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(max(2, 0 if reads_free()
+                                                else TICK_SECS_METERED))
                         continue
                 if braked_now:
                     # A new ladder is new exposure. Not while the account is this far
@@ -1315,7 +1339,8 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                             "• وأنصب السلّم تلقائياً أول ما تنفك صفقة وحدة\n"
                             "• تريده هسه؟ سكّر صفقة بالمنصة، أو `/grid off` ثم `/grid on`")
                 else:
-                    ok, err = await arm(conn, symbol, notify)
+                    ok, err = await arm(conn, symbol, notify,
+                                        max_orders=max(0, GRID_MAX_POSITIONS - len(held)))
                     if ok:
                         arm_fails = 0
                     else:
@@ -1338,10 +1363,17 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                             await notify(f"⚠️ ما كدرت أنصب الشبكة "
                                          f"(محاولة `{arm_fails}` من `{ARM_FAIL_HALT}`):\n"
                                          f"{err}\n• أبقى أحاول — صلّح الإعداد وأنصب لحالي")
-                    await asyncio.sleep(2 if ok else ARM_RETRY_SECS)
+                    # Paced like the main path. An unarmed grid still calls book()
+                    # every tick, so a flat 2-second retry is 10,800 position reads in
+                    # six hours against a quota of about 4,320 - the same shape as the
+                    # outage that blinded the bot before, just on the other engine.
+                    await asyncio.sleep(max(2 if ok else ARM_RETRY_SECS,
+                                            0 if reads_free() else TICK_SECS_METERED))
                     continue
                 if not held:
-                    await asyncio.sleep(5)   # nothing armed and nothing open: just wait
+                    # Idle, but still reading the book each pass. Free reads can keep
+                    # the 5-second rhythm; metered ones must not.
+                    await asyncio.sleep(5 if reads_free() else TICK_SECS_METERED)
                     continue
                 # ...otherwise fall through and manage what is open.
 
@@ -1807,7 +1839,8 @@ async def halve_distant(conn, positions, bid, ask, notify=None):
         pid = p.get("id")
         done = _halves.get(pid, 0)
         dist = adverse_distance(p, bid, ask)
-        if dist < HALF_DISTANCE * (done + 1):
+        step = half_distance((float(bid) + float(ask)) / 2.0)
+        if dist < step * (done + 1):
             continue                  # not another whole step away yet
         cut = half_volume(p.get("volume"))
         if cut is None:
