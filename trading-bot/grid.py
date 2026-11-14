@@ -2081,6 +2081,16 @@ def entry_stop(price_at, is_buy):
     return round(price_at - GRID_STOP_DIST, 2) if is_buy else round(price_at + GRID_STOP_DIST, 2)
 
 
+# How far past the floor the price must go before the floor's stop is placed. Without
+# it the stop lands on top of the market and the trade dies on noise.
+FLOOR_HEADROOM_CASH = _f("FLOOR_HEADROOM_CASH", 0.0) or None
+
+
+def _floor_headroom():
+    return FLOOR_HEADROOM_CASH if FLOOR_HEADROOM_CASH else max(0.25 * BE_FLOOR_CASH,
+                                                               BE_TRIGGER_CASH)
+
+
 def server_trail():
     """His protection rule as a MetaApi trailingStopLoss, or None if switched off."""
     if not (SERVER_TRAIL and BE_ENABLED):
@@ -2090,7 +2100,12 @@ def server_trail():
         steps.append({"threshold": round(BE_TRIGGER_CASH, 2),
                       "stopLoss": round(BE_LOCK_CASH, 2)})
     if BE_FLOOR_CASH > 0 and BE_FLOOR_CASH > BE_LOCK_CASH:
-        steps.append({"threshold": round(BE_FLOOR_CASH, 2),
+        # The floor used to trigger at the very figure it locked: "at $2 profit, keep
+        # $2" puts the stop exactly where price is, so the first tick against it closes
+        # the trade at the instant it earned the protection. The floor still LOCKS what
+        # it says; it just waits for a little headroom before arming, so there is room
+        # between the stop and the market.
+        steps.append({"threshold": round(BE_FLOOR_CASH + _floor_headroom(), 2),
                       "stopLoss": round(BE_FLOOR_CASH, 2)})
     cfg = {}
     if steps:
