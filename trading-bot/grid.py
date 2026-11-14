@@ -951,6 +951,46 @@ async def teardown(conn):
     return closed, booked, cancelled
 
 
+def cash_in_price(cash, lot=None):
+    """What a cash figure is worth as a distance in the instrument's own price."""
+    per = float(lot if lot is not None else GRID_BASE_LOT) * GRID_CONTRACT
+    return round(float(cash) / per, 2) if per > 0 and cash else 0.0
+
+
+def protection_audit(price=0.0, lot=None):
+    """Every cash-denominated protection setting, in price terms, with a verdict.
+
+    These settings are priced in dollars of P/L, which is lot-independent and was the
+    whole point. The catch is that their meaning as a DISTANCE changes the moment the
+    lot does: a $3 trail is $150 of gold at 0.02 lots and $300 of bitcoin at 0.01.
+    The owner halved his lot and the trail silently doubled its reach, so it never got
+    the chance to move before price came back. Nothing on any screen said so.
+    """
+    lot = float(lot if lot is not None else GRID_BASE_LOT)
+    rows, warn = [], []
+    for name, key, cash in (("التأمين", "be", BE_TRIGGER_CASH),
+                            ("المقفول", "belock", BE_LOCK_CASH),
+                            ("الأرضية", "befloor", BE_FLOOR_CASH),
+                            ("التريلينغ", "betrail", BE_TRAIL_CASH)):
+        if cash <= 0:
+            continue
+        px = cash_in_price(cash, lot)
+        # Judged against the grid's OWN geometry, not against an invented percentage.
+        # A first attempt used fixed shares of price and promptly called the gold
+        # settings - which demonstrably work on gold - too tight. The honest measure
+        # is the ladder itself: a protection distance wider than the whole ladder can
+        # never act inside the range the grid trades, whatever the instrument.
+        ladder_depth = GRID_STEP * max(1, GRID_LEVELS)
+        wide = ladder_depth > 0 and px > ladder_depth
+        rows.append((name, key, cash, px, "⚠️ واسع" if wide else "✅"))
+        if wide:
+            good = round(ladder_depth * 0.5 * lot * GRID_CONTRACT, 2)
+            warn.append(f"• `{name}` = حركة `{px:,.0f}$`، وكل سلّم الشبكة "
+                        f"`{ladder_depth:,.0f}$` — ما يلحق يتحرك داخل مدى الشبكة. "
+                        f"جرّب `/setkey {key} {good:g}`")
+    return rows, warn
+
+
 def plan_text(balance=0.0, price=0.0):
     """Everything the user needs to judge the configuration before arming it."""
     lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
@@ -1009,6 +1049,11 @@ def plan_text(balance=0.0, price=0.0):
          f"• 📈 بعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة، "
          f"وأول ما تعدّي `{BE_FLOOR_CASH:g}$` ما ينزل الوقف تحتها"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
+        *( [f"• ⚖️ كل `1$` ربح = حركة `{cash_in_price(1.0):,.0f}$` بهذا اللوت"]
+           + [f"• {n}: `{c:g}$` = حركة `{px:,.0f}$`  {v}"
+              for n, _k, c, px, v in protection_audit(price)[0]]
+           if price else []),
+        *(protection_audit(price)[1] if price else []),
         (f"• 🎯 ارتداد `{TRADE_GIVEBACK_PCT:g}%` من قمة ربح الصفقة يغلقها "
          f"(وما ينزل تحت `{BE_LOCK_CASH:g}$` المضمونة)"
          if TRADE_GIVEBACK_PCT > 0 else
