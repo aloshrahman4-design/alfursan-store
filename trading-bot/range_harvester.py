@@ -1006,12 +1006,42 @@ def keyboard():
              InlineKeyboardButton("📰 آخر الأخبار", callback_data="news")],
             [InlineKeyboardButton("🎯 صفقة اليوم", callback_data="daily_trade")],
         ]
+    # Grid controls. Everything here already existed as a typed command; the owner
+    # should not have to remember a command name to change a lot or a direction.
+    if grid is not None:
+        g_on = "🕸 الشبكة: شغالة" if grid.GRID_ENABLED else "🕸 الشبكة: مطفية"
+        bias = {"down": "🔻 هبوط فقط", "up": "🔺 صعود فقط"}.get(grid.GRID_BIAS, "↔️ الجهتين")
+        lot = grid.GRID_BASE_LOT
+        rows += [
+            [InlineKeyboardButton(g_on, callback_data="grid_toggle"),
+             InlineKeyboardButton(bias, callback_data="grid_bias")],
+            [InlineKeyboardButton(f"➖ لوت", callback_data="lot_down"),
+             InlineKeyboardButton(f"اللوت: {lot:g}", callback_data="noop"),
+             InlineKeyboardButton(f"➕ لوت", callback_data="lot_up")],
+            [InlineKeyboardButton("🔄 إعادة نصب", callback_data="grid_rearm"),
+             InlineKeyboardButton("🧭 ليش ما ينصب", callback_data="grid_why")],
+        ]
     rows += [
         [InlineKeyboardButton(mode_label(), callback_data="toggle_mode")],
         [InlineKeyboardButton(status, callback_data="toggle_bot")],
         [InlineKeyboardButton("🚨 إغلاق جميع صفقات البوت", callback_data="close_all")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+# What the ➕/➖ buttons step through. Broker minimums vary, so the list is the
+# sensible rungs rather than an arithmetic step that could land off the lot grid.
+LOT_RUNGS = (0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0)
+
+
+def next_lot(current, up):
+    """The next rung above or below `current`, staying inside the list."""
+    rungs = list(LOT_RUNGS)
+    if up:
+        later = [x for x in rungs if x > current + 1e-9]
+        return later[0] if later else rungs[-1]
+    earlier = [x for x in rungs if x < current - 1e-9]
+    return earlier[-1] if earlier else rungs[0]
 
 
 async def safe_reply(coro_func, **kwargs):
@@ -2578,6 +2608,90 @@ async def handle_callback(query):
             await run_analysis(query, "جلب الأخبار", lambda: intel.news_now_message(fetch_candles, SYMBOL))
         elif data == "daily_trade":
             await run_analysis(query, "إعداد صفقة اليوم", lambda: intel.daily_trade_message(fetch_candles, SYMBOL))
+        elif data == "noop":
+            return                      # the lot label; tapping it does nothing
+
+        elif data == "grid_toggle":
+            if grid is None:
+                await safe_reply(query.edit_message_text, text="وحدة الشبكة غير موجودة — `/update`.",
+                                 reply_markup=keyboard(), parse_mode="Markdown")
+                return
+            turning_on = not grid.GRID_ENABLED
+            write_env_value("GRID_ENABLED", "1" if turning_on else "0")
+            if turning_on:
+                grid.reset()            # clears a halt left over from a refused batch
+                grid.notices_reset()
+            await safe_reply(query.edit_message_text,
+                             text=("🕸 *شغّلت الشبكة* — تنصب على السعر الحالي أول ما أرجع."
+                                   if turning_on else
+                                   "🕸 *طفّيت الشبكة* — الأوامر المعلّقة تنلغي، "
+                                   "والصفقات المفتوحة تبقى مفتوحة."),
+                             parse_mode="Markdown")
+            await asyncio.sleep(1.0)
+            os._exit(0)
+
+        elif data == "grid_bias":
+            if grid is None:
+                return
+            nxt = {"both": "down", "down": "up", "up": "both"}[grid.GRID_BIAS]
+            write_env_value("GRID_BIAS", nxt)
+            name = {"down": "🔻 هبوط فقط (بيع)", "up": "🔺 صعود فقط (شراء)",
+                    "both": "↔️ الجهتين"}[nxt]
+            await safe_reply(query.edit_message_text,
+                             text=f"🎯 *الاتجاه: {name}*\nأعيد التشغيل وأنصب من جديد...",
+                             parse_mode="Markdown")
+            await asyncio.sleep(1.0)
+            os._exit(0)
+
+        elif data in ("lot_up", "lot_down"):
+            if grid is None:
+                return
+            new = next_lot(grid.GRID_BASE_LOT, data == "lot_up")
+            if abs(new - grid.GRID_BASE_LOT) < 1e-9:
+                await safe_reply(query.answer, text="وصلت الحد", show_alert=False)
+                return
+            write_env_value("GRID_BASE_LOT", f"{new:g}")
+            # The cap has to move with it, or the ladder silently keeps the old size.
+            if new > grid.GRID_MAX_LOT:
+                write_env_value("GRID_MAX_LOT", f"{new:g}")
+            await safe_reply(query.edit_message_text,
+                             text=f"📏 *اللوت: `{new:g}`*\nينطبق على السلّم الجاي. "
+                                  f"أعيد التشغيل...",
+                             parse_mode="Markdown")
+            await asyncio.sleep(1.0)
+            os._exit(0)
+
+        elif data == "grid_rearm":
+            if grid is None or connection is None:
+                await safe_reply(query.edit_message_text,
+                                 text="⏳ الاتصال لسه ما جهز — جرّب بعد شوي.",
+                                 reply_markup=keyboard())
+                return
+            grid.notices_reset()
+            try:
+                cancelled = await grid.cancel_all(connection)
+                st = grid.load(); st["armed"] = False; st["halted"] = False
+                st["halt_reason"] = ""; grid.save(st)
+                txt = (f"🔄 *أعيد النصب*\n• ألغيت `{cancelled}` أمر معلّق\n"
+                       "• الصفقات المفتوحة ما لمستها\n• أنصب من جديد خلال ثواني...")
+            except Exception as e:
+                txt = f"⚠️ `{str(e)[:200]}`"
+            await safe_reply(query.edit_message_text, text=txt,
+                             reply_markup=keyboard(), parse_mode="Markdown")
+
+        elif data == "grid_why":
+            if grid is None:
+                return
+            px = 0.0
+            try:
+                q = await market_price(SYMBOL)
+                px = (float(q.get("bid", 0) or 0) + float(q.get("ask", 0) or 0)) / 2
+            except Exception:
+                pass
+            await safe_reply(query.edit_message_text,
+                             text=await grid.why_not(connection, SYMBOL, bot_active, px),
+                             reply_markup=keyboard(), parse_mode="Markdown")
+
         elif data == "close_all":
             if not connection and saver_sleeping:
                 await wake_for_execution("طلب إغلاق الصفقات")
