@@ -998,6 +998,10 @@ def plan_text(balance=0.0, price=0.0):
          f"• 📈 بعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة، "
          f"وأول ما تعدّي `{BE_FLOOR_CASH:g}$` ما ينزل الوقف تحتها"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
+        (f"• 🎯 ارتداد `{TRADE_GIVEBACK_PCT:g}%` من قمة ربح الصفقة يغلقها "
+         f"(وما ينزل تحت `{BE_LOCK_CASH:g}$` المضمونة)"
+         if TRADE_GIVEBACK_PCT > 0 else
+         "• ماكو إغلاق على ارتداد — التريلينغ بس"),
         f"• 🚧 سقف الصفقات المفتوحة: `{GRID_MAX_POSITIONS}` · يوقف التوسّع عند "
         f"`{GRID_ADD_STOP_PCT:g}%` من حد الخسارة",
         (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
@@ -2230,6 +2234,64 @@ async def ensure_server_trail(conn, positions, notify=None):
             f"• *ينفّذها MetaApi نفسه* — تشتغل حتى لو البوت مطفي أو السيرفر واقف "
             f"أو الحصة منتهية")
     return done
+
+
+# Give back at most this share of a trade's best profit before it is taken. 0 = off.
+# The broker's own trailing stop can only hold a FIXED distance; a share of the peak
+# has to be measured here, tick by tick. So the two work together and neither is
+# redundant: this one is tighter and acts first while the bot is alive, and the
+# server-side lock underneath it still holds if the bot is not.
+TRADE_GIVEBACK_PCT = _f("TRADE_GIVEBACK_PCT", 0.0)
+
+
+def giveback_floor(peak):
+    """The profit at which a trade that peaked at `peak` should be taken.
+
+    Never below BE_LOCK_CASH: the locked amount is a promise, and a percentage of a
+    small peak can sit under it (15% off a $0.55 peak is $0.47, which would hand back
+    part of a $0.50 lock).
+    """
+    if TRADE_GIVEBACK_PCT <= 0 or peak <= 0:
+        return None
+    return round(max(peak * (1.0 - TRADE_GIVEBACK_PCT / 100.0), BE_LOCK_CASH), 2)
+
+
+async def take_giveback(conn, positions, notify=None, allowed=True):
+    """Close any trade that has handed back more than its share of the peak.
+
+    Arms only once a position has earned BE_LOCK_CASH, so it can never fire on a
+    trade that was never protected in the first place.
+    """
+    if not (allowed and TRADE_GIVEBACK_PCT > 0) or not hasattr(conn, "close_position"):
+        return 0
+    taken = []
+    for p in positions:
+        pid = p.get("id")
+        try:
+            profit = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        peak = max(_be_peaks.get(pid, 0.0), profit)
+        if profit > 0 or peak > 0:
+            _be_peaks[pid] = peak
+        if peak < BE_LOCK_CASH or BE_LOCK_CASH <= 0:
+            continue                      # not yet worth protecting
+        floor = giveback_floor(peak)
+        if floor is None or profit > floor:
+            continue
+        try:
+            await asyncio.wait_for(conn.close_position(pid), timeout=8.0)
+            taken.append((pid, peak, profit))
+            _be_peaks.pop(pid, None)
+        except Exception as e:
+            log.warning(f"give-back close refused on {pid}: {e}")
+    if taken and notify:
+        tot = round(sum(x[2] for x in taken), 2)
+        lines = "\n".join(f"• قمتها `{pk:g}$` ← أغلقتها على `{pr:g}$`"
+                           for _i, pk, pr in taken)
+        await notify(f"🎯 *حصدت `{len(taken)}` صفقة على ارتداد "
+                     f"`{TRADE_GIVEBACK_PCT:g}%`* — المجموع `{tot:+g}$`\n{lines}")
+    return len(taken)
 
 
 _be_peaks = {}        # best profit each secured position has shown; dies with the position

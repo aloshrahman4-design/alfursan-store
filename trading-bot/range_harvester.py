@@ -134,6 +134,7 @@ SETTABLE_KEYS = {
     "GRID_MAX_LOT": "سقف اللوت بالشبكة",
     "GRID_LEVELS": "عدد مستويات الشبكة بكل جهة",
     "GRID_STEP": "المسافة بين مستويات الشبكة بالدولار",
+    "TRADE_GIVEBACK_PCT": "نسبة الارتداد من قمة ربح الصفقة اللي يغلق عندها (0 = مطفي)",
     "FLOOR_HEADROOM_CASH": "كم ربح إضافي قبل ما يثبّت الأرضية (فراغ بين الوقف والسعر)",
     "GRID_CONTRACT": "وحدات اللوت الواحد (الذهب 100 أونصة، البيتكوين 1)",
     "GRID_STEP_MIN_PCT": "أصغر خطوة مسموحة كنسبة من السعر (حارس)",
@@ -210,6 +211,7 @@ KEY_ALIASES = {
     "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "servertrail": "SERVER_TRAIL", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
+    "giveback": "TRADE_GIVEBACK_PCT", "retrace": "TRADE_GIVEBACK_PCT",
     "befloorgap": "FLOOR_HEADROOM_CASH", "gridcontract": "GRID_CONTRACT", "contract": "GRID_CONTRACT", "gridstepmin": "GRID_STEP_MIN_PCT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT", "brake": "GRID_EQUITY_BRAKE_PCT", "gridstop": "GRID_STOP_DIST",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
@@ -2325,6 +2327,11 @@ async def protect_engine():
                 # The same `mine` is reused on purpose - re-reading cost a whole extra
                 # API call per tick, and anything apply_breakeven has just protected is
                 # far above BE_SOFT_EXIT, so soft_protect skips it on profit alone.
+                # Closing belongs with the other closing actions, after every stop has
+                # been tightened. Tightening is safe in any state and must keep running
+                # while the system is paused; closing is an action and must not - so
+                # this sits below apply_breakeven and carries the same permission.
+                await grid.take_giveback(connection, mine, notify, allowed=bot_active)
                 await grid.soft_protect(connection, mine, bid, ask, notify,
                                         allowed=bot_active)
             fast = 1.0 if mine else 3.0
