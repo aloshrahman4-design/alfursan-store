@@ -1092,6 +1092,30 @@ def savings_line():
     return line
 
 
+def code_version():
+    """Which commit is actually running.
+
+    Three times now a fix was pushed, the owner read the old behaviour on his screen,
+    and neither of us could tell whether the pull had happened. Nothing in the bot
+    said. A seven-character hash in the line he already reads ends that for good.
+    """
+    global _code_rev
+    if _code_rev is None:
+        _code_rev = "؟"
+        try:
+            import subprocess
+            _code_rev = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True, text=True, timeout=4).stdout.strip() or "؟"
+        except Exception as e:
+            log.info(f"version unavailable: {e}")
+    return _code_rev
+
+
+_code_rev = None
+
+
 def whoami_line():
     """What instrument am I on, right now. The single line this evening needed.
 
@@ -1107,7 +1131,8 @@ def whoami_line():
     shut = market_closed()
     mkt = ("🟢 مفتوح 24/7" if always_open()
            else "🔴 مغلق (عطلة نهاية الأسبوع)" if shut else "🟢 مفتوح")
-    return f"🎯 *الأداة: `{SYMBOL}`* · اللوت = `{unit}` · السوق {mkt}"
+    return (f"🎯 *الأداة: `{SYMBOL}`* · اللوت = `{unit}` · السوق {mkt}\n"
+            f"🔖 النسخة `{code_version()}`")
 
 
 async def our_positions_open():
