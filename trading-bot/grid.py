@@ -232,6 +232,13 @@ _last_conn = None
 # near price instead: it keeps the grid working without disturbing what is already open.
 GRID_REFILL = os.environ.get("GRID_REFILL", "1") not in ("0", "false", "no")
 GRID_GAP_FACTOR = _f("GRID_GAP_FACTOR", 1.5)   # a hole this many steps wide is refilled
+# How far price may drift from the centre before the ladder is laid again. Re-centring
+# used to need the book COMPLETELY empty - no positions and no orders. So the ordinary
+# case went unhandled: targets close the winners, price walks away, and what is left is
+# a handful of pendings stranded behind the market with nothing near it. refill_gaps
+# patches one hole per side per tick, which is a repair, not a re-centre. The grid sat
+# there looking dead, and it was: nothing it held could be reached any more.
+GRID_RECENTER_STEPS = _f("GRID_RECENTER_STEPS", 3.0)
 # Break-even. A trade that climbed part of the way to its target and then turned around
 # used to hand the whole gain back and keep going into loss. Once it has shown BE_TRIGGER
 # of profit its stop moves to entry, so from then on it either reaches the target or closes
@@ -1600,6 +1607,29 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                 state["armed"] = False
                 save(state)
                 continue
+
+            # Nothing open, but stale orders left behind the market: re-lay the ladder
+            # around price instead of waiting for the last one to be hit or cancelled.
+            # Only with no positions - cancelling pendings while trades are open could
+            # pull a level that is hedging one of them.
+            if (not positions and orders and GRID_RECENTER_STEPS > 0
+                    and GRID_STEP > 0 and quote):
+                _mid = (float(quote.get("bid", 0) or 0)
+                        + float(quote.get("ask", 0) or 0)) / 2.0
+                _centre = float(state.get("center", 0) or 0)
+                _drift = abs(_mid - _centre) / GRID_STEP if (_mid and _centre) else 0.0
+                _far = min((abs(float(o.get("openPrice", 0) or 0) - _mid)
+                            for o in orders), default=0.0)
+                if _drift >= GRID_RECENTER_STEPS and _far > GRID_STEP * GRID_GAP_FACTOR:
+                    pulled = await cancel_all(conn)
+                    state["armed"] = False
+                    save(state)
+                    await notify(
+                        f"♻️ *أعدت توسيط الشبكة* — السعر ابتعد "
+                        f"`{_drift:.1f}` خطوات عن المركز وماكو صفقة مفتوحة.\n"
+                        f"• سحبت `{pulled}` أمر كان واقف ورا السوق\n"
+                        f"• أنصب سلّم جديد حول `{_mid:,.0f}$` خلال ثواني")
+                    continue
 
             # A trailing exit is only as tight as how often it looks. While a basket is in
             # the money the give-back threshold is live, so watch it three times as closely;
