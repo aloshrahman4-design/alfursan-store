@@ -119,6 +119,7 @@ _blind = {"cut": False}
 _brake_said = 0.0
 _stranded_said = 0.0   # last "winner I cannot close" warning
 _paused_said = 0.0     # last 'grid on but system paused' notice
+_halt_said = 0.0       # last 'the grid is halted' notice
 
 
 def note_read_ok():
@@ -537,11 +538,12 @@ def notices_reset():
     2:51 decided not to arm and said nothing, because the same notice had gone out at
     2:39. From his side the bot simply ignored him. Anything he types resets this.
     """
-    global _brake_said, _blocked_at, _stranded_said, _paused_said
+    global _brake_said, _blocked_at, _stranded_said, _paused_said, _halt_said
     _brake_said = 0.0
     _blocked_at = 0.0
     _stranded_said = 0.0
     _paused_said = 0.0
+    _halt_said = 0.0
 
 
 async def bias_watch(notify=None):
@@ -1224,6 +1226,15 @@ async def grid_engine(get_conn, symbol, notify, is_active):
 
             state = load()
             if state.get("halted"):
+                # Silent forever. A halt set hours ago on another instrument stops the
+                # engine dead and nothing on any screen says why, which is exactly the
+                # shape of bug this project keeps paying for.
+                global _halt_said
+                if time.time() - _halt_said > BLOCKED_NOTE_SECS:
+                    _halt_said = time.time()
+                    await notify(f"🛑 *الشبكة موقوفة* — "
+                                 f"`{state.get('halt_reason', 'بدون سبب مسجل')}`\n"
+                                 f"• `/grid on` يلغي الإيقاف ويبدأ من جديد")
                 await asyncio.sleep(5)
                 continue
             # Being unable to ARM must never stop us MANAGING what is already open.
@@ -1807,6 +1818,72 @@ STOPS_RETRY_SECS = _f("STOPS_RETRY_SECS", 600.0)
 
 def stops_reset():
     _stops.update({"value": None, "asked": 0.0})
+
+
+async def why_not(conn, symbol, is_active=None, price=0.0):
+    """Walk the engine's own decision chain and say which gate stopped it.
+
+    Four separate evenings were spent inferring this from screenshots. Every gate the
+    engine passes through is cheap to evaluate on demand, so the bot can simply be
+    asked. Each line is the real condition, not a description of one.
+    """
+    L, blocker = [], None
+
+    def row(ok, text, fix=""):
+        nonlocal blocker
+        L.append(("✅ " if ok else "❌ ") + text + (f"\n   ↳ {fix}" if not ok and fix else ""))
+        if not ok and blocker is None:
+            blocker = text
+
+    row(GRID_ENABLED, "الشبكة مشغّلة (`GRID_ENABLED`)", "`/grid on`")
+    if is_active is not None:
+        row(bool(is_active), "النظام شغّال (`BOT_ACTIVE`)", "`/resume`")
+    row(conn is not None, "أكو اتصال بالوسيط", "انتظر شوي أو `/check`")
+    row(True, f"الأداة `{GRID_SYMBOL}`")
+
+    st = load()
+    row(not st.get("halted"),
+        f"الشبكة مو موقوفة" + (f" — موقوفة بسبب: `{st.get('halt_reason','؟')}`"
+                               if st.get("halted") else ""), "`/grid on`")
+    armed = bool(st.get("armed"))
+    L.append(("ℹ️ السلّم منصوب أصلاً حول `%s` — ما ينصب ثاني" % st.get("center")) if armed
+             else "ℹ️ السلّم مو منصوب — المحرك لازم ينصبه")
+
+    if conn is None:
+        return "🧭 *ليش ما ينصب*\n\n" + "\n".join(L)
+
+    try:
+        held, net, elsewhere = await book(conn, symbol)
+        row(len(held) < GRID_MAX_POSITIONS,
+            f"الصفقات المفتوحة `{len(held)}` تحت السقف `{GRID_MAX_POSITIONS}`",
+            "سكّر صفقة أو ارفع `/setkey gridmaxpos`")
+    except Exception as e:
+        row(False, f"قراءة الصفقات: `{str(e)[:120]}`")
+        held, elsewhere = [], 0.0
+
+    try:
+        acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
+        bal = float(acct.get("balance", 0) or 0)
+        eq = float(acct.get("equity", bal) or bal)
+        down, lim, braked = drawdown_brake(bal, eq)
+        fix = f"`/setkey brake {int(down / max(1.0, bal) * 100) + 5}` أو `0` للإلغاء"
+        row(not braked,
+            f"المكبح: نازل `{down:g}$` والحد `{lim:g}$` "
+            f"(`{GRID_EQUITY_BRAKE_PCT:g}%` من `{bal:g}$`)"
+            + (f" — `{abs(elsewhere):g}$` منه من أدوات ثانية" if elsewhere < -0.01 else ""),
+            fix)
+    except Exception as e:
+        row(False, f"قراءة الحساب: `{str(e)[:120]}`")
+
+    if price:
+        ok_step, floor, nice = step_sane(price)
+        row(ok_step, f"الخطوة `{GRID_STEP:g}$` فوق أرضيتها `{floor:g}$`",
+            f"`/setkey gridstep {nice:g}`")
+
+    head = ("🧭 *ليش ما ينصب*" if blocker else "🧭 *ماكو شي يمنع النصب*")
+    tail = (f"\n\n🚧 *أول مانع:* {blocker}" if blocker else
+            "\n\nكل البوابات مفتوحة. إذا لسه ماكو أوامر، `/grid rearm` وابعثلي الرد.")
+    return head + "\n\n" + "\n".join(L) + tail
 
 
 async def spec_report(conn, symbol, price=0.0):

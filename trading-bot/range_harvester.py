@@ -969,6 +969,7 @@ HELP_TEXT = (
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
     "• /asset btc — يبدّل الأداة للبيتكوين (أو gold / eth / silver)\n"
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
+    "• /why — يمشي بكل بوابات المحرك ويقول أي وحدة واقفة\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
     "**بدون ما يغلق ولا صفقة مفتوحة** (الحراسة تبقى شغالة عليها)\n"
@@ -2737,6 +2738,19 @@ async def process_update(update):
                                           "صفقات مفتوحة بلا حارس.", markup=keyboard())
             elif text.startswith("/live"):
                 await handle_go_live()
+            elif text.startswith("/why") or text.startswith("/ليش"):
+                if grid is None:
+                    await send_long("وحدة الشبكة غير موجودة — `/update`.", markup=keyboard())
+                else:
+                    px = 0.0
+                    try:
+                        q = await market_price(SYMBOL)
+                        px = (float(q.get("bid", 0) or 0) + float(q.get("ask", 0) or 0)) / 2
+                    except Exception:
+                        pass
+                    await send_long(
+                        await grid.why_not(connection, SYMBOL, bot_active, px),
+                        markup=keyboard())
             elif text.startswith("/spec") or text.startswith("/rules"):
                 if connection is None or grid is None:
                     await send_long("ماكو اتصال — جرّب بعد شوي.", markup=keyboard())
@@ -2959,6 +2973,7 @@ async def main():
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("asset", "ضبط الأداة: /asset btc أو /asset gold"),
             BotCommand("spec", "قواعد الوسيط للأداة ومقارنتها بإعداداتك"),
+            BotCommand("why", "ليش الشبكة ما تنصب — يمشي بكل البوابات"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
