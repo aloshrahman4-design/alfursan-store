@@ -46,6 +46,35 @@ YAHOO = {
 YAHOO_BACKUP = {"GOLD": "GC=F", "XAUUSD": "GC=F"}          # futures, if spot is empty
 GOLD_SYMBOLS = {"GOLD", "XAUUSD", "GOLD.", "XAUUSD.", "GOLDmicro"}
 
+# Crypto -> Binance spot pair. Binance is the right primary here, not Yahoo: it is free,
+# needs no key, serves true 1-minute klines and never closes - which is the whole point
+# of the free-price path. Brokers spell the same instrument a dozen ways, so the lookup
+# strips the decoration (BTCUSD., BTCUSD_raw, BTC/USD, #BTCUSD) before matching.
+CRYPTO = {
+    "BTCUSD": "BTCUSDT", "BTCUSDT": "BTCUSDT", "BTC": "BTCUSDT", "BITCOIN": "BTCUSDT",
+    "BTCUSDC": "BTCUSDT", "XBTUSD": "BTCUSDT",
+    "ETHUSD": "ETHUSDT", "ETHUSDT": "ETHUSDT", "ETH": "ETHUSDT", "ETHEREUM": "ETHUSDT",
+    "LTCUSD": "LTCUSDT", "XRPUSD": "XRPUSDT", "SOLUSD": "SOLUSDT", "BNBUSD": "BNBUSDT",
+    "ADAUSD": "ADAUSDT", "DOGEUSD": "DOGEUSDT",
+}
+CRYPTO_YAHOO = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "LTCUSDT": "LTC-USD",
+                "XRPUSDT": "XRP-USD", "SOLUSDT": "SOL-USD", "BNBUSDT": "BNB-USD",
+                "ADAUSDT": "ADA-USD", "DOGEUSDT": "DOGE-USD"}
+
+
+def bare(symbol):
+    """Strip broker decoration: 'BTCUSD.', '#BTCUSD', 'BTC/USD', 'BTCUSD_raw' -> 'BTCUSD'."""
+    up = str(symbol).upper().strip()
+    for junk in ("_RAW", "_ECN", "-RAW", ".RAW", ".PRO", ".A", ".B", ".C", ".M", "MICRO", "MINI"):
+        if up.endswith(junk):
+            up = up[: -len(junk)]
+    return "".join(c for c in up if c.isalnum())
+
+
+def crypto_pair(symbol):
+    """The Binance pair for a broker symbol, or None if it is not a crypto we know."""
+    return CRYPTO.get(bare(symbol))
+
 # our timeframe -> (yahoo interval, yahoo range, how many yahoo bars make one of ours)
 YF_TF = {
     "1m": ("1m", "1d", 1), "5m": ("5m", "5d", 1), "15m": ("15m", "1mo", 1),
@@ -83,32 +112,71 @@ def _save_state(state):
         log.warning(f"datafeed state save failed: {e}")
 
 
+def sane_offset_limit(broker_price):
+    """How far apart the broker and the free feed may plausibly be, on THIS instrument.
+
+    A flat $120 was a gold number. On bitcoin near $100,000 a $120 gap is ordinary and
+    would have been thrown away as implausible, leaving the feed forever uncalibrated;
+    on gold a relative limit alone would be far too loose. So: the old floor, or 0.4% of
+    price, whichever is larger. It can only widen, never reject what it used to accept.
+    """
+    try:
+        return max(MAX_SANE_OFFSET, abs(float(broker_price)) * 0.004)
+    except (TypeError, ValueError):
+        return MAX_SANE_OFFSET
+
+
 def note_broker_price(symbol, broker_price, free_price):
-    """Called while MetaApi is awake: learn how far the free feed sits from the broker."""
+    """Called while MetaApi is awake: learn how far the free feed sits from the broker.
+
+    Kept per instrument. One shared number was fine while the bot only ever traded gold,
+    but switching the symbol would then have applied gold's offset to bitcoin - a silent
+    corruption of every price the bot reads while the broker is throttled.
+    """
     if not (broker_price and free_price):
         return
     diff = float(broker_price) - float(free_price)
-    if abs(diff) > MAX_SANE_OFFSET:
-        log.warning(f"ignoring implausible calibration diff {diff:.2f}")
+    if abs(diff) > sane_offset_limit(broker_price):
+        log.warning(f"ignoring implausible calibration diff {diff:.2f} on {symbol}")
         return
     st = _load_state()
-    st["samples"] = (st.get("samples", []) + [round(diff, 3)])[-40:]
-    st["offset"] = round(statistics.median(st["samples"]), 3)
-    st["updated"] = int(time.time())
+    key = bare(symbol)
+    book = st.setdefault("bysym", {})
+    row = book.setdefault(key, {"samples": []})
+    row["samples"] = (row.get("samples", []) + [round(diff, 3)])[-40:]
+    row["offset"] = round(statistics.median(row["samples"]), 3)
+    row["updated"] = int(time.time())
+    if key in {bare(g) for g in GOLD_SYMBOLS}:   # keep the legacy gold fields in step
+        st["samples"], st["offset"], st["updated"] = row["samples"], row["offset"], row["updated"]
     _save_state(st)
 
 
-def offset():
+def _row(symbol=None):
     st = _load_state()
-    return float(st.get("offset", 0.0)) if st.get("samples") else 0.0
+    if symbol:
+        key = bare(symbol)
+        row = (st.get("bysym") or {}).get(key)
+        if row and row.get("samples"):
+            return row
+        # Nothing stored yet for this symbol. Gold inherits the pre-per-symbol state;
+        # anything else starts uncalibrated rather than borrowing gold's number.
+        if key in {bare(g) for g in GOLD_SYMBOLS} and st.get("samples"):
+            return st
+        return {"samples": []}
+    return st
 
 
-def calibration_line():
-    st = _load_state()
-    n = len(st.get("samples", []))
+def offset(symbol=None):
+    row = _row(symbol)
+    return float(row.get("offset", 0.0)) if row.get("samples") else 0.0
+
+
+def calibration_line(symbol=None):
+    row = _row(symbol)
+    n = len(row.get("samples", []))
     if not n:
         return "📡 مصدر مجاني (غير معاير بعد — سيُعاير تلقائياً أول ما يشتغل الحساب)"
-    return f"📡 مصدر مجاني معاير على سعر وسيطك (فرق `{st.get('offset', 0.0)}$` من {n} قياس)"
+    return f"📡 مصدر مجاني معاير على سعر وسيطك (فرق `{row.get('offset', 0.0)}$` من {n} قياس)"
 
 
 def _fold(candles, factor):
@@ -152,14 +220,19 @@ async def _yahoo(client, ticker, timeframe, limit):
     return _fold(candles, factor)[-limit:]
 
 
-async def _binance_paxg(client, timeframe, limit):
-    """PAXG is 1 token = 1 troy ounce of gold, and crypto never closes."""
+async def _binance(client, pair, timeframe, limit):
+    """Binance spot klines, in the shape MetaApi returns."""
     r = await client.get("https://api.binance.com/api/v3/klines",
-                         params={"symbol": "PAXGUSDT", "interval": BINANCE_TF.get(timeframe, "1h"),
+                         params={"symbol": pair, "interval": BINANCE_TF.get(timeframe, "1h"),
                                  "limit": min(limit, 1000)})
     r.raise_for_status()
     return [{"time": int(k[0] / 1000), "open": float(k[1]), "high": float(k[2]),
              "low": float(k[3]), "close": float(k[4]), "tickVolume": float(k[5])} for k in r.json()]
+
+
+async def _binance_paxg(client, timeframe, limit):
+    """PAXG is 1 token = 1 troy ounce of gold, and crypto never closes."""
+    return await _binance(client, "PAXGUSDT", timeframe, limit)
 
 
 async def _stooq_daily(client, code, limit):
@@ -186,6 +259,7 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
 
     sym = symbol.upper()
     is_gold = sym in GOLD_SYMBOLS or sym.startswith("XAU")
+    pair = crypto_pair(sym)
     errors = []
     async with httpx.AsyncClient(timeout=15, headers=UA, follow_redirects=True, transport=_transport()) as client:
         attempts = []
@@ -193,6 +267,11 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
             attempts.append(("yahoo", lambda: _yahoo(client, YAHOO[sym], timeframe, limit)))
         if sym in YAHOO_BACKUP:
             attempts.append(("yahoo-futures", lambda: _yahoo(client, YAHOO_BACKUP[sym], timeframe, limit)))
+        if pair:
+            attempts.append((f"binance-{pair}", lambda: _binance(client, pair, timeframe, limit)))
+            yh = CRYPTO_YAHOO.get(pair)
+            if yh:
+                attempts.append(("yahoo-crypto", lambda: _yahoo(client, yh, timeframe, limit)))
         if is_gold:
             attempts.append(("binance-paxg", lambda: _binance_paxg(client, timeframe, limit)))
             attempts.append(("stooq", lambda: _stooq_daily(client, "xauusd", limit)))
@@ -203,8 +282,8 @@ async def get_candles(symbol, timeframe="1h", limit=200, apply_offset=True):
             try:
                 candles = await fn()
                 if candles and len(candles) >= 30:
-                    if is_gold and apply_offset:
-                        off = offset()
+                    if apply_offset:
+                        off = offset(sym)
                         if off:
                             candles = [{**c, "open": c["open"] + off, "high": c["high"] + off,
                                         "low": c["low"] + off, "close": c["close"] + off} for c in candles]

@@ -967,6 +967,12 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
     if not bid or not ask:
         return False, "ماكو سعر"
     center = round((bid + ask) / 2.0, 2)
+    ok_step, floor, nice = step_sane(center)
+    if not ok_step:
+        return False, (f"الخطوة `{GRID_STEP:g}$` صغيرة جداً على سعر `{center:,.0f}$` — "
+                       f"السلّم كله يمتلي بدقيقة وما يبقى شبكة.\n"
+                       f"• الحد الأدنى `{floor:g}$`  • المنصوح `{nice:g}$`\n"
+                       f"• `/setkey gridstep {nice:g}`")
     streak = load().get("loss_streak", 0)
     base = recovery_base(streak)
     lots = ladder(base=base)
@@ -1796,6 +1802,28 @@ SERVER_TRAIL = os.environ.get("SERVER_TRAIL", "1") not in ("0", "false", "no")
 # writing a $1 stop onto trades that are $20 under water would shut them all at once, and
 # nothing he has asked for means that.
 GRID_STOP_DIST = _f("GRID_STOP_DIST", 0.0)
+
+# A grid step is only meaningful relative to what the instrument costs. $2 on gold near
+# $4,000 is 0.05% - twelve levels span $24, which gold takes hours to cross. Carry that
+# same $2 to bitcoin near $100,000 and the whole twelve-level ladder spans 0.024% of
+# price: every level fills inside a minute at effectively one price, and what is left is
+# not a grid but one oversized position with no plan. The floor below is deliberately
+# under gold's own ratio, so an existing gold setup keeps working untouched, while a
+# step that cannot work on a dearer instrument is refused with the number to use.
+GRID_STEP_MIN_PCT = _f("GRID_STEP_MIN_PCT", 0.02)     # of price, per step
+
+
+def step_floor(price):
+    """Smallest step that still makes a grid on an instrument at this price."""
+    if GRID_STEP_MIN_PCT <= 0 or not price:
+        return 0.0
+    return round(float(price) * GRID_STEP_MIN_PCT / 100.0, 2)
+
+
+def step_sane(price):
+    """(ok, floor, suggested). `suggested` is the gold-equivalent ratio, 0.05% of price."""
+    floor = step_floor(price)
+    return (GRID_STEP >= floor, floor, round(float(price) * 0.05 / 100.0, 2) if price else 0.0)
 
 
 def entry_stop(price_at, is_buy):

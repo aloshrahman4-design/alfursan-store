@@ -100,7 +100,7 @@ HOOK_MAX_BODY = 8192
 SETTABLE_KEYS = {
     "META_API_TOKEN": "توكن MetaApi",
     "ACCOUNT_ID": "رقم الحساب في MetaApi",
-    "SYMBOL": "اسم أداة الذهب عند الوسيط",
+    "SYMBOL": "اسم الأداة عند الوسيط (ذهب، بيتكوين، ...)",
     "ANTHROPIC_API_KEY": "مفتاح Claude",
     "FINNHUB_API_KEY": "مفتاح الأخبار",
     "CLAUDE_MODEL": "نموذج Claude",
@@ -133,6 +133,8 @@ SETTABLE_KEYS = {
     "GRID_MAX_LOT": "سقف اللوت بالشبكة",
     "GRID_LEVELS": "عدد مستويات الشبكة بكل جهة",
     "GRID_STEP": "المسافة بين مستويات الشبكة بالدولار",
+    "GRID_CONTRACT": "وحدات اللوت الواحد (الذهب 100 أونصة، البيتكوين 1)",
+    "GRID_STEP_MIN_PCT": "أصغر خطوة مسموحة كنسبة من السعر (حارس)",
     "GRID_DOUBLE_EVERY": "يضاعف اللوت كل كم مستوى",
     "GRID_TP_CASH": "أقل ربح تغلق عليه الشبكة (الباسكت)",
     "GRID_TP_PER_TRADE": "هدف كل صفقة لحالها بالدولار (0 = مطفي)",
@@ -206,6 +208,7 @@ KEY_ALIASES = {
     "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "servertrail": "SERVER_TRAIL", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
+    "gridcontract": "GRID_CONTRACT", "contract": "GRID_CONTRACT", "gridstepmin": "GRID_STEP_MIN_PCT",
     "gridmaxpos": "GRID_MAX_POSITIONS", "gridaddstop": "GRID_ADD_STOP_PCT", "brake": "GRID_EQUITY_BRAKE_PCT", "gridstop": "GRID_STOP_DIST",
     "gridrefill": "GRID_REFILL", "gridgap": "GRID_GAP_FACTOR", "gridside": "GRID_SIDE_HARVEST",
     "half": "HALF_ENABLED", "halfdist": "HALF_DISTANCE", "halfmin": "HALF_MIN_LOT",
@@ -514,7 +517,7 @@ async def broker_check():
         lines.append("• الصفقات المفتوحة بأمان عند الوسيط، بس أنا ما أشوفها الآن.")
         lines.append("• لو تريد تأمين فوري، حط ستوب يدوي من MT5 — أحترمه وما ألمسه.")
         if datafeed:
-            lines.append(f"• {datafeed.calibration_line()}")
+            lines.append(f"• {datafeed.calibration_line(SYMBOL)}")
         return "\n".join(lines)
     try:
         ours = [p for p in pos if p.get("magic") in (MAGIC_BUY, MAGIC_SELL)]
@@ -534,7 +537,7 @@ async def broker_check():
         if guarded:
             lines.append(f"• `{guarded}` صفقة عليها ستوب لوز منك — لسه تحت إدارتي عادي 🛡")
         if datafeed:
-            lines.append(f"• {datafeed.calibration_line()}")
+            lines.append(f"• {datafeed.calibration_line(SYMBOL)}")
         if intel:
             lines.append(f"• Claude: {'✅' if intel.claude_ready() else '❌ غير مضبوط'}")
     except Exception as e:
@@ -590,7 +593,23 @@ async def handle_go_live():
 GOLD_CROSSES = ("EUR", "GBP", "AUD", "JPY", "CHF", "CNH", "SGD", "HKD", "CAD", "NZD")
 
 
-async def handle_gold_symbol():
+# What to look for when the owner names an instrument. Brokers spell these a dozen ways,
+# so each entry is a list of substrings; `avoid` throws out the crosses of the same metal
+# or coin (XAUEUR is gold, but not the gold we trade; BTCEUR likewise).
+ASSET_HUNT = {
+    "gold":  {"want": ("XAU", "GOLD"), "avoid": GOLD_CROSSES, "ar": "الذهب"},
+    "btc":   {"want": ("BTC", "BITCOIN", "XBT"), "avoid": ("EUR", "GBP", "JPY", "AUD", "CHF"),
+              "ar": "البيتكوين"},
+    "eth":   {"want": ("ETH", "ETHEREUM"), "avoid": ("EUR", "GBP", "JPY"), "ar": "الإيثيريوم"},
+    "silver": {"want": ("XAG", "SILVER"), "avoid": GOLD_CROSSES, "ar": "الفضة"},
+}
+ASSET_WORDS = {"gold": "gold", "ذهب": "gold", "xau": "gold",
+               "btc": "btc", "bitcoin": "btc", "بيتكوين": "btc", "بتكوين": "btc",
+               "eth": "eth", "ethereum": "eth", "إيثيريوم": "eth", "ايثيريوم": "eth",
+               "silver": "silver", "فضة": "silver", "xag": "silver"}
+
+
+async def handle_gold_symbol(arg=""):
     """/gold — ask the broker what gold is called here, instead of guessing the name."""
     if connection is None:
         await send_long("ماكو اتصال بالحساب حالياً — أرسل /check وشوف السبب.", markup=keyboard())
@@ -598,22 +617,31 @@ async def handle_gold_symbol():
     if not hasattr(connection, "get_symbols"):
         await send_long("هذا الأمر يشتغل بوضع MetaApi فقط. أرسل /live أول.", markup=keyboard())
         return
-    await send_long("⏳ أدوّر على أداة الذهب بحسابك...")
+    which = ASSET_WORDS.get(str(arg).strip().lower(), "gold")
+    hunt = ASSET_HUNT[which]
+    await send_long(f"⏳ أدوّر على أداة {hunt['ar']} بحسابك...")
     try:
         symbols = await asyncio.wait_for(connection.get_symbols(), timeout=30)
     except Exception as e:
         await send_long(f"⚠️ ما كدرت أجيب قائمة الأدوات: `{str(e)[:250]}`", markup=keyboard())
         return
-    matches = [s for s in symbols if "XAU" in s.upper() or "GOLD" in s.upper()]
+    matches = [s for s in symbols if any(w in s.upper() for w in hunt["want"])]
     if not matches:
-        await send_long("⚠️ ما لكيت أي أداة ذهب بهذا الحساب. تأكد إن الذهب مفعّل عند الوسيط.",
-                        markup=keyboard())
+        await send_long(f"⚠️ ما لكيت أي أداة {hunt['ar']} بهذا الحساب. "
+                        f"تأكد إنها مفعّلة عند الوسيط.", markup=keyboard())
         return
-    # XAUEUR and friends are gold too, but not the one we trade.
-    best = [s for s in matches if not any(c in s.upper().replace("XAU", "") for c in GOLD_CROSSES)] or matches
+    # XAUEUR and BTCEUR are the same asset against another currency, not the one we trade.
+    def _stripped(name):
+        up = name.upper()
+        for w in hunt["want"]:
+            up = up.replace(w, "")
+        return up
+    best = [s for s in matches
+            if not any(c in _stripped(s) for c in hunt["avoid"])] or matches
     if len(best) > 1:
-        lines = "\n".join(f"• `/setkey gold {s}`" for s in best[:12])
-        await send_long(f"لكيت أكثر من أداة ذهب — اختر واحدة وأرسل سطرها:\n\n{lines}", markup=keyboard())
+        lines = "\n".join(f"• `/setkey symbol {s}`" for s in best[:12])
+        await send_long(f"لكيت أكثر من أداة {hunt['ar']} — اختر واحدة وأرسل سطرها:\n\n{lines}",
+                        markup=keyboard())
         return
     found = best[0]
     try:  # a name that does not quote is the wrong name, however right it looks
@@ -622,11 +650,24 @@ async def handle_gold_symbol():
         await send_long(f"⚠️ لكيت `{found}` بس ما طلّع سعر: `{str(e)[:200]}`", markup=keyboard())
         return
     if found == SYMBOL:
-        await send_long(f"✅ اسم أداة الذهب صحيح أصلاً: `{SYMBOL}` — السعر `{price.get('bid')}`.",
-                        markup=keyboard())
+        await send_long(f"✅ اسم أداة {hunt['ar']} صحيح أصلاً: `{SYMBOL}` — "
+                        f"السعر `{price.get('bid')}`.", markup=keyboard())
         return
     write_env_value("SYMBOL", found)
-    await send_long(f"✅ أداة الذهب عند وسيطك اسمها `{found}` (السعر `{price.get('bid')}`) — ضبطتها.\n"
+    # Switching instrument class changes what a lot IS. Gold is 100 oz per lot; bitcoin
+    # is 1 coin. Leaving the old contract size behind would misprice every margin check,
+    # every cash target and every stop distance the engine computes - silently.
+    extra = ""
+    if which in ("btc", "eth"):
+        write_env_value("GRID_CONTRACT", "1")
+        bid = float(price.get("bid") or 0)
+        nice = round(bid * 0.05 / 100.0, 2) if bid else 0.0
+        write_env_value("GRID_STEP", f"{nice:g}")
+        extra = (f"\n• ضبطت `GRID_CONTRACT=1` (اللوت = عملة واحدة، مو 100 أونصة)"
+                 f"\n• وضبطت `GRID_STEP={nice:g}$` (نفس نسبة الذهب من السعر)"
+                 f"\n⚠️ راجع اللوت والهامش بـ `/grid` قبل `/grid on`")
+    await send_long(f"✅ أداة {hunt['ar']} عند وسيطك اسمها `{found}` "
+                    f"(السعر `{price.get('bid')}`) — ضبطتها.{extra}\n"
                     "♻️ أعيد التشغيل الآن...")
     os._exit(0)
 
@@ -862,6 +903,7 @@ HELP_TEXT = (
     "• /live — رجوع للتنفيذ الآلي على MetaApi (يلقى حسابك لوحده)\n"
     "• /accounts — كل حساباتك بـ MetaApi وسطر جاهز للتبديل لأي واحد\n"
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
+    "• /asset btc — يبدّل الأداة للبيتكوين (أو gold / eth / silver)\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
     "**بدون ما يغلق ولا صفقة مفتوحة** (الحراسة تبقى شغالة عليها)\n"
@@ -1433,7 +1475,7 @@ async def market_price(symbol=None):
                         free = await datafeed.get_price_fast(symbol)
                         mid_b = (float(q["bid"]) + float(q["ask"])) / 2.0
                         mid_f = (float(free["bid"]) + float(free["ask"])) / 2.0
-                        datafeed.note_broker_price(symbol, mid_b, mid_f - datafeed.offset())
+                        datafeed.note_broker_price(symbol, mid_b, mid_f - datafeed.offset(symbol))
                     except Exception:
                         pass
                 return q
@@ -1451,7 +1493,7 @@ def price_source_line():
     if reads_are_free():
         return "• 💹 السعر: من الوسيط مباشرة (البث مجاني)"
     if _price_note["free_used"]:
-        extra = f" · {datafeed.calibration_line()}" if datafeed else ""
+        extra = f" · {datafeed.calibration_line(SYMBOL)}" if datafeed else ""
         return (f"• 💹 السعر: *من المصدر المجاني* — ما يكلف ولا طلب"
                 f" (`{_price_note['free_used']}` قراءة){extra}")
     return "• 💹 السعر: من الوسيط (استعلام مدفوع)"
@@ -2343,7 +2385,7 @@ async def handle_callback(query):
                 try:
                     p = await datafeed.get_price(SYMBOL)
                     txt = (f"🥇 **الذهب (تقريبي):** Ask: `{p['ask']}` | Bid: `{p['bid']}`\n"
-                           f"{datafeed.calibration_line()}\nالحساب المدفوع نائم — اضغط ارتكاز إذا تريد تنفيذ.")
+                           f"{datafeed.calibration_line(SYMBOL)}\nالحساب المدفوع نائم — اضغط ارتكاز إذا تريد تنفيذ.")
                 except Exception as e:
                     txt = f"⚠️ تعذّر جلب السعر المجاني: `{e}`"
             else:
@@ -2515,8 +2557,8 @@ async def process_update(update):
                                           "صفقات مفتوحة بلا حارس.", markup=keyboard())
             elif text.startswith("/live"):
                 await handle_go_live()
-            elif text.startswith("/gold"):
-                await handle_gold_symbol()
+            elif text.startswith("/gold") or text.startswith("/asset"):
+                await handle_gold_symbol(text.split(maxsplit=1)[1] if len(text.split()) > 1 else "")
             elif text.startswith("/paper"):
                 write_env_value("BROKER", "paper")
                 await send_long("📄 *تحويل إلى الحساب التجريبي الداخلي*\n"
@@ -2720,6 +2762,7 @@ async def main():
             BotCommand("live", "تنفيذ آلي على MetaApi (البوت ينفّذ بنفسه)"),
             BotCommand("accounts", "قائمة حساباتك والتبديل بينها"),
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
+            BotCommand("asset", "ضبط الأداة: /asset btc أو /asset gold"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
             BotCommand("mine", "صفقاتك المسلّمة ومتابعتها"),
