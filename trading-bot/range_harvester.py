@@ -2078,6 +2078,11 @@ async def handle_grid_command(text):
         # gold when he believed he had moved to bitcoin.
         when = ("" if not market_closed() else
                 "\n⏳ *بس السوق مغلق الآن* — ما راح تنصب شي قبل ما يفتح.")
+        # Turning the grid on while the SYSTEM is paused does nothing at all, and used
+        # to say so nowhere. This is the one place he is guaranteed to be looking.
+        if os.environ.get("BOT_ACTIVE", "1") in ("0", "false", "no"):
+            when += ("\n⏸ *وانتبه: النظام موقوف* — لازم `/resume` وإلا ما تنصب "
+                     "الشبكة ولا أمر واحد.")
         await send_long(f"🕸 *شغّلت الشبكة.*\n{whoami_line()}\n"
                         f"تنصب نفسها على السعر الحالي أول ما أرجع.{when}\n"
                         "♻️ أعيد التشغيل...")

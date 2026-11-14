@@ -118,6 +118,7 @@ _reads = {"ok": 0.0}
 _blind = {"cut": False}
 _brake_said = 0.0
 _stranded_said = 0.0   # last "winner I cannot close" warning
+_paused_said = 0.0     # last 'grid on but system paused' notice
 
 
 def note_read_ok():
@@ -536,10 +537,11 @@ def notices_reset():
     2:51 decided not to arm and said nothing, because the same notice had gone out at
     2:39. From his side the bot simply ignored him. Anything he types resets this.
     """
-    global _brake_said, _blocked_at, _stranded_said
+    global _brake_said, _blocked_at, _stranded_said, _paused_said
     _brake_said = 0.0
     _blocked_at = 0.0
     _stranded_said = 0.0
+    _paused_said = 0.0
 
 
 async def bias_watch(notify=None):
@@ -1142,6 +1144,18 @@ async def grid_engine(get_conn, symbol, notify, is_active):
     while True:
         try:
             if not (GRID_ENABLED and is_active()):
+                # The quietest failure in the whole project. /grid on sets GRID_ENABLED,
+                # answers "the grid is on", restarts - and then this line sends the
+                # engine straight back to sleep because BOT_ACTIVE is still 0 from an
+                # earlier /pause. Nothing connected the two, so the owner watched an
+                # empty chart while the bot insisted the grid was running. Say it.
+                if GRID_ENABLED and not is_active():
+                    global _paused_said
+                    if time.time() - _paused_said > BLOCKED_NOTE_SECS:
+                        _paused_said = time.time()
+                        await notify("⏸ *الشبكة مشغّلة بس النظام موقوف* — ما أنصب شي.\n"
+                                     "• أرسل `/resume` حتى أبدأ\n"
+                                     "• (النظام انوقف بـ `/pause` أو `/stop` من قبل)")
                 await asyncio.sleep(3)
                 continue
             conn = get_conn()
