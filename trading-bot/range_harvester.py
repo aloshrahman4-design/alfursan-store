@@ -2165,8 +2165,19 @@ async def handle_grid_command(text):
         # Re-lay the ladder around the current price without touching what is open. The
         # positions stay, keep their stops, and still count toward GRID_MAX_POSITIONS.
         if connection is None:
-            await send_long("ماكو اتصال حالياً — ما أقدر ألغي الأوامر القديمة بأمان.",
-                            markup=keyboard())
+            # Typed seconds after a restart the connection is simply not up yet. A flat
+            # refusal reads as a fault and sends the owner hunting for one; the honest
+            # answer is "wait a moment", so wait a moment. And say the engine lays the
+            # ladder by itself anyway - rearm is for re-centring, not for starting.
+            for _ in range(20):
+                await asyncio.sleep(1.0)
+                if connection is not None:
+                    break
+        if connection is None:
+            await send_long("⏳ الاتصال لسه ما جهز — جرّب بعد شوي.\n"
+                            "• وما تحتاج `/grid rearm` حتى تبدأ: المحرك ينصب لحاله أول "
+                            "ما يتصل\n"
+                            "• `rearm` للتوسيط من جديد على سعر حالي", markup=keyboard())
             return
         try:
             held = await grid.grid_positions(connection)
