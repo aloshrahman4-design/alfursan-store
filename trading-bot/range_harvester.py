@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -1093,23 +1094,27 @@ def savings_line():
 
 
 def code_version():
-    """Which commit is actually running.
+    """A fingerprint of the code actually running on this machine.
 
-    Three times now a fix was pushed, the owner read the old behaviour on his screen,
-    and neither of us could tell whether the pull had happened. Nothing in the bot
-    said. A seven-character hash in the line he already reads ends that for good.
+    Three times a fix was pushed, the owner read the old behaviour on his screen, and
+    neither of us could tell whether the update had landed. The first attempt at this
+    asked git for the commit - useless here, because /update downloads raw files from
+    GitHub and the server holds no repository at all. So it hashes the source files
+    themselves: no git needed, changes whenever any line does, and the same seven
+    characters can be computed from the repo to compare against.
     """
     global _code_rev
     if _code_rev is None:
-        _code_rev = "؟"
         try:
-            import subprocess
-            _code_rev = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                capture_output=True, text=True, timeout=4).stdout.strip() or "؟"
+            h = hashlib.sha256()
+            for name in sorted(CODE_FILES):
+                path = os.path.join(BASE_DIR, name)
+                h.update(name.encode())
+                h.update(open(path, "rb").read() if os.path.exists(path) else b"")
+            _code_rev = h.hexdigest()[:7]
         except Exception as e:
             log.info(f"version unavailable: {e}")
+            _code_rev = "؟"
     return _code_rev
 
 
