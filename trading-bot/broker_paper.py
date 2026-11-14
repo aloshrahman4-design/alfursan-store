@@ -145,13 +145,13 @@ class PaperBroker:
             out.append(item)
         return out
 
-    async def _open(self, direction, volume, options):
+    async def _open(self, direction, volume, options, symbol=None):
         state = _load()
         mid = await self._mid()
         entry = mid + SPREAD / 2 if direction == "BUY" else mid - SPREAD / 2
         pos = {
             "id": f"P{state['next_id']}",
-            "symbol": ENGINE_SYMBOL,
+            "symbol": symbol or ENGINE_SYMBOL,
             "type": "POSITION_TYPE_BUY" if direction == "BUY" else "POSITION_TYPE_SELL",
             "magic": (options or {}).get("magic", 0),
             "openPrice": round(entry, 2),
@@ -165,10 +165,10 @@ class PaperBroker:
         return {"dealId": pos["id"], "openPrice": pos["openPrice"]}
 
     async def create_market_buy_order(self, symbol=None, volume=None, options=None):
-        return await self._open("BUY", volume, options)
+        return await self._open("BUY", volume, options, symbol)
 
     async def create_market_sell_order(self, symbol=None, volume=None, options=None):
-        return await self._open("SELL", volume, options)
+        return await self._open("SELL", volume, options, symbol)
 
     async def close_position_partially(self, position_id, volume, options=None):
         """Book part of a position and shrink what stays open, keeping the same id."""
@@ -232,7 +232,8 @@ class PaperBroker:
         for o in fired:
             state["positions"].append({
                 "id": o["id"],
-                "symbol": ENGINE_SYMBOL,
+                # A filled pending becomes a position on the order's OWN instrument.
+                "symbol": o.get("symbol") or ENGINE_SYMBOL,
                 "type": "POSITION_TYPE_BUY" if o["type"] == "ORDER_TYPE_BUY_STOP" else "POSITION_TYPE_SELL",
                 "magic": o.get("magic", 0),
                 "takeProfit": o.get("takeProfit"),
@@ -274,11 +275,12 @@ class PaperBroker:
             state["history"] = state["history"][-500:]
             _save(state)
 
-    async def _place_pending(self, kind, volume, open_price, options, take_profit=None):
+    async def _place_pending(self, kind, volume, open_price, options, take_profit=None,
+                             symbol=None):
         state = _load()
         order = {
             "id": f"O{state['next_id']}",
-            "symbol": ENGINE_SYMBOL,
+            "symbol": symbol or ENGINE_SYMBOL,
             "type": kind,
             "magic": (options or {}).get("magic", 0),
             "openPrice": round(float(open_price), 2),
@@ -293,11 +295,13 @@ class PaperBroker:
 
     async def create_stop_buy_order(self, symbol=None, volume=None, open_price=None,
                                     stop_loss=None, take_profit=None, options=None, **kw):
-        return await self._place_pending("ORDER_TYPE_BUY_STOP", volume, open_price, options, take_profit)
+        return await self._place_pending("ORDER_TYPE_BUY_STOP", volume, open_price,
+                                         options, take_profit, symbol)
 
     async def create_stop_sell_order(self, symbol=None, volume=None, open_price=None,
                                      stop_loss=None, take_profit=None, options=None, **kw):
-        return await self._place_pending("ORDER_TYPE_SELL_STOP", volume, open_price, options, take_profit)
+        return await self._place_pending("ORDER_TYPE_SELL_STOP", volume, open_price,
+                                         options, take_profit, symbol)
 
     async def get_orders(self, **kw):
         await self._trigger_pending()

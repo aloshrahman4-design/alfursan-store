@@ -2993,6 +2993,7 @@ async def main():
         # reads happen to be free too. This is what lets the bot keep managing trades
         # while the API is throttled: it can still see, and moving a stop is a write.
         grid.PRICE_HOOK = market_price
+        grid.set_symbol(SYMBOL)   # one source of truth for which instrument is ours
         log.info("grid price source: free feed (calibrated), broker only when streaming")
     log.info("Bot booting up (supervised mode)")
     tasks = [

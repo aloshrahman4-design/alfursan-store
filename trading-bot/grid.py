@@ -692,16 +692,34 @@ async def book(conn, symbol=None, exclude=None):
     exclude = set(exclude if exclude is not None else load().get("released", []))
     pos = await asyncio.wait_for(conn.get_positions(), timeout=6.0)
     note_read_ok()
-    mine = [p for p in pos if p.get("magic") in MAGICS and p.get("id") not in exclude]
-    return mine, net_exposure(pos, symbol)
+    mine = [p for p in pos if ours(p, exclude, symbol)]
+    sym = symbol or GRID_SYMBOL
+    elsewhere = round(sum(float(p.get("unrealizedProfit", 0.0) or 0.0)
+                          for p in pos if p.get("symbol") != sym), 2)
+    return mine, net_exposure(pos, symbol), elsewhere
 
 
-async def grid_positions(conn, exclude=None):
+def ours(p, exclude, symbol=None):
+    """A grid trade of ours, ON THE INSTRUMENT WE ARE TRADING.
+
+    The symbol test was missing everywhere, and it only became visible on the day the
+    bot changed instrument. Switching to bitcoin left four gold grid trades matching
+    the magic numbers, so they still filled the position cap, still counted inside the
+    basket's profit (which is why a basket $2000 under water could never be harvested),
+    still drove the basket stop - and /grid off would have closed them. None of that
+    is bitcoin's business, and none of it was visible on any screen.
+    """
+    return (p.get("magic") in MAGICS
+            and p.get("symbol") == (symbol or GRID_SYMBOL)
+            and p.get("id") not in exclude)
+
+
+async def grid_positions(conn, exclude=None, symbol=None):
     """Grid trades the bot still owns. Released ones are the user's and stay invisible."""
     exclude = set(exclude if exclude is not None else load().get("released", []))
     pos = await asyncio.wait_for(conn.get_positions(), timeout=6.0)
     note_read_ok()
-    return [p for p in pos if p.get("magic") in MAGICS and p.get("id") not in exclude]
+    return [p for p in pos if ours(p, exclude, symbol)]
 
 
 async def close_positions(conn, positions):
@@ -855,7 +873,7 @@ async def ensure_take_profits(conn, positions, notify=None):
     return len(fixed)
 
 
-async def grid_orders(conn):
+async def grid_orders(conn, symbol=None):
     if not hasattr(conn, "get_orders"):
         return []
     try:
@@ -863,7 +881,8 @@ async def grid_orders(conn):
     except Exception as e:
         log.warning(f"could not read pending orders: {e}")
         return []
-    return [o for o in orders if o.get("magic") in MAGICS]
+    return [o for o in orders
+            if o.get("magic") in MAGICS and o.get("symbol") == (symbol or GRID_SYMBOL)]
 
 
 async def cancel_all(conn):   # noqa: D401 - the record is cleared with the orders
@@ -1152,6 +1171,7 @@ _blocked_at = 0.0
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
+    set_symbol(symbol)            # the argument wins over whatever the env said
     # best each side has shown; in memory, so a peak dies with the basket that earned it
     peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
     while True:
@@ -1217,7 +1237,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     _d, _lim, braked_now = drawdown_brake(_b, _e)
                 except Exception as e:
                     log.warning(f"could not read the account for the brake: {e}")
-                held, net = await book(conn, symbol)
+                held, net, elsewhere = await book(conn, symbol)
                 crowded_now = len(held) >= GRID_MAX_POSITIONS
                 # Under water, but one direction still REDUCES the hole. Let that one
                 # through, capped so it can never run past flat into fresh exposure.
@@ -1244,9 +1264,19 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                     global _brake_said
                     if time.time() - _brake_said > BLOCKED_NOTE_SECS:
                         _brake_said = time.time()
+                        # The drawdown that stops a bitcoin ladder can be entirely
+                        # gold's. Without saying so, the owner sees a bot refusing to
+                        # work on an instrument he has not lost a cent on.
+                        other = ""
+                        if elsewhere < -0.01:
+                            need = int(abs(elsewhere) / max(1.0, _b) * 100) + 5
+                            other = (f"• ⚠️ `{abs(elsewhere):g}$` من الهبوط من *أدوات "
+                                     f"ثانية* مو من `{symbol}` — الشبكة هنا نظيفة\n"
+                                     f"• ارفع المكبح فوق هذا: `/setkey brake {need}`\n")
                         await notify(
                             f"🛑 *ما أنصب شبكة جديدة — الحساب نازل `{_d:g}$` تحت رصيده*\n"
                             f"• الحد `{_lim:g}$` (`{GRID_EQUITY_BRAKE_PCT:g}%` من الرصيد)\n"
+                            f"{other}"
                             f"• ما أضيف ولا صفقة تزيد تعرّضك وأنت بهذا العمق\n"
                             f"• بس أبقى أدير `{len(held)}` صفقة مفتوحة: تأمين، تريلينغ، "
                             f"وحصاد لو طلعت بالربح\n"
@@ -1910,6 +1940,21 @@ GRID_STOP_DIST = _f("GRID_STOP_DIST", 0.0)
 # step that cannot work on a dearer instrument is refused with the number to use.
 GRID_STEP_MIN_PCT = _f("GRID_STEP_MIN_PCT", 0.02)     # of price, per step
 GRID_SYMBOL = os.environ.get("SYMBOL", "GOLD").strip()
+
+
+def set_symbol(sym):
+    """One source of truth for which instrument the grid owns.
+
+    The engine receives the symbol as an argument while the filters read it
+    independently from the environment. Two reads of the same setting agree right up
+    until they do not - a caller that passes "XAUUSD" while the environment says
+    "GOLD" makes every grid position invisible, and the grid silently owns nothing.
+    The engine now publishes the symbol it was actually given.
+    """
+    global GRID_SYMBOL
+    if sym and str(sym).strip() and str(sym).strip() != GRID_SYMBOL:
+        GRID_SYMBOL = str(sym).strip()
+        log.info(f"grid symbol set to {GRID_SYMBOL}")
 # What a lot is, in words, so the panel can say it instead of printing a bare 100.
 UNIT_WORD = {100.0: "100 أونصة", 1.0: "وحدة واحدة", 1000.0: "1000 وحدة"}
 
