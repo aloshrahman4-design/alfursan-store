@@ -714,8 +714,22 @@ async def handle_gold_symbol(arg=""):
         nice = round(bid * 0.05 / 100.0, 2) if bid else 0.0
         write_env_value("GRID_STEP", f"{nice:g}")
         extra = (f"\n• ضبطت `GRID_CONTRACT=1` (اللوت = عملة واحدة، مو 100 أونصة)"
-                 f"\n• وضبطت `GRID_STEP={nice:g}$` (نفس نسبة الذهب من السعر)"
-                 f"\n⚠️ راجع اللوت والهامش بـ `/grid` قبل `/grid on`")
+                 f"\n• وضبطت `GRID_STEP={nice:g}$` (نفس نسبة الذهب من السعر)")
+        # A hard stop is a price distance, and a price distance carried over from
+        # another instrument is meaningless: $1 is a sane stop on gold and is inside
+        # the spread on bitcoin, where the broker rejects every order that carries it.
+        # Zeroing it is safe - the server-side profit trail is untouched.
+        try:
+            had = float(os.environ.get("GRID_STOP_DIST", "0") or 0)
+        except ValueError:
+            had = 0.0
+        if had > 0:
+            write_env_value("GRID_STOP_DIST", "0")
+            extra += (f"\n• وألغيت الوقف الثابت (`{had:g}$`) — مسافة سعر من أداة ثانية "
+                      f"ما لها معنى هنا، والوسيط يرفض كل أمر يحملها.\n"
+                      f"  ستوب متابعة الربح ما تغيّر. تريد وقف ثابت للبيتكوين؟ "
+                      f"`/setkey gridstop 200` مثلاً")
+        extra += "\n⚠️ راجع اللوت والهامش بـ `/grid` قبل `/grid on`"
     await send_long(f"✅ أداة {hunt['ar']} عند وسيطك اسمها `{found}` "
                     f"(السعر `{price.get('bid')}`) — ضبطتها.{extra}\n"
                     "♻️ أعيد التشغيل الآن...")

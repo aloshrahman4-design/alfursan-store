@@ -1010,6 +1010,7 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
                        f"`{min(free, ceiling):,.0f}$` — قلّل المستويات أو اللوت")
 
     placed, failed, placed_lots = 0, 0, 0.0
+    reasons = []                      # what the broker actually said, for the user
     for i, lot in enumerate(lots, start=1):
         up = round(center + i * GRID_STEP, 2)
         down = round(center - i * GRID_STEP, 2)
@@ -1038,9 +1039,21 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why=""):
                 placed_lots = round(placed_lots + lot, 2)
             except Exception as e:
                 failed += 1
+                why = str(e).strip()[:160] or e.__class__.__name__
+                if why not in reasons:
+                    reasons.append(why)
                 log.warning(f"grid level {i} at {price_at} failed: {e}")
     if not placed:
-        return False, "ما انحطت ولا أمر — راجع اسم الأداة وحجم اللوت عند وسيطك"
+        # "Check the symbol and the lot size" was a guess printed INSTEAD of the answer:
+        # the broker had said exactly what was wrong, every time, and it went to the log
+        # file the owner cannot read from his phone. Hand him what the broker said.
+        detail = "\n".join(f"• `{r}`" for r in reasons[:3]) or "• (الوسيط ما رد بسبب)"
+        return False, (f"ما انحطت ولا أمر. رد الوسيط:\n{detail}\n"
+                       f"• الأداة `{symbol}` · اللوت `{lots[0]:g}` · العقد "
+                       f"`{GRID_CONTRACT:g}` · الخطوة `{GRID_STEP:g}$`"
+                       + (f"\n• الوقف الثابت `{GRID_STOP_DIST:g}$` — على أداة بسعر "
+                          f"`{center:,.0f}$` هذا أقرب من حد الوسيط غالباً، "
+                          f"جرّب `/setkey gridstop 0`" if GRID_STOP_DIST > 0 else ""))
 
     state = load()
     state.update({"armed": True, "center": center, "armed_at": time.time(),
