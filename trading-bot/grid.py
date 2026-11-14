@@ -120,6 +120,11 @@ _brake_said = 0.0
 _stranded_said = 0.0   # last "winner I cannot close" warning
 _paused_said = 0.0     # last 'grid on but system paused' notice
 _halt_said = 0.0       # last 'the grid is halted' notice
+_armfail_said = 0.0    # last 'could not arm, still trying' notice
+# How many refusals in a row before the grid really stops. One was far too few: a
+# single bad setting latched a permanent halt that outlived every fix for it.
+ARM_FAIL_HALT = max(1, _i("ARM_FAIL_HALT", 10))
+ARM_RETRY_SECS = _f("ARM_RETRY_SECS", 30.0)
 
 
 def note_read_ok():
@@ -539,11 +544,13 @@ def notices_reset():
     2:39. From his side the bot simply ignored him. Anything he types resets this.
     """
     global _brake_said, _blocked_at, _stranded_said, _paused_said, _halt_said
+    global _armfail_said
     _brake_said = 0.0
     _blocked_at = 0.0
     _stranded_said = 0.0
     _paused_said = 0.0
     _halt_said = 0.0
+    _armfail_said = 0.0
 
 
 async def bias_watch(notify=None):
@@ -1173,6 +1180,7 @@ _blocked_at = 0.0
 async def grid_engine(get_conn, symbol, notify, is_active):
     """Watch the basket: take it on profit, cut it on loss, re-centre when it empties."""
     warned_unsupported = False
+    arm_fails = 0
     set_symbol(symbol)            # the argument wins over whatever the env said
     # best each side has shown; in memory, so a peak dies with the basket that earned it
     peaks = {"buy": 0.0, "sell": 0.0, "all": 0.0}
@@ -1308,12 +1316,29 @@ async def grid_engine(get_conn, symbol, notify, is_active):
                             "• تريده هسه؟ سكّر صفقة بالمنصة، أو `/grid off` ثم `/grid on`")
                 else:
                     ok, err = await arm(conn, symbol, notify)
-                    if not ok:
-                        await notify(f"⚠️ ما كدرت أنصب الشبكة: {err}")
-                        state["halted"] = True
-                        state["halt_reason"] = err or "?"
-                        save(state)
-                    await asyncio.sleep(2)
+                    if ok:
+                        arm_fails = 0
+                    else:
+                        # A refused batch is not a reason to halt forever. It used to
+                        # be: one failure at 18:15, caused by a $1 stop left over from
+                        # gold, latched halted=True - and every fix applied afterwards
+                        # was irrelevant because the halt outlived all of them, in
+                        # silence. Hours went into chasing settings that were already
+                        # correct. Retry instead, and only give up after several
+                        # consecutive failures, saying plainly that it will keep trying.
+                        arm_fails += 1
+                        if arm_fails >= ARM_FAIL_HALT:
+                            state["halted"] = True
+                            state["halt_reason"] = err or "?"
+                            save(state)
+                            await notify(f"🛑 *وقفت الشبكة بعد `{arm_fails}` محاولات*\n"
+                                         f"{err}\n• `/grid on` يلغي الإيقاف ويبدأ من جديد")
+                        elif time.time() - _armfail_said > BLOCKED_NOTE_SECS:
+                            globals()["_armfail_said"] = time.time()
+                            await notify(f"⚠️ ما كدرت أنصب الشبكة "
+                                         f"(محاولة `{arm_fails}` من `{ARM_FAIL_HALT}`):\n"
+                                         f"{err}\n• أبقى أحاول — صلّح الإعداد وأنصب لحالي")
+                    await asyncio.sleep(2 if ok else ARM_RETRY_SECS)
                     continue
                 if not held:
                     await asyncio.sleep(5)   # nothing armed and nothing open: just wait
