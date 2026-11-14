@@ -611,7 +611,13 @@ ASSET_WORDS = {"gold": "gold", "ذهب": "gold", "xau": "gold",
 
 
 async def handle_gold_symbol(arg=""):
-    """/gold — ask the broker what gold is called here, instead of guessing the name."""
+    """/gold or /asset <name> — ask the broker what this instrument is called here.
+
+    `global` goes at the top, before any read of the name. Placed lower it is a
+    SyntaxError that ast.parse happily accepts and only compile() catches - which is
+    why every check in this project uses compile(), and why it is written here first.
+    """
+    global symbols_cache
     if connection is None:
         await send_long("ماكو اتصال بالحساب حالياً — أرسل /check وشوف السبب.", markup=keyboard())
         return
@@ -629,6 +635,17 @@ async def handle_gold_symbol(arg=""):
         return
     which = ASSET_WORDS.get(word)
     if which is None:
+        # An exact broker symbol is a perfectly good answer to "which instrument" -
+        # it is what the chooser above hands back. Taking it here keeps the lot size
+        # and step setup on the path; /setkey symbol would skip both and leave
+        # bitcoin running on gold's 100-ounce contract.
+        guess = str(arg).strip().upper()
+        if any(x.upper() == guess for x in (symbols_cache or [])) or _looks_like_symbol(guess):
+            for name, spec in ASSET_HUNT.items():
+                if any(w in guess for w in spec["want"]):
+                    which = name
+                    break
+    if which is None:
         opts = " · ".join(f"`/asset {k}`" for k in ASSET_HUNT)
         await send_long(f"⚠️ ما أعرف أداة اسمها `{arg}` — وما راح أخمّن.\n"
                         f"المتاح: {opts}\n"
@@ -642,6 +659,7 @@ async def handle_gold_symbol(arg=""):
     except Exception as e:
         await send_long(f"⚠️ ما كدرت أجيب قائمة الأدوات: `{str(e)[:250]}`", markup=keyboard())
         return
+    symbols_cache = list(symbols)
     matches = [s for s in symbols if any(w in s.upper() for w in hunt["want"])]
     if not matches:
         # "Not found" with nothing else is a dead end. Show what the account actually
@@ -650,7 +668,7 @@ async def handle_gold_symbol(arg=""):
         near = [x for x in symbols if any(k in x.upper() for k in
                 ("BTC", "ETH", "CRYPTO", "COIN", "XAU", "XAG", "GOLD", "SILVER"))][:15]
         hint = ("\n\nالموجود بحسابك من هذا النوع:\n"
-                + "\n".join(f"• `/setkey symbol {x}`" for x in near)) if near else \
+                + "\n".join(f"• `/asset {x}`" for x in near)) if near else \
                f"\n\nعدد أدوات حسابك `{len(symbols)}` وماكو ولا وحدة قريبة من هذا النوع."
         await send_long(f"⚠️ ما لكيت أي أداة {hunt['ar']} بهذا الحساب — "
                         f"يعني وسيطك ما يوفرها على الأغلب.{hint}", markup=keyboard())
@@ -663,12 +681,19 @@ async def handle_gold_symbol(arg=""):
         return up
     best = [s for s in matches
             if not any(c in _stripped(s) for c in hunt["avoid"])] or matches
+    # BTC against USD is the one being asked for. The account also lists BTCETH,
+    # BTCLTC, BTCBCH, BTCXAU and friends - every one of them bitcoin, none of them the
+    # instrument. If exactly one candidate quotes in plain USD, that is it.
+    usd = [x for x in best if _stripped(x) in ("USD", "USDT", "USDC")]
+    if len(usd) == 1:
+        best = usd
     if len(best) > 1:
-        lines = "\n".join(f"• `/setkey symbol {s}`" for s in best[:12])
+        lines = "\n".join(f"• `/asset {s}`" for s in best[:12])
         await send_long(f"لكيت أكثر من أداة {hunt['ar']} — اختر واحدة وأرسل سطرها:\n\n{lines}",
                         markup=keyboard())
         return
-    found = best[0]
+    exact = [x for x in symbols if x.upper() == str(arg).strip().upper()]
+    found = exact[0] if exact else best[0]
     try:  # a name that does not quote is the wrong name, however right it looks
         price = await asyncio.wait_for(connection.get_symbol_price(symbol=found), timeout=15)
     except Exception as e:
@@ -1119,6 +1144,15 @@ def code_version():
 
 
 _code_rev = None
+
+
+symbols_cache = []
+
+
+def _looks_like_symbol(text):
+    """A broker instrument name: letters and digits, with optional . / # decoration."""
+    core = "".join(c for c in text if c.isalnum())
+    return 3 <= len(core) <= 16 and core.isalnum() and not core.isdigit()
 
 
 def whoami_line():
