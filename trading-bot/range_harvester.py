@@ -708,32 +708,51 @@ async def handle_gold_symbol(arg=""):
                         f"السعر `{price.get('bid')}`.", markup=keyboard())
         return
     write_env_value("SYMBOL", found)
-    # Switching instrument class changes what a lot IS. Gold is 100 oz per lot; bitcoin
-    # is 1 coin. Leaving the old contract size behind would misprice every margin check,
-    # every cash target and every stop distance the engine computes - silently.
-    extra = ""
-    if which in ("btc", "eth"):
-        write_env_value("GRID_CONTRACT", "1")
-        bid = float(price.get("bid") or 0)
-        nice = round(bid * 0.05 / 100.0, 2) if bid else 0.0
+    # Switching instrument changes what a lot IS and what a sane step is. The first
+    # version only corrected these on the way TO crypto, so coming back to gold left
+    # bitcoin's contract size of 1 and its $33 step in place - every margin check,
+    # cash target and stop distance wrong by a hundredfold, silently. The fix is to
+    # stop special-casing a direction and ask the BROKER what this instrument is.
+    extra, bid = "", float(price.get("bid") or 0)
+    spec = {}
+    try:
+        if hasattr(connection, "get_symbol_specification"):
+            spec = await asyncio.wait_for(
+                connection.get_symbol_specification(found), timeout=8.0) or {}
+    except Exception as e:
+        log.warning(f"could not read the specification for {found}: {e}")
+
+    cs = float(spec.get("contractSize", 0) or 0)
+    if cs > 0:
+        write_env_value("GRID_CONTRACT", f"{cs:g}")
+        extra += f"\n• حجم العقد من الوسيط: `{cs:g}` وحدة باللوت"
+    if bid:
+        nice = round(bid * 0.05 / 100.0, 2)
         write_env_value("GRID_STEP", f"{nice:g}")
-        extra = (f"\n• ضبطت `GRID_CONTRACT=1` (اللوت = عملة واحدة، مو 100 أونصة)"
-                 f"\n• وضبطت `GRID_STEP={nice:g}$` (نفس نسبة الذهب من السعر)")
-        # A hard stop is a price distance, and a price distance carried over from
-        # another instrument is meaningless: $1 is a sane stop on gold and is inside
-        # the spread on bitcoin, where the broker rejects every order that carries it.
-        # Zeroing it is safe - the server-side profit trail is untouched.
+        extra += f"\n• الخطوة `{nice:g}$` (نصف بالألف من السعر — نفس نسبة إعداد الذهب)"
+    mn = float(spec.get("minVolume", 0) or 0)
+    if mn > 0:
         try:
-            had = float(os.environ.get("GRID_STOP_DIST", "0") or 0)
+            lot = float(os.environ.get("GRID_BASE_LOT", "0.02") or 0.02)
         except ValueError:
-            had = 0.0
-        if had > 0:
-            write_env_value("GRID_STOP_DIST", "0")
-            extra += (f"\n• وألغيت الوقف الثابت (`{had:g}$`) — مسافة سعر من أداة ثانية "
-                      f"ما لها معنى هنا، والوسيط يرفض كل أمر يحملها.\n"
-                      f"  ستوب متابعة الربح ما تغيّر. تريد وقف ثابت للبيتكوين؟ "
-                      f"`/setkey gridstop 200` مثلاً")
-        extra += "\n⚠️ راجع اللوت والهامش بـ `/grid` قبل `/grid on`"
+            lot = 0.02
+        if lot < mn:
+            write_env_value("GRID_BASE_LOT", f"{mn:g}")
+            write_env_value("GRID_MAX_LOT", f"{mn:g}")
+            extra += f"\n• رفعت اللوت لـ`{mn:g}` — أقل لوت يقبله الوسيط هنا"
+
+    # A hard stop is a price distance, and one carried over from another instrument is
+    # meaningless: $1 is a sane stop on gold and sits inside the spread on bitcoin,
+    # where the broker rejects every order that carries it.
+    try:
+        had = float(os.environ.get("GRID_STOP_DIST", "0") or 0)
+    except ValueError:
+        had = 0.0
+    if had > 0:
+        write_env_value("GRID_STOP_DIST", "0")
+        extra += (f"\n• وألغيت الوقف الثابت (`{had:g}$`) — مسافة سعر من أداة ثانية "
+                  f"ما لها معنى هنا")
+    extra += "\n⚠️ شوف `/grid` قبل `/grid on` — راح يبيّن كل إعداد بالحركة الحقيقية"
     await send_long(f"✅ أداة {hunt['ar']} عند وسيطك اسمها `{found}` "
                     f"(السعر `{price.get('bid')}`) — ضبطتها.{extra}\n"
                     "♻️ أعيد التشغيل الآن...")
