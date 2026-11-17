@@ -674,7 +674,55 @@ def _blank():
             # The account's high-water mark. Deliberately NOT cleared by reset(): a
             # drawdown that survives a re-centre is the whole point of measuring it.
             "equity_hwm": 0.0,
+            # Positions the owner handed TO the bot. The mirror image of "released":
+            # trades it did not open, that he has asked it to protect anyway.
+            "adopted": [],
             "loss_streak": 0, "pending_ids": []}
+
+
+def adopted_ids():
+    """Positions the bot did not open but has been told to manage."""
+    return set(load().get("adopted", []))
+
+
+def adopt(pid):
+    """Take over a trade opened by hand. Returns True if this changed anything.
+
+    Deliberately explicit rather than automatic: protecting a trade means being
+    allowed to CLOSE it, and the bot must never assume that permission over money
+    somebody else put at risk.
+    """
+    pid = str(pid)
+    state = load()
+    ids = [str(i) for i in state.get("adopted", [])]
+    # Adopting undoes a release, or the two lists would contradict each other and
+    # whichever check ran last would decide - the kind of ambiguity that has already
+    # cost this project a day. This runs BEFORE the "already adopted" exit: a trade
+    # that is on both lists is exactly the case that needs repairing, and an early
+    # return would leave it broken for good.
+    rel = [i for i in state.get("released", []) if str(i) != pid]
+    fixed = len(rel) != len(state.get("released", []))
+    state["released"] = rel
+    if pid in ids:
+        if fixed:
+            save(state)
+        return fixed
+    ids.append(pid)
+    state["adopted"] = ids[-200:]
+    save(state)
+    return True
+
+
+def unadopt(pid):
+    """Hand a trade back. The bot stops touching it from the next tick."""
+    pid = str(pid)
+    state = load()
+    ids = [str(i) for i in state.get("adopted", [])]
+    if pid not in ids:
+        return False
+    state["adopted"] = [i for i in ids if i != pid]
+    save(state)
+    return True
 
 
 def load():
@@ -683,6 +731,7 @@ def load():
             state = _blank()
             state.update(json.load(f))
             state.setdefault("released", [])
+            state.setdefault("adopted", [])
             state.setdefault("loss_streak", 0)
             state.setdefault("pending_ids", [])
             return state
@@ -717,6 +766,9 @@ def reset():
     # The high-water mark survives too. A drawdown the user can erase by re-arming is
     # not a drawdown; it is a number that flatters whoever is looking at it.
     fresh["equity_hwm"] = old.get("equity_hwm", 0.0)
+    # Adoptions survive for the same reason releases do: the owner asked for that
+    # trade to be guarded, and a re-centre is not him changing his mind.
+    fresh["adopted"] = old.get("adopted", [])
     save(fresh)
     trend_reset()
 
@@ -2304,7 +2356,9 @@ async def trades_report(conn, symbol, bid=0.0, ask=0.0):
     pos = [p for p in (pos or []) if p.get("symbol") == symbol]
     if not pos:
         return f"ماكو صفقات مفتوحة على `{symbol}`."
-    rel = set(load().get("released", []))
+    st = load()
+    rel = set(st.get("released", []))
+    ado = {str(i) for i in st.get("adopted", [])}
     out = [f"📋 *صفقات `{symbol}`* — النسخة تحت"]
     for p in pos:
         pid, mg = p.get("id"), p.get("magic")
@@ -2318,22 +2372,25 @@ async def trades_report(conn, symbol, bid=0.0, ask=0.0):
         side = "شراء" if is_buy else "بيع"
         if pid in rel:
             who = "🤝 مسلّمة إلك — البوت ما يلمسها"
+        elif str(pid) in ado:
+            who = "🫱 متبنّاة — البوت يحميها (`/unadopt` يرجّعها)"
         elif mg in MAGICS:
             who = "🕸 شبكة — البوت يديرها"
         elif mg in (777111, 777222):
             who = "⚓ ارتكاز — البوت يديرها"
         else:
-            who = f"👤 مو من البوت (magic `{mg}`) — ما يلمسها"
+            who = (f"👤 مو من البوت (magic `{mg}`) — ما يلمسها\n"
+                   f"  `/adopt {pid}` يخليه يحميها")
         sl = p.get("stopLoss")
         tp = p.get("takeProfit")
         trail = "✅" if has_server_trail(p) else "❌"
         cur = (f"✅" if trail == "✅" and trail_is_current(p, server_trail()) else
                ("قديم ⚠️" if trail == "✅" else "❌"))
-        lines = [f"\n*{side} `{lot:g}` @ `{entry}`* · `{pl:+.2f}$`",
+        lines = [f"\n*{side} `{lot:g}` @ `{entry}`* · `{pl:+.2f}$` · رقمها `{pid}`",
                  f"  {who}",
                  f"  وقف: `{sl if sl else 'ماكو'}` · هدف: `{tp if tp else 'ماكو'}` "
                  f"· تريلينغ الوسيط: {cur}"]
-        if mg in MAGICS and not (pid in rel):
+        if (mg in MAGICS or str(pid) in ado) and not (pid in rel):
             nxt = []
             if BE_ENABLED and pl < BE_TRIGGER_CASH:
                 need = round((BE_TRIGGER_CASH - pl) / max(1e-9, lot * GRID_CONTRACT), 2)

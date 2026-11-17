@@ -997,6 +997,7 @@ HELP_TEXT = (
     "• /asset btc — يبدّل الأداة للبيتكوين (أو gold / eth / silver)\n"
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
+    "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
     "• /perf 30 — الأداء الحقيقي من صفقاتك المغلقة عند الوسيط\n"
     "• /why — يمشي بكل بوابات المحرك ويقول أي وحدة واقفة\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
@@ -1365,6 +1366,8 @@ async def wake_up(message):
 CLOSED_WARN_SECS = int(os.environ.get("CLOSED_WARN_SECS", "21600"))
 BE_OFF_NOTE_SECS = int(os.environ.get("BE_OFF_NOTE_SECS", "900"))
 last_beoff_note = 0.0   # at most once every 6h
+UNMANAGED_NOTE_SECS = int(os.environ.get("UNMANAGED_NOTE_SECS", "1800"))
+last_unmanaged = {}     # position id -> when we last said it is not ours
 
 
 async def cost_governor():
@@ -2313,6 +2316,99 @@ async def handle_grid_command(text):
     await send_long(grid.status_text(balance, px, sp), markup=keyboard())
 
 
+async def handle_adopt_command(text):
+    """Take over, or hand back, a trade the bot did not open.
+
+    Protecting a trade means being allowed to close it, so this is never automatic:
+    the owner names the position and is told, in the confirmation, exactly what the
+    bot may now do to it.
+    """
+    drop = text.startswith("/unadopt")
+    if grid is None:
+        await send_long("وحدة الشبكة غير موجودة — `/update`.", markup=keyboard())
+        return
+    parts = text.split()
+    ids = [i for i in grid.adopted_ids()]
+    if len(parts) < 2:
+        have = ("\n".join(f"• `{i}`" for i in ids) if ids else "ماكو ولا وحدة")
+        await send_long(
+            f"*الصفقات اللي تبنّاها البوت*\n{have}\n\n"
+            f"`/adopt <رقم الصفقة>` — يخلي البوت يحمي صفقة ما فتحها\n"
+            f"`/unadopt <رقم الصفقة>` — يرجّعها إلك\n"
+            f"أرقام الصفقات من `/trades`.", markup=keyboard())
+        return
+    pid = parts[1].strip("`")
+    if drop:
+        ok = grid.unadopt(pid)
+        await send_long(
+            (f"🤝 رجّعت `{pid}` إلك — البوت ما يلمسها من الآن."
+             if ok else f"`{pid}` أصلاً مو متبنّاة."), markup=keyboard())
+        return
+    # Refuse an id the broker does not have open: adopting a number that is not
+    # there would sit in the state file looking like protection that exists.
+    live = []
+    if connection is not None:
+        try:
+            live = [str(p.get("id")) for p in
+                    (await asyncio.wait_for(connection.get_positions(), timeout=8.0) or [])]
+        except Exception as e:
+            await send_long(f"⚠️ ما كدرت أقرا الصفقات: `{str(e)[:200]}`", markup=keyboard())
+            return
+    if live and pid not in live:
+        await send_long(f"❌ ماكو صفقة مفتوحة رقمها `{pid}`. شوف `/trades`.",
+                        markup=keyboard())
+        return
+    ok = grid.adopt(pid)
+    trig = getattr(grid, "BE_TRIGGER_CASH", 0.0)
+    await send_long(
+        (f"✅ *تبنّيت الصفقة `{pid}`*\n"
+         f"• أحط عليها وقف متابعة من ربح `{trig:g}$`\n"
+         f"• وأغلقها لو ارتد الربح أو وصل الهدف — يعني صرت أكدر أسكّرها\n"
+         f"• `/unadopt {pid}` يرجّعها إلك"
+         if ok else f"`{pid}` متبنّاة من قبل."), markup=keyboard())
+
+
+async def warn_unmanaged(pos, magics, released, adopted=frozenset()):
+    """Say out loud when a profitable trade on our symbol is one we will never protect.
+
+    The protection filters on magic number: a position opened by hand in MT5, or by
+    another robot, is not the bot's and is left strictly alone. That is the right
+    rule. What was wrong was doing it in silence - the owner watched a trade run to
+    +2$ with no stop on it and had no way to tell "not mine" from "broken".
+    """
+    now = time.time()
+    for p in (pos or []):
+        if p.get("symbol") != SYMBOL:
+            continue
+        pid = p.get("id")
+        if pid not in released and (p.get("magic") in magics
+                                    or str(pid) in adopted):
+            continue                      # ours; the rest of the loop handles it
+        try:
+            pl = float(p.get("unrealizedProfit", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        trigger = float(getattr(grid, "BE_TRIGGER_CASH", 1.0) or 1.0)
+        if pl < trigger or p.get("stopLoss"):
+            continue                      # not yet worth protecting, or already stopped
+        if now - last_unmanaged.get(pid, 0.0) < UNMANAGED_NOTE_SECS:
+            continue
+        last_unmanaged[pid] = now
+        lot = float(p.get("volume", 0) or 0)
+        side = "شراء" if p.get("type") == "POSITION_TYPE_BUY" else "بيع"
+        why = ("سلّمتها إلي بـ/release" if pid in released
+               else f"مو من فتح البوت (magic `{p.get('magic')}`)")
+        await notify(
+            f"⚠️ *صفقة رابحة بدون أي حماية*\n"
+            f"• {side} `{lot:g}` على `{SYMBOL}` — ربح `{pl:+.2f}$` وماكو وقف\n"
+            f"• السبب: {why}\n"
+            f"• البوت ما يحط وقف على صفقة ما فتحها — هذا مقصود، مو عطل\n"
+            f"• تريدني أديرها؟ `/adopt {pid}`  ·  تفاصيل الكل: `/trades`")
+    for gone in [k for k in last_unmanaged
+                 if k not in {p.get("id") for p in (pos or [])}]:
+        last_unmanaged.pop(gone, None)
+
+
 async def protect_engine():
     """Watch the price of every bot trade and never let a profitable one turn red.
 
@@ -2359,11 +2455,21 @@ async def protect_engine():
                 await asyncio.sleep(2 if reads_are_free() else RPC_TICK_SECS)
                 continue
             released = set(grid.load().get("released", []))
+            adopted = grid.adopted_ids()
             magics = (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS
             pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
+            # Ours by magic, or handed to us by name with /adopt. Either way the
+            # release list wins: a trade given back is never taken back silently.
             mine = [p for p in pos
-                    if p.get("symbol") == SYMBOL and p.get("magic") in magics
-                    and p.get("id") not in released]
+                    if p.get("symbol") == SYMBOL and p.get("id") not in released
+                    and (p.get("magic") in magics or str(p.get("id")) in adopted)]
+            # Six rounds were spent asking why a winning trade carried no stop, each
+            # one guessed from a photo of the chart, because a position the bot does
+            # not own gets no stop, no trail and no exit AND SAYS NOTHING. The
+            # exclusion is correct - the bot must not touch a trade it did not open -
+            # but the silence made a deliberate rule indistinguishable from a broken
+            # guard. `pos` is already in hand, so this costs no extra read.
+            await warn_unmanaged(pos, magics, released, adopted)
             if mine:
                 # Hand the rule to MetaApi first. Once a position carries it, its
                 # protection no longer depends on this loop running at all.
@@ -2914,6 +3020,8 @@ async def process_update(update):
                                           "صفقات مفتوحة بلا حارس.", markup=keyboard())
             elif text.startswith("/live"):
                 await handle_go_live()
+            elif text.startswith("/adopt") or text.startswith("/unadopt"):
+                await handle_adopt_command(text)
             elif text.startswith("/why") or text.startswith("/ليش"):
                 if grid is None:
                     await send_long("وحدة الشبكة غير موجودة — `/update`.", markup=keyboard())
