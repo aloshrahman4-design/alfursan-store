@@ -1361,7 +1361,9 @@ async def wake_up(message):
         await notify(message)
 
 
-CLOSED_WARN_SECS = int(os.environ.get("CLOSED_WARN_SECS", "21600"))   # at most once every 6h
+CLOSED_WARN_SECS = int(os.environ.get("CLOSED_WARN_SECS", "21600"))
+BE_OFF_NOTE_SECS = int(os.environ.get("BE_OFF_NOTE_SECS", "900"))
+last_beoff_note = 0.0   # at most once every 6h
 
 
 async def cost_governor():
@@ -2321,6 +2323,25 @@ async def protect_engine():
     while True:
         try:
             if not (connection and getattr(grid, "BE_ENABLED", False)):
+                # The quietest gate left in the project. BE_ENABLED=0 switches off
+                # every stop, every trail and every exit this loop owns, for ever,
+                # and nothing anywhere says so - the owner watches winning trades sit
+                # unprotected and has no way to tell a disabled guard from a broken
+                # one. If he has trades open, he hears about it.
+                if connection and not getattr(grid, "BE_ENABLED", False):
+                    global last_beoff_note
+                    if time.time() - last_beoff_note > BE_OFF_NOTE_SECS:
+                        last_beoff_note = time.time()
+                        # Deliberately WITHOUT counting the open trades. Reading
+                        # positions here would be a second get_positions in this loop,
+                        # and one duplicate read per tick is exactly what burned the
+                        # six-hour quota once already. The warning does not need a
+                        # number to be true.
+                        await notify(
+                            "🚨 *الحماية مطفية بالكامل* (`BE_ENABLED=0`)\n"
+                            "• ماكو وقف ولا تريلينغ ولا تأمين على أي صفقة\n"
+                            "• `/setkey beon 1` يشغّلها\n"
+                            "• `/trades` يبيّن وضع كل صفقة بالضبط")
                 await asyncio.sleep(3)
                 continue
             wait = grid.cooling_down()

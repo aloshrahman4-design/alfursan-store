@@ -2059,6 +2059,10 @@ async def why_not(conn, symbol, is_active=None, price=0.0):
     if is_active is not None:
         row(bool(is_active), "النظام شغّال (`BOT_ACTIVE`)", "`/resume`")
     row(conn is not None, "أكو اتصال بالوسيط", "انتظر شوي أو `/check`")
+    # Not an arming gate, but the one most likely to be the real complaint: a grid
+    # that arms perfectly and protects nothing looks identical to a broken one.
+    row(BE_ENABLED, "الحماية مشغّلة (`BE_ENABLED`) — وقف وتريلينغ وتأمين",
+        "`/setkey beon 1`")
     row(True, f"الأداة `{GRID_SYMBOL}`")
 
     st = load()
