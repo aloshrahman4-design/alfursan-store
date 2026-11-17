@@ -2342,6 +2342,26 @@ async def history_report(conn, symbol, days=30, lot=None, contract=None):
     ])
 
 
+async def account_line(conn):
+    """Name the account being read, so a mismatch with the user's terminal shows up.
+
+    Every 'nothing there' answer in this project has at some point meant 'I was
+    looking somewhere else'. An account number costs one cached read and removes
+    the whole category of that mistake.
+    """
+    try:
+        acct = await asyncio.wait_for(conn.get_account_information(), timeout=6.0)
+    except Exception as e:
+        return f"⚠️ ما كدرت أقرا هوية الحساب: `{str(e)[:120]}`"
+    login = acct.get("login") or acct.get("id") or "؟"
+    srv = acct.get("server") or acct.get("broker") or "؟"
+    bal = acct.get("balance", 0) or 0
+    eq = acct.get("equity", bal) or bal
+    return (f"🏦 الحساب `{login}` · `{srv}` · رصيد `{float(bal):,.2f}$` "
+            f"· حقوق `{float(eq):,.2f}$`\n"
+            f"_قارنه برقم حسابك بالـMT5 — لازم يكون نفسه._")
+
+
 async def trades_report(conn, symbol, bid=0.0, ask=0.0):
     """Every open position: who owns it, what protects it, and what acts next.
 
@@ -2353,13 +2373,28 @@ async def trades_report(conn, symbol, bid=0.0, ask=0.0):
         pos = await asyncio.wait_for(conn.get_positions(), timeout=8.0)
     except Exception as e:
         return f"⚠️ ما كدرت أقرا الصفقات: `{str(e)[:200]}`"
-    pos = [p for p in (pos or []) if p.get("symbol") == symbol]
+    all_pos = list(pos or [])
+    # WHICH account is this? The report said "no open trades" without ever naming the
+    # account it had looked at, so "I am reading a different account from the one on
+    # your screen" and "you have no trades" printed the same sentence.
+    head = [f"📋 *صفقات `{symbol}`*", await account_line(conn)]
+    pos = [p for p in all_pos if p.get("symbol") == symbol]
     if not pos:
-        return f"ماكو صفقات مفتوحة على `{symbol}`."
+        # And say what the account DOES hold. A symbol spelled XAUUSD. or GOLD on this
+        # broker would be filtered out above and read, wrongly, as an empty account.
+        other = {}
+        for p in all_pos:
+            other[p.get("symbol")] = other.get(p.get("symbol"), 0) + 1
+        rest = ("\n".join(f"• `{k}` — `{v}` صفقة" for k, v in sorted(other.items()))
+                if other else "")
+        tail = (f"\n\n⚠️ *بس الحساب بيه صفقات على رموز ثانية:*\n{rest}\n"
+                f"إذا واحد منها هو نفس الذهب باسم ثاني، `/asset <الاسم>` يحوّل البوت له."
+                if other else "\n\nوالحساب فاضي تماماً — ماكو ولا صفقة على أي رمز.")
+        return "\n".join(head) + f"\n\nماكو صفقات مفتوحة على `{symbol}`." + tail
     st = load()
     rel = set(st.get("released", []))
     ado = {str(i) for i in st.get("adopted", [])}
-    out = [f"📋 *صفقات `{symbol}`* — النسخة تحت"]
+    out = list(head)
     for p in pos:
         pid, mg = p.get("id"), p.get("magic")
         lot = float(p.get("volume", 0) or 0)
