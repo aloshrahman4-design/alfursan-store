@@ -766,6 +766,75 @@ async def close_positions(conn, positions):
     return closed, round(booked, 2)
 
 
+# His own idea, from earlier: a trade that gets stranded is not cut at a loss and not
+# left to rot - it is PAID OFF out of what the grid has already banked. The fund is
+# simply `realized`, the grid's net booked profit, so nothing needs a second ledger:
+# closing the loser books it, which draws the fund down by exactly what it cost.
+RESCUE_ENABLED = os.environ.get("RESCUE_ENABLED", "0") not in ("0", "false", "no")
+RESCUE_STEPS = _f("RESCUE_STEPS", 3.0)      # how far price must have run against it
+RESCUE_RESERVE = _f("RESCUE_RESERVE", 0.0)  # profit kept back, never spent on rescues
+
+
+def rescue_fund(state=None):
+    """What the grid can afford to spend clearing a stranded trade."""
+    st = state if state is not None else load()
+    return round(float(st.get("realized", 0.0) or 0.0) - RESCUE_RESERVE, 2)
+
+
+def stranded(positions, bid, ask):
+    """Losing grid trades price has walked away from, worst loss first."""
+    if RESCUE_STEPS <= 0 or GRID_STEP <= 0:
+        return []
+    out = []
+    for p in positions:
+        try:
+            loss = float(p.get("unrealizedProfit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if loss >= 0:
+            continue
+        if adverse_distance(p, bid, ask) < RESCUE_STEPS * GRID_STEP:
+            continue                 # still near price; it may yet come back on its own
+        out.append((p, round(-loss, 2)))
+    return sorted(out, key=lambda x: -x[1])
+
+
+async def rescue_stranded(conn, positions, bid, ask, notify=None, allowed=True):
+    """Spend banked profit to close the biggest stranded loser it can fully cover.
+
+    One per call. Clearing the largest affordable loss removes the most drag, and
+    booking it draws the fund down by that exact amount, so the next call sees the
+    truth without anyone tracking a balance by hand.
+    """
+    if not (allowed and RESCUE_ENABLED) or not hasattr(conn, "close_position"):
+        return 0
+    st = load()
+    fund = rescue_fund(st)
+    if fund <= 0:
+        return 0
+    afford = [(p, cost) for p, cost in stranded(positions, bid, ask) if cost <= fund]
+    if not afford:
+        return 0
+    p, cost = afford[0]
+    try:
+        await asyncio.wait_for(conn.close_position(p["id"]), timeout=8.0)
+    except Exception as e:
+        log.warning(f"rescue close refused on {p.get('id')}: {e}")
+        return 0
+    st = load()
+    st["realized"] = round(float(st.get("realized", 0.0) or 0.0) - cost, 2)
+    st["rescued"] = int(st.get("rescued", 0)) + 1
+    save(st)
+    if notify:
+        await notify(
+            f"🧹 *صفّيت صفقة عالقة من أرباح الشبكة*\n"
+            f"• خسارتها `-{cost:g}$` دفعتها من المحصّل\n"
+            f"• المحصّل كان `{fund + RESCUE_RESERVE:g}$` وصار "
+            f"`{st['realized']:g}$`\n"
+            f"• صافي الأثر عليك: صفر — بس انفك مستوى ورجع هامشك")
+    return 1
+
+
 def release(positions):
     """Hand these trades to the user: the bot stops counting, managing and closing them."""
     if not positions:
@@ -1065,6 +1134,9 @@ def plan_text(balance=0.0, price=0.0):
          f"(وما ينزل تحت `{BE_LOCK_CASH:g}$` المضمونة)"
          if TRADE_GIVEBACK_PCT > 0 else
          "• ماكو إغلاق على ارتداد — التريلينغ بس"),
+        (f"• 🧹 التصفية الممولة: صفقة ابتعد عنها السعر `{RESCUE_STEPS:g}` خطوات "
+         f"تنغلق من المحصّل لما يكفي (المحجوز `{RESCUE_RESERVE:g}$`)"
+         if RESCUE_ENABLED else "• ماكو تصفية ممولة للصفقات العالقة"),
         f"• 🚧 سقف الصفقات المفتوحة: `{GRID_MAX_POSITIONS}` · يوقف التوسّع عند "
         f"`{GRID_ADD_STOP_PCT:g}%` من حد الخسارة",
         (f"• 🧩 يسدّ الفجوات: أمر جديد إذا ابتعد أقرب مستوى أكثر من `{GRID_GAP_FACTOR:g}` خطوة"
