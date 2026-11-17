@@ -2106,6 +2106,71 @@ async def why_not(conn, symbol, is_active=None, price=0.0):
     return head + "\n\n" + "\n".join(L) + tail
 
 
+async def trades_report(conn, symbol, bid=0.0, ask=0.0):
+    """Every open position: who owns it, what protects it, and what acts next.
+
+    Written because a winning trade sat on the chart with no stop on it and neither of
+    us could say why from a screenshot. Guessing cost hours; this answers in one line
+    per trade, from the broker's own data.
+    """
+    try:
+        pos = await asyncio.wait_for(conn.get_positions(), timeout=8.0)
+    except Exception as e:
+        return f"⚠️ ما كدرت أقرا الصفقات: `{str(e)[:200]}`"
+    pos = [p for p in (pos or []) if p.get("symbol") == symbol]
+    if not pos:
+        return f"ماكو صفقات مفتوحة على `{symbol}`."
+    rel = set(load().get("released", []))
+    out = [f"📋 *صفقات `{symbol}`* — النسخة تحت"]
+    for p in pos:
+        pid, mg = p.get("id"), p.get("magic")
+        lot = float(p.get("volume", 0) or 0)
+        entry = float(p.get("openPrice", 0) or 0)
+        try:
+            pl = float(p.get("unrealizedProfit", 0) or 0)
+        except (TypeError, ValueError):
+            pl = 0.0
+        is_buy = p.get("type") == "POSITION_TYPE_BUY"
+        side = "شراء" if is_buy else "بيع"
+        if pid in rel:
+            who = "🤝 مسلّمة إلك — البوت ما يلمسها"
+        elif mg in MAGICS:
+            who = "🕸 شبكة — البوت يديرها"
+        elif mg in (777111, 777222):
+            who = "⚓ ارتكاز — البوت يديرها"
+        else:
+            who = f"👤 مو من البوت (magic `{mg}`) — ما يلمسها"
+        sl = p.get("stopLoss")
+        tp = p.get("takeProfit")
+        trail = "✅" if has_server_trail(p) else "❌"
+        cur = (f"✅" if trail == "✅" and trail_is_current(p, server_trail()) else
+               ("قديم ⚠️" if trail == "✅" else "❌"))
+        lines = [f"\n*{side} `{lot:g}` @ `{entry}`* · `{pl:+.2f}$`",
+                 f"  {who}",
+                 f"  وقف: `{sl if sl else 'ماكو'}` · هدف: `{tp if tp else 'ماكو'}` "
+                 f"· تريلينغ الوسيط: {cur}"]
+        if mg in MAGICS and not (pid in rel):
+            nxt = []
+            if BE_ENABLED and pl < BE_TRIGGER_CASH:
+                need = round((BE_TRIGGER_CASH - pl) / max(1e-9, lot * GRID_CONTRACT), 2)
+                nxt.append(f"التأمين بعد `{need}$` حركة")
+            elif BE_ENABLED:
+                nxt.append(f"مؤمّنة — الوقف ما ينزل تحت `{BE_LOCK_CASH:g}$`")
+            if TRADE_GIVEBACK_PCT > 0:
+                pk = max(_be_peaks.get(pid, 0.0), pl)
+                fl = giveback_floor(pk)
+                if fl is not None and pk >= BE_LOCK_CASH:
+                    nxt.append(f"ارتداد يغلقها عند `{fl:g}$` (القمة `{pk:g}$`)")
+            if GRID_TP_PER_TRADE > 0:
+                nxt.append(f"هدف `{GRID_TP_PER_TRADE:g}$`")
+            if nxt:
+                lines.append("  الجاي: " + " · ".join(nxt))
+        out.append("\n".join(lines))
+    out.append(f"\n⚙️ لوت `{GRID_BASE_LOT:g}` · عقد `{GRID_CONTRACT:g}` · "
+               f"كل `1$` ربح = حركة `{cash_in_price(1.0):g}$`")
+    return "\n".join(out)
+
+
 async def spec_report(conn, symbol, price=0.0):
     """Ask the broker its own rules for this symbol and check our settings against them.
 

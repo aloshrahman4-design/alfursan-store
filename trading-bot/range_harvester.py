@@ -996,6 +996,7 @@ HELP_TEXT = (
     "• /gold — يسأل وسيطك شنو اسم أداة الذهب ويضبطها\n"
     "• /asset btc — يبدّل الأداة للبيتكوين (أو gold / eth / silver)\n"
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
+    "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /why — يمشي بكل بوابات المحرك ويقول أي وحدة واقفة\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
@@ -2901,6 +2902,19 @@ async def process_update(update):
                     await send_long(
                         await grid.why_not(connection, SYMBOL, bot_active, px),
                         markup=keyboard())
+            elif text.startswith("/trades") or text.startswith("/صفقات"):
+                if connection is None or grid is None:
+                    await send_long("ماكو اتصال — جرّب بعد شوي.", markup=keyboard())
+                else:
+                    b = a = 0.0
+                    try:
+                        q = await market_price(SYMBOL)
+                        b, a = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0)
+                    except Exception:
+                        pass
+                    await send_long(
+                        await grid.trades_report(connection, SYMBOL, b, a)
+                        + "\n" + whoami_line(), markup=keyboard())
             elif text.startswith("/spec") or text.startswith("/rules"):
                 if connection is None or grid is None:
                     await send_long("ماكو اتصال — جرّب بعد شوي.", markup=keyboard())
@@ -3123,6 +3137,7 @@ async def main():
             BotCommand("gold", "ضبط اسم أداة الذهب عند وسيطك تلقائياً"),
             BotCommand("asset", "ضبط الأداة: /asset btc أو /asset gold"),
             BotCommand("spec", "قواعد الوسيط للأداة ومقارنتها بإعداداتك"),
+            BotCommand("trades", "كل صفقة مفتوحة: مين يديرها وشنو يحميها"),
             BotCommand("why", "ليش الشبكة ما تنصب — يمشي بكل البوابات"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),
