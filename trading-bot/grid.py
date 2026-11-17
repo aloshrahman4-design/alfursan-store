@@ -17,6 +17,7 @@ refuses to re-arm. The second one is the account saver and it does not restart b
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
@@ -670,6 +671,9 @@ def loss_limit(balance=0.0):
 def _blank():
     return {"armed": False, "center": None, "armed_at": 0, "cycles": 0,
             "realized": 0.0, "halted": False, "halt_reason": "", "released": [],
+            # The account's high-water mark. Deliberately NOT cleared by reset(): a
+            # drawdown that survives a re-centre is the whole point of measuring it.
+            "equity_hwm": 0.0,
             "loss_streak": 0, "pending_ids": []}
 
 
@@ -710,6 +714,9 @@ def reset():
     # The losing run survives a re-centre on purpose: recovery sizing is about the run of
     # cycles, and zeroing it here would make every re-arm look like a fresh start.
     fresh["loss_streak"] = old.get("loss_streak", 0)
+    # The high-water mark survives too. A drawdown the user can erase by re-arming is
+    # not a drawdown; it is a number that flatters whoever is looking at it.
+    fresh["equity_hwm"] = old.get("equity_hwm", 0.0)
     save(fresh)
     trend_reset()
 
@@ -1033,6 +1040,47 @@ def cash_in_price(cash, lot=None):
     return round(float(cash) / per, 2) if per > 0 and cash else 0.0
 
 
+def money(x):
+    """A price distance a human can read on ANY instrument.
+
+    "{:,.0f}" was chosen while the bot traded bitcoin, where a distance is hundreds of
+    dollars. The same format turned gold's half-dollar into "0$" - a true number
+    rendered as a false one, on the very line meant to explain the conversion. The
+    precision follows the size instead.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "?"
+    a = abs(v)
+    if a >= 100:
+        return f"{v:,.0f}"
+    if a >= 1:
+        return f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"{v:,.3f}".rstrip("0").rstrip(".") if a else "0"
+
+
+def cycle_cost(spread, lot=None):
+    """What one round trip costs before any rule earns a cent.
+
+    The number an outside review called the most important one missing from this
+    project, and it was right: a target smaller than a few multiples of this is a
+    losing trade dressed as a winning rule, however well the rest behaves.
+    """
+    per = float(lot if lot is not None else GRID_BASE_LOT) * GRID_CONTRACT
+    return round(abs(float(spread or 0.0)) * per, 2)
+
+
+def cost_verdict(spread, exit_cash, lot=None):
+    """(cost, share of the exit it eats, a word). None when there is nothing to judge."""
+    cost = cycle_cost(spread, lot)
+    if cost <= 0 or not exit_cash or exit_cash <= 0:
+        return None
+    share = round(cost / float(exit_cash) * 100, 0)
+    return cost, share, ("\u26d4\ufe0f \u062e\u0637\u0631" if share > 33 else
+                         "\u26a0\ufe0f \u062d\u062f\u0651\u064a" if share > 20 else "\u2705")
+
+
 def protection_audit(price=0.0, lot=None):
     """Every cash-denominated protection setting, in price terms, with a verdict.
 
@@ -1061,13 +1109,13 @@ def protection_audit(price=0.0, lot=None):
         rows.append((name, key, cash, px, "⚠️ واسع" if wide else "✅"))
         if wide:
             good = round(ladder_depth * 0.5 * lot * GRID_CONTRACT, 2)
-            warn.append(f"• `{name}` = حركة `{px:,.0f}$`، وكل سلّم الشبكة "
-                        f"`{ladder_depth:,.0f}$` — ما يلحق يتحرك داخل مدى الشبكة. "
+            warn.append(f"• `{name}` = حركة `{money(px)}$`، وكل سلّم الشبكة "
+                        f"`{money(ladder_depth)}$` — ما يلحق يتحرك داخل مدى الشبكة. "
                         f"جرّب `/setkey {key} {good:g}`")
     return rows, warn
 
 
-def plan_text(balance=0.0, price=0.0):
+def plan_text(balance=0.0, price=0.0, spread=0.0):
     """Everything the user needs to judge the configuration before arming it."""
     lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
     total = round(sum(lots), 2)
@@ -1125,8 +1173,12 @@ def plan_text(balance=0.0, price=0.0):
          f"• 📈 بعدها يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة، "
          f"وأول ما تعدّي `{BE_FLOOR_CASH:g}$` ما ينزل الوقف تحتها"
          if BE_ENABLED else "• ⚠️ ماكو تأمين على نقطة الدخول"),
-        *( [f"• ⚖️ كل `1$` ربح = حركة `{cash_in_price(1.0):,.0f}$` بهذا اللوت"]
-           + [f"• {n}: `{c:g}$` = حركة `{px:,.0f}$`  {v}"
+        *([f"• 💸 كلفة الدورة `{_cv[0]:g}$` (سبريد `{spread:g}$`) — "
+           f"تاكل `{_cv[1]:.0f}%` من خروج نموذجي عند قمة `2$`  {_cv[2]}"]
+          if (_cv := cost_verdict(spread, giveback_floor(2.0) or GRID_TP_PER_TRADE
+                                  or GRID_TP_CASH)) else []),
+        *( [f"• ⚖️ كل `1$` ربح = حركة `{money(cash_in_price(1.0))}$` بهذا اللوت"]
+           + [f"• {n}: `{c:g}$` = حركة `{money(px)}$`  {v}"
               for n, _k, c, px, v in protection_audit(price)[0]]
            if price else []),
         *(protection_audit(price)[1] if price else []),
@@ -1278,6 +1330,7 @@ async def cached_account(conn):
     bal = float(acct.get("balance", 0) or 0)
     eq = float(acct.get("equity", bal) or bal)
     _balance_cache.update({"at": now, "value": bal, "equity": eq})
+    note_equity(eq)                # the one place a fresh equity is actually observed
     return bal, eq
 
 
@@ -1320,16 +1373,56 @@ def hedge_side(net):
     return None
 
 
-def drawdown_brake(balance, equity):
-    """How far under water the WHOLE account is, and whether that forbids expansion.
+def equity_peak():
+    """The highest equity this account has reached, remembered across restarts."""
+    return float(load().get("equity_hwm", 0.0) or 0.0)
 
-    Measured on balance minus equity, so it counts every open trade - grid, anchor and
-    anything handed over - because margin does not care which engine opened what.
+
+def note_equity(equity):
+    """Record a newly OBSERVED equity. Called where the account is actually read.
+
+    Kept separate from drawdown_brake on purpose. Folding it in made a function that
+    reads like arithmetic write to disk, so merely asking "are we braked?" moved the
+    high-water mark - and two tests that call it with made-up numbers silently taught
+    the file a peak that never happened. A query that mutates is a trap for whoever
+    reads it next.
+    """
+    try:
+        eq = float(equity)
+    except (TypeError, ValueError):
+        return equity_peak()
+    st = load()
+    hwm = float(st.get("equity_hwm", 0.0) or 0.0)
+    if eq > hwm:
+        hwm = round(eq, 2)
+        st["equity_hwm"] = hwm
+        save(st)
+    return hwm
+
+
+def drawdown_brake(balance, equity):
+    """How far under its own high-water mark the account is, and whether that forbids
+    expansion.
+
+    This used to measure balance minus equity, which only sees FLOATING loss. Closing a
+    loser turns that loss into balance and the measure reads zero - so the moment the
+    account is hurt most, the brake reports it healthy. The owner's own account proved
+    it: he closed roughly $1,886 of losing gold, the balance fell to $1,885, and the
+    drawdown read 0 on an account that had lost half of itself. Same family as "cannot
+    see" read as "nothing there", and five passes of review did not catch it.
+
+    Measured against the highest equity the account has reached, a realised loss stays
+    counted - which is what a drawdown means everywhere else in this trade.
     """
     if GRID_EQUITY_BRAKE_PCT <= 0 or balance <= 0:
         return 0.0, 0.0, False
-    down = round(max(0.0, balance - equity), 2)
-    limit = round(balance * GRID_EQUITY_BRAKE_PCT / 100.0, 2)
+    eq = float(equity)
+    hwm = max(equity_peak(), eq)   # read only; note_equity() is what records it
+    # Floating-only, the old measure: still the right answer early on, before the
+    # account has ever been in profit, when the peak IS roughly the starting balance.
+    floating = max(0.0, float(balance) - eq)
+    down = round(max(floating, hwm - eq), 2)
+    limit = round(max(hwm, float(balance)) * GRID_EQUITY_BRAKE_PCT / 100.0, 2)
     return down, limit, down >= limit
 
 
@@ -1722,7 +1815,7 @@ async def grid_engine(get_conn, symbol, notify, is_active):
             await asyncio.sleep(5)
 
 
-def status_text(balance=0.0, price=0.0):
+def status_text(balance=0.0, price=0.0, spread=0.0):
     state = load()
     lots = ladder(base=recovery_base(state.get("loss_streak", 0)))
     head = "🕸 *شبكة المضاعفة المكبوحة*"
@@ -1734,7 +1827,7 @@ def status_text(balance=0.0, price=0.0):
         head += f" — ✅ منصوبة حول `{state.get('center')}`"
     else:
         head += " — ⏳ تنتظر النصب"
-    body = [head, "", plan_text(balance, price), "",
+    body = [head, "", plan_text(balance, price, spread), "",
             f"• دورات مكتملة: `{state.get('cycles', 0)}` · محصّلة: `{state.get('realized', 0.0):g}$`"]
     freed = len(state.get("released", []))
     if freed:
@@ -2108,6 +2201,93 @@ async def why_not(conn, symbol, is_active=None, price=0.0):
     tail = (f"\n\n🚧 *أول مانع:* {blocker}" if blocker else
             "\n\nكل البوابات مفتوحة. إذا لسه ماكو أوامر، `/grid rearm` وابعثلي الرد.")
     return head + "\n\n" + "\n".join(L) + tail
+
+
+async def history_report(conn, symbol, days=30, lot=None, contract=None):
+    """What the account ACTUALLY did, from the broker's own closed deals.
+
+    Every test in this project checks that the code does what it was told. Not one
+    of them says whether being told that makes money. A backtest would answer it with
+    assumed fills and an assumed spread; the account's own history answers it with the
+    fills that really happened, at this broker, on these settings. It is both faster
+    to build and more truthful, so it comes first.
+    """
+    if not hasattr(conn, "get_deals_by_time_range"):
+        return ("هذا الوضع ما يعطي تاريخ الصفقات (الاتصال مو RPC).\n"
+                "جرّب بعد شوي أو `/check`.")
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max(1, int(days)))
+    deals = []
+    try:
+        off = 0
+        while True:
+            page = await asyncio.wait_for(
+                conn.get_deals_by_time_range(start, end, off, 1000), timeout=30.0)
+            got = (page or {}).get("deals", page if isinstance(page, list) else [])
+            deals.extend(got or [])
+            if len(got or []) < 1000:
+                break
+            off += 1000
+            if off >= 10000:
+                break
+    except Exception as e:
+        return f"⚠️ ما كدرت أقرا التاريخ: `{str(e)[:220]}`"
+
+    # Only what CLOSED a position, on this instrument. An entry deal carries no result.
+    closed = [d for d in deals
+              if (d.get("entryType") or "").upper().endswith("OUT")
+              and (not symbol or d.get("symbol") == symbol)]
+    if not closed:
+        return (f"ماكو صفقات مغلقة على `{symbol}` بآخر `{days}` يوم.\n"
+                f"(قرأت `{len(deals)}` حركة بالتاريخ)")
+
+    def net(d):
+        return (float(d.get("profit", 0) or 0) + float(d.get("commission", 0) or 0)
+                + float(d.get("swap", 0) or 0))
+
+    res = sorted((net(d) for d in closed))
+    wins = [x for x in res if x > 0]
+    losses = [x for x in res if x < 0]
+    total = round(sum(res), 2)
+    gross_w, gross_l = round(sum(wins), 2), round(-sum(losses), 2)
+    pf = round(gross_w / gross_l, 2) if gross_l else None
+    aw = round(gross_w / len(wins), 2) if wins else 0.0
+    al = round(gross_l / len(losses), 2) if losses else 0.0
+    rate = round(len(wins) / len(res) * 100, 1)
+    need = round(al / (aw + al) * 100, 1) if (aw + al) else 0.0
+    # Worst run of the equity curve built from these results, in order of closing.
+    seq = [net(d) for d in sorted(closed, key=lambda d: str(d.get("brokerTime") or ""))]
+    peak = run = worst = 0.0
+    for x in seq:
+        run += x
+        peak = max(peak, run)
+        worst = min(worst, run - peak)
+
+    lot = float(lot or GRID_BASE_LOT)
+    contract = float(contract or GRID_CONTRACT)
+    fees = round(sum(abs(float(d.get("commission", 0) or 0))
+                     + abs(float(d.get("swap", 0) or 0)) for d in closed), 2)
+
+    verdict = ("🟢 موجب" if total > 0 and (pf or 0) > 1.2 else
+               "🟡 حدّي" if total > 0 or (pf or 0) > 0.95 else "🔴 سالب")
+    return "\n".join([
+        f"📊 *أداء `{symbol}` الحقيقي — آخر `{days}` يوم*",
+        f"*الحكم: {verdict}*",
+        "",
+        f"• صفقات مغلقة: `{len(res)}` · رابحة `{len(wins)}` · خاسرة `{len(losses)}`",
+        f"• نسبة النجاح: `{rate}%` · *المطلوبة للتعادل: `{need}%`*",
+        f"• متوسط الربح `{aw}$` · متوسط الخسارة `{al}$`",
+        f"• إجمالي ربح `{gross_w}$` · إجمالي خسارة `{gross_l}$`",
+        f"• عامل الربح: `{pf if pf is not None else '∞'}`"
+        + ("  ← تحت 1 يعني خسارة" if pf is not None and pf < 1 else ""),
+        f"• *الصافي: `{total:+g}$`*",
+        f"• أسوأ ارتداد متتالي: `{worst:+.2f}$`",
+        f"• عمولات وسواب: `{fees}$`",
+        "",
+        (f"⚠️ نسبة نجاحك `{rate}%` والمطلوب `{need}%` — "
+         f"الفرق `{round(need - rate, 1)}` نقطة" if rate < need else
+         f"✅ نسبة نجاحك فوق المطلوب بـ`{round(rate - need, 1)}` نقطة"),
+    ])
 
 
 async def trades_report(conn, symbol, bid=0.0, ask=0.0):

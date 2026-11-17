@@ -997,6 +997,7 @@ HELP_TEXT = (
     "• /asset btc — يبدّل الأداة للبيتكوين (أو gold / eth / silver)\n"
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
+    "• /perf 30 — الأداء الحقيقي من صفقاتك المغلقة عند الوسيط\n"
     "• /why — يمشي بكل بوابات المحرك ويقول أي وحدة واقفة\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
     "• `/pause` — تجميد: يلغي الأوامر المعلّقة ويطفي النظام، "
@@ -2301,12 +2302,15 @@ async def handle_grid_command(text):
             balance = float(acct.get("balance", 0) or 0)
         except Exception:
             pass
+    sp = 0.0
     try:   # free when reads are free, and the panel is useless without it on crypto
         q = await market_price(SYMBOL)
-        px = (float(q.get("bid", 0) or 0) + float(q.get("ask", 0) or 0)) / 2.0
+        _b, _a = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0)
+        px = (_b + _a) / 2.0
+        sp = max(0.0, _a - _b)
     except Exception:
         pass
-    await send_long(grid.status_text(balance, px), markup=keyboard())
+    await send_long(grid.status_text(balance, px, sp), markup=keyboard())
 
 
 async def protect_engine():
@@ -2923,6 +2927,16 @@ async def process_update(update):
                     await send_long(
                         await grid.why_not(connection, SYMBOL, bot_active, px),
                         markup=keyboard())
+            elif text.startswith("/perf") or text.startswith("/أداء"):
+                if connection is None or grid is None:
+                    await send_long("ماكو اتصال — جرّب بعد شوي.", markup=keyboard())
+                else:
+                    _p = text.split()
+                    _d = int(_p[1]) if len(_p) > 1 and _p[1].isdigit() else 30
+                    await send_long(f"⏳ أقرا تاريخ آخر `{_d}` يوم من الوسيط...")
+                    await send_long(
+                        await grid.history_report(connection, SYMBOL, _d) + "\n"
+                        + whoami_line(), markup=keyboard())
             elif text.startswith("/trades") or text.startswith("/صفقات"):
                 if connection is None or grid is None:
                     await send_long("ماكو اتصال — جرّب بعد شوي.", markup=keyboard())
@@ -3159,6 +3173,7 @@ async def main():
             BotCommand("asset", "ضبط الأداة: /asset btc أو /asset gold"),
             BotCommand("spec", "قواعد الوسيط للأداة ومقارنتها بإعداداتك"),
             BotCommand("trades", "كل صفقة مفتوحة: مين يديرها وشنو يحميها"),
+            BotCommand("perf", "الأداء الحقيقي من تاريخ حسابك: /perf 30"),
             BotCommand("why", "ليش الشبكة ما تنصب — يمشي بكل البوابات"),
             BotCommand("hook", "ربط TradingView: الرابط والحالة"),
             BotCommand("grid", "شبكة المضاعفة المكبوحة: الحالة والإعداد"),

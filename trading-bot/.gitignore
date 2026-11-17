@@ -4,6 +4,10 @@ __pycache__/
 intel_state.json
 saver_state.json
 datafeed_state.json
+# The grid's own state. Untracked like the others - a test that forgets to
+# redirect STATE_PATH writes here, and a stray equity_hwm in the repo would
+# travel to every machine as a drawdown nobody ever had.
+grid_state.json
 .env.bak
 .update/
 chat_id.txt
