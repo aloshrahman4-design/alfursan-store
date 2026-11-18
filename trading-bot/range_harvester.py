@@ -1539,8 +1539,15 @@ def whoami_line():
     shut = market_closed()
     mkt = ("🟢 مفتوح 24/7" if always_open()
            else "🔴 مغلق (عطلة نهاية الأسبوع)" if shut else "🟢 مفتوح")
+    # If the safety module had to be stubbed, that belongs on the line the owner
+    # reads most, not in a log file he cannot open. A bot running the stand-in
+    # looks completely normal otherwise, and "looks normal while degraded" is the
+    # exact failure this project keeps paying for.
+    warn = ("\n🚨 *وحدة الأمان ناقصة — أشتغل بنسخة طوارئ*: الحراسة على الصفقات "
+            "المفتوحة شغالة، والفتح مقفول. `/update` يصلحها."
+            if ENTRY_SAFETY_STATE == "stub" else "")
     return (f"🎯 *الأداة: `{SYMBOL}`* · اللوت = `{unit}` · السوق {mkt}\n"
-            f"🔖 النسخة `{code_version()}`")
+            f"🔖 النسخة `{code_version()}`{warn}")
 
 
 async def our_positions_open():
