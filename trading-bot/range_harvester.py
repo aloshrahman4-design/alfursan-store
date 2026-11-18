@@ -1368,6 +1368,8 @@ BE_OFF_NOTE_SECS = int(os.environ.get("BE_OFF_NOTE_SECS", "900"))
 last_beoff_note = 0.0   # at most once every 6h
 UNMANAGED_NOTE_SECS = int(os.environ.get("UNMANAGED_NOTE_SECS", "1800"))
 last_unmanaged = {}     # position id -> when we last said it is not ours
+FOREIGN_NOTE_SECS = int(os.environ.get("FOREIGN_NOTE_SECS", "21600"))
+last_foreign_note = 0.0  # a position on another instrument: mention, do not nag
 
 
 async def cost_governor():
@@ -2407,6 +2409,34 @@ async def warn_unmanaged(pos, magics, released, adopted=frozenset()):
     for gone in [k for k in last_unmanaged
                  if k not in {p.get("id") for p in (pos or [])}]:
         last_unmanaged.pop(gone, None)
+    await warn_foreign(pos)
+
+
+async def warn_foreign(pos):
+    """Name open positions on instruments the bot is not trading.
+
+    Switching the bot from bitcoin back to gold left a BTCUSD position open. The
+    filter is by symbol, so from that moment nothing watched it, nothing stopped
+    it and nothing mentioned it - it appeared only inside the equity-brake
+    warning, which fires once the damage is done. Said every six hours, because
+    it is the owner's trade to close, not the bot's.
+    """
+    global last_foreign_note
+    foreign = [p for p in (pos or []) if p.get("symbol") != SYMBOL]
+    if not foreign or time.time() - last_foreign_note < FOREIGN_NOTE_SECS:
+        return
+    last_foreign_note = time.time()
+    tot = round(sum(float(p.get("unrealizedProfit", 0) or 0) for p in foreign), 2)
+    lines = "\n".join(
+        f"• `{p.get('symbol')}` "
+        f"{'شراء' if p.get('type') == 'POSITION_TYPE_BUY' else 'بيع'} "
+        f"`{float(p.get('volume', 0) or 0):g}` · "
+        f"`{float(p.get('unrealizedProfit', 0) or 0):+.2f}$`"
+        for p in sorted(foreign, key=lambda q: float(q.get("unrealizedProfit", 0) or 0)))
+    await notify(
+        f"🧭 *عندك صفقات على أدوات غير `{SYMBOL}`* — `{tot:+.2f}$`\n{lines}\n"
+        f"• البوت يشتغل على رمز واحد، فهاي *ما ينطيها وقف ولا يغلقها*\n"
+        f"• غالباً بقايا تبديل أداة — سكّرها بإيدك أو `/asset` يرجّع البوت لها")
 
 
 async def protect_engine():

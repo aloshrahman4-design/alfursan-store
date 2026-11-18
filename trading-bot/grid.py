@@ -677,6 +677,9 @@ def _blank():
             # Positions the owner handed TO the bot. The mirror image of "released":
             # trades it did not open, that he has asked it to protect anyway.
             "adopted": [],
+            # Best profit each open position has shown. Persisted because three
+            # protections measure from it and a restart used to zero all three.
+            "peaks": {},
             "loss_streak": 0, "pending_ids": []}
 
 
@@ -732,6 +735,7 @@ def load():
             state.update(json.load(f))
             state.setdefault("released", [])
             state.setdefault("adopted", [])
+            state.setdefault("peaks", {})
             state.setdefault("loss_streak", 0)
             state.setdefault("pending_ids", [])
             return state
@@ -769,6 +773,8 @@ def reset():
     # Adoptions survive for the same reason releases do: the owner asked for that
     # trade to be guarded, and a re-centre is not him changing his mind.
     fresh["adopted"] = old.get("adopted", [])
+    # Peaks belong to positions that are still open; a re-centre does not close them.
+    fresh["peaks"] = old.get("peaks", {})
     save(fresh)
     trend_reset()
 
@@ -2433,7 +2439,7 @@ async def trades_report(conn, symbol, bid=0.0, ask=0.0):
             elif BE_ENABLED:
                 nxt.append(f"مؤمّنة — الوقف ما ينزل تحت `{BE_LOCK_CASH:g}$`")
             if TRADE_GIVEBACK_PCT > 0:
-                pk = max(_be_peaks.get(pid, 0.0), pl)
+                pk = max(peak_of(pid), pl)
                 fl = giveback_floor(pk)
                 if fl is not None and pk >= BE_LOCK_CASH:
                     nxt.append(f"ارتداد يغلقها عند `{fl:g}$` (القمة `{pk:g}$`)")
@@ -2442,6 +2448,20 @@ async def trades_report(conn, symbol, bid=0.0, ask=0.0):
             if nxt:
                 lines.append("  الجاي: " + " · ".join(nxt))
         out.append("\n".join(lines))
+    # Positions on OTHER instruments. The bot filters by symbol, so a trade left
+    # behind by an instrument switch - a BTCUSD position still open after the bot
+    # went back to gold - is managed by nobody and mentioned nowhere. It only ever
+    # surfaced inside the equity-brake message, which fires when it is already bad.
+    foreign = [p for p in all_pos if p.get("symbol") != symbol]
+    if foreign:
+        tot = round(sum(float(p.get("unrealizedProfit", 0) or 0) for p in foreign), 2)
+        out.append(f"\n\n🧭 *وأدوات ثانية بالحساب* — `{tot:+.2f}$`")
+        for p in sorted(foreign, key=lambda q: float(q.get("unrealizedProfit", 0) or 0)):
+            sd = "شراء" if p.get("type") == "POSITION_TYPE_BUY" else "بيع"
+            out.append(f"• `{p.get('symbol')}` {sd} `{float(p.get('volume', 0) or 0):g}` "
+                       f"· `{float(p.get('unrealizedProfit', 0) or 0):+.2f}$` — "
+                       f"خارج إدارة البوت تماماً")
+        out.append("_البوت يشتغل على رمز واحد؛ هاي ما ينطيها وقف ولا يغلقها._")
     out.append(f"\n⚙️ لوت `{GRID_BASE_LOT:g}` · عقد `{GRID_CONTRACT:g}` · "
                f"كل `1$` ربح = حركة `{cash_in_price(1.0):g}$`")
     return "\n".join(out)
@@ -2770,9 +2790,7 @@ async def take_giveback(conn, positions, notify=None, allowed=True):
             profit = float(p.get("unrealizedProfit", 0.0) or 0.0)
         except (TypeError, ValueError):
             continue
-        peak = max(_be_peaks.get(pid, 0.0), profit)
-        if profit > 0 or peak > 0:
-            _be_peaks[pid] = peak
+        peak = note_peak(pid, profit)
         if peak < BE_LOCK_CASH or BE_LOCK_CASH <= 0:
             continue                      # not yet worth protecting
         floor = giveback_floor(peak)
@@ -2781,7 +2799,7 @@ async def take_giveback(conn, positions, notify=None, allowed=True):
         try:
             await asyncio.wait_for(conn.close_position(pid), timeout=8.0)
             taken.append((pid, peak, profit))
-            _be_peaks.pop(pid, None)
+            forget_peak(pid)
         except Exception as e:
             log.warning(f"give-back close refused on {pid}: {e}")
     if taken and notify:
@@ -2793,8 +2811,89 @@ async def take_giveback(conn, positions, notify=None, allowed=True):
     return len(taken)
 
 
-_be_peaks = {}        # best profit each secured position has shown; dies with the position
+_be_peaks = {}        # best profit each secured position has shown, by str(id)
 _be_waiting = {}      # id -> True once the user has been told this one cannot be stopped yet
+_peaks_loaded = False
+_peaks_dirty = False
+_peaks_saved_at = 0.0
+PEAKS_SAVE_SECS = 20.0
+
+
+def _load_peaks():
+    """Bring the remembered peaks back after a restart.
+
+    Three separate protections are measured from the best a trade has shown:
+    the give-back exit, the break-even lock, and the soft exit. All three lived in
+    a dict that died with the process - so every `/update`, every crash and every
+    reconnect silently reset them. A trade that had run to +5$ came back with a
+    peak of whatever it happened to be worth at that second, and soft_protect,
+    which skips anything whose peak never reached the trigger, stopped guarding it
+    altogether. The owner was told to run /update several times a day.
+    """
+    global _peaks_loaded
+    if _peaks_loaded:
+        return
+    _peaks_loaded = True
+    try:
+        for k, v in (load().get("peaks") or {}).items():
+            _be_peaks[str(k)] = float(v)
+    except Exception as e:
+        log.warning(f"could not restore peaks: {e}")
+
+
+def note_peak(pid, profit):
+    """Record and return the best this position has ever shown."""
+    global _peaks_dirty
+    _load_peaks()
+    key = str(pid)
+    try:
+        profit = float(profit)
+    except (TypeError, ValueError):
+        profit = 0.0
+    peak = max(_be_peaks.get(key, 0.0), profit)
+    # A trade that has never been in profit gets no entry: storing a peak of zero for
+    # every loser would grow the file and mark it dirty on every single tick.
+    if peak > 0 and peak > _be_peaks.get(key, 0.0):
+        _be_peaks[key] = peak
+        _peaks_dirty = True
+    return peak
+
+
+def peak_of(pid):
+    _load_peaks()
+    return _be_peaks.get(str(pid), 0.0)
+
+
+def forget_peak(pid):
+    global _peaks_dirty
+    _load_peaks()
+    if _be_peaks.pop(str(pid), None) is not None:
+        _peaks_dirty = True
+
+
+def prune_peaks(live_ids):
+    """Drop peaks whose position is gone, and write the rest to disk.
+
+    Debounced: the peaks move on most ticks and the state file is small but not
+    free. A peak that is at most PEAKS_SAVE_SECS stale costs nothing, because the
+    in-memory copy is what every decision reads.
+    """
+    global _peaks_dirty, _peaks_saved_at
+    _load_peaks()
+    live = {str(i) for i in live_ids}
+    removed = [k for k in _be_peaks if k not in live]
+    for gone in removed:
+        _be_peaks.pop(gone, None)
+        _peaks_dirty = True
+    now = time.time()
+    # A rising peak can wait out the debounce; a position that has CLOSED cannot.
+    # Leaving its peak on disk means a restart inside the window reloads a peak for
+    # a trade that no longer exists, and the next ticket to reuse that id inherits it.
+    if _peaks_dirty and (removed or now - _peaks_saved_at >= PEAKS_SAVE_SECS):
+        state = load()
+        state["peaks"] = {k: round(v, 2) for k, v in _be_peaks.items()}
+        save(state)
+        _peaks_dirty, _peaks_saved_at = False, now
 
 
 def has_protective_stop(p, spread):
@@ -2827,7 +2926,7 @@ async def soft_protect(conn, positions, bid, ask, notify=None, allowed=True):
     closed = []
     for p in positions:
         pid = p.get("id")
-        peak = _be_peaks.get(pid, 0.0)
+        peak = peak_of(pid)
         if peak < BE_TRIGGER_CASH:
             continue                      # never showed real profit; nothing to defend
         if has_protective_stop(p, spread):
@@ -2844,7 +2943,7 @@ async def soft_protect(conn, positions, bid, ask, notify=None, allowed=True):
             log.warning(f"soft protect could not close {pid}: {e}")
             continue
         closed.append((pid, peak, profit))
-        _be_peaks.pop(pid, None)
+        forget_peak(pid)
         _be_waiting.pop(pid, None)
     if closed and notify:
         for pid, peak, profit in closed:
@@ -2879,8 +2978,7 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label="", gap_
             continue
         is_buy = p.get("type") == "POSITION_TYPE_BUY"
         pid = p.get("id")
-        peak = max(_be_peaks.get(pid, 0.0), profit)
-        _be_peaks[pid] = peak
+        peak = note_peak(pid, profit)
         # Lock break-even at the least, and otherwise whatever the peak leaves after the
         # trail - so a trade that ran to +1.80 keeps most of it instead of closing at zero.
         locked = max(BE_LOCK_CASH, peak - BE_TRAIL_CASH) if BE_TRAIL_CASH > 0 else BE_LOCK_CASH
@@ -2926,8 +3024,7 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label="", gap_
         except Exception as e:
             log.warning(f"break-even move failed on {p.get('id')}: {e}")
     live = {p.get("id") for p in positions}
-    for gone in [k for k in _be_peaks if k not in live]:
-        _be_peaks.pop(gone, None)
+    prune_peaks(live)
     for gone in [k for k in _be_waiting if k not in live]:
         _be_waiting.pop(gone, None)
     for pid, _ in moved:
