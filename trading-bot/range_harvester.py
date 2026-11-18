@@ -258,17 +258,159 @@ except Exception as _e:
     broker_capital = None
     log.warning(f"broker_capital unavailable: {_e}")
 
+ENTRY_SAFETY_PATH = os.path.join(BASE_DIR, "entry_safety.py")
+STUB_MARK = "IS_BOOTSTRAP_STUB"
+
+# A last-resort stand-in, written to disk only when the real module is absent AND
+# cannot be fetched. It is deliberately lopsided: everything that OPENS exposure
+# fails closed, and everything that PROTECTS keeps working, because a bot that
+# cannot guard the trades already open is more dangerous than one that cannot
+# trade. It marks itself so the next start replaces it instead of trusting it.
+_STUB = '''"""Bootstrap stand-in for entry_safety. Replaced on the next successful fetch."""
+IS_BOOTSTRAP_STUB = True
+MANUAL_MAGIC = 0
+
+
+class EntryBlocked(RuntimeError):
+    pass
+
+
+def is_ours(position, magics, adopted=(), released=()):
+    pid = str((position or {}).get("id"))
+    if pid in {str(i) for i in (released or ())}:
+        return False
+    if pid in {str(i) for i in (adopted or ())}:
+        return True
+    return (position or {}).get("magic") in tuple(magics or ())
+
+
+def owner_label(position, magics, adopted=(), released=()):
+    pid = str((position or {}).get("id"))
+    if pid in {str(i) for i in (released or ())}:
+        return "released"
+    if pid in {str(i) for i in (adopted or ())}:
+        return "adopted"
+    mg = (position or {}).get("magic")
+    if mg in tuple(magics or ()):
+        return "bot"
+    return "manual" if mg in (MANUAL_MAGIC, None) else "foreign-ea"
+
+
+def may_protect(position, magics, adopted=(), released=()):
+    return is_ours(position, magics, adopted, released)
+
+
+def may_close(position, magics, adopted=(), released=(), allowed=True):
+    return bool(allowed) and is_ours(position, magics, adopted, released)
+
+
+def needs_real_stop(position, trigger_cash, magics, adopted=(), released=()):
+    if not is_ours(position, magics, adopted, released):
+        return False
+    try:
+        if float((position or {}).get("unrealizedProfit", 0) or 0) < float(trigger_cash or 0):
+            return False
+        sl = (position or {}).get("stopLoss")
+        return not (sl and float(sl))
+    except (TypeError, ValueError):
+        return True
+
+
+def would_duplicate(price, is_buy, existing, tolerance):
+    return True                       # cannot judge -> place nothing
+
+
+def duplicate_report(existing, tolerance):
+    return []
+
+
+def reconcile(*a, **k):
+    return {"vanished": [], "unexpected": [], "unprotected": [],
+            "duplicates": [], "foreign": []}
+
+
+def feed_is_stale(last_ok_ts, max_age_secs, now=None):
+    return True
+
+
+def entry_allowed(*a, **k):
+    return False, "\u0646\u0633\u062e\u0629 \u0637\u0648\u0627\u0631\u0626 \u0645\u0646 \u0648\u062d\u062f\u0629 \u0627\u0644\u0623\u0645\u0627\u0646 \u2014 \u0645\u0627\u0643\u0648 \u0641\u062a\u062d \u0635\u0641\u0642\u0627\u062a"
+
+
+def entry_lock_state(conn=None):
+    return True, "\U0001f512 \u0648\u062d\u062f\u0629 \u0627\u0644\u0623\u0645\u0627\u0646 \u0646\u0627\u0642\u0635\u0629 \u2014 \u0646\u0633\u062e\u0629 \u0637\u0648\u0627\u0631\u0626: \u0627\u0644\u062d\u0631\u0627\u0633\u0629 \u0634\u063a\u0627\u0644\u0629 \u0648\u0627\u0644\u0641\u062a\u062d \u0645\u0642\u0641\u0648\u0644"
+
+
+def require_entry_permission(**kwargs):
+    raise EntryBlocked("entry_safety is a bootstrap stub: no new orders")
+'''
+
+ENTRY_SAFETY_STATE = "ok"
+
+
+def ensure_entry_safety():
+    """Make sure entry_safety.py exists before anything imports it.
+
+    Returns "ok", "fetched" or "stub". Never raises: a bootstrap that can throw
+    is a bootstrap that can brick the thing it was added to protect.
+    """
+    global ENTRY_SAFETY_STATE
+    try:
+        if os.path.exists(ENTRY_SAFETY_PATH):
+            with open(ENTRY_SAFETY_PATH, encoding="utf-8", errors="replace") as f:
+                if STUB_MARK not in f.read(2000):
+                    ENTRY_SAFETY_STATE = "ok"
+                    return ENTRY_SAFETY_STATE
+        cmd = ["curl", "-fsSL", "--connect-timeout", "15", "--retry", "2",
+               f"{RAW_BASE}/entry_safety.py", "-o", ENTRY_SAFETY_PATH + ".new"]
+        if os.environ.get("FORCE_IPV4", "0") in ("1", "true", "yes"):
+            cmd.insert(1, "-4")
+        got = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        tmp = ENTRY_SAFETY_PATH + ".new"
+        if got.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 400:
+            with open(tmp, encoding="utf-8", errors="replace") as f:
+                body = f.read()
+            if "def require_entry_permission" in body and STUB_MARK not in body:
+                compile(body, tmp, "exec")          # never install something broken
+                os.replace(tmp, ENTRY_SAFETY_PATH)
+                ENTRY_SAFETY_STATE = "fetched"
+                return ENTRY_SAFETY_STATE
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    except Exception as e:                           # network, disk, anything
+        log.warning(f"could not fetch entry_safety.py: {e}")
+    if not os.path.exists(ENTRY_SAFETY_PATH):
+        try:
+            with open(ENTRY_SAFETY_PATH, "w", encoding="utf-8") as f:
+                f.write(_STUB)
+        except Exception as e:
+            log.error(f"could not even write the entry_safety stub: {e}")
+    ENTRY_SAFETY_STATE = "stub"
+    return ENTRY_SAFETY_STATE
+
+
+# Before ANY import that needs it - grid.py imports entry_safety too, and its
+# import sits in a try/except that would swallow the failure and leave the bot
+# running with no grid at all, which is a quieter disaster than the crash loop.
+ensure_entry_safety()
+
 try:
     import grid  # capped-martingale stop-order grid, its own magics, its own limits
 except Exception as _e:
     grid = None
     log.warning(f"grid module unavailable: {_e}")
 
-# Not wrapped in a try. Every other optional module degrades to a feature being
-# absent; this one decides what the bot is allowed to TOUCH. A silent fallback
-# here would mean the bot carrying on with no rule about whose money it is acting
-# on - and silence is the failure this whole module exists to end. It is in
-# CODE_FILES, so /update fetches it and the boot check shouts if it is missing.
+# entry_safety decides what the bot is allowed to TOUCH, so it must exist before
+# anything imports it - and the one moment it is guaranteed NOT to exist is the
+# upgrade that introduces it. The update is run by the code ALREADY on the server,
+# whose CODE_FILES has six entries and no entry_safety.py. It downloads six files,
+# compiles them (py_compile never executes an import, so a missing module passes),
+# installs them, reports success, and restarts into ModuleNotFoundError - for ever,
+# because the unit says Restart=always. No Telegram, no SSH, a live account.
+# Simulated against a byte-identical copy of the server: that is exactly what
+# happened. So this file repairs itself before importing anything that needs it.
 import entry_safety as safety
 from entry_safety import require_entry_permission
 
