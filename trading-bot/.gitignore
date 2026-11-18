@@ -16,3 +16,6 @@ bot.log
 *.log
 paper_state.json
 bot.lock
+# The one-trade permit. Server state, never the repo: a committed permit would
+# travel to every machine as a licence to open a live trade.
+test_permit.json

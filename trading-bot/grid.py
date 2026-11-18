@@ -1326,6 +1326,15 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
     # broker and some adapters expose no order book at all; refusing to arm on those
     # would be a lockout dressed as caution. Only a reader that exists and then threw
     # means we are blind.
+    # A ladder next to a live single-trade test is exactly the extra exposure that
+    # mode promises not to create. The general lock refuses these orders anyway
+    # today, so this guard changes nothing right now - which is the point: it is
+    # the guard that still holds on the day the general lock is lifted, and a
+    # guard written and never wired is a comment pretending to be a control.
+    if safety.test_mode_active():
+        return False, ("\u0645\u0627 \u0646\u0635\u0628\u062a: \u0648\u0636\u0639 \u0627\u062e\u062a\u0628\u0627\u0631 \u0627\u0644\u062a\u0646\u0641\u064a\u0630 \u0641\u0639\u0651\u0627\u0644 \u2014 \u0635\u0641\u0642\u0629 \u0648\u062d\u062f\u0629 \u0628\u0633\u060c "
+                       "\u0648\u0627\u0644\u0634\u0628\u0643\u0629 \u0645\u0642\u0641\u0648\u0644\u0629 \u0637\u0648\u0644 \u0627\u0644\u0648\u0642\u062a. `/testtrade off` \u064a\u0633\u062d\u0628 \u0627\u0644\u0625\u0630\u0646.")
+
     _open, _book_ok = [], True
     for _getter in ("get_orders", "get_positions"):
         _fn = getattr(conn, _getter, None)
@@ -2081,6 +2090,11 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
     which is the side one-way has deliberately stood down - refilling that side was undoing
     the same decision on the next tick, over and over.
     """
+    # Same rule as arm(): while a single-trade test is live, nothing tops the
+    # ladder back up either. refill_gaps is the quieter of the two paths and
+    # the easier one to forget.
+    if safety.test_mode_active():
+        return 0
     if not (GRID_REFILL and GRID_LEVELS > 0):
         return 0
     if room is not None and room <= 0:

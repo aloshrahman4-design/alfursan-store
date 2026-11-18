@@ -1289,6 +1289,7 @@ HELP_TEXT = (
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
     "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
+    "• /testtrade — وضع اختبار التنفيذ: صفقة حقيقية وحدة `0.01` بوقف إلزامي\n"
     "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
     "• `/setkey branch <اسم الفرع>` — من أي فرع يسحب `/update`\n"
     "• /perf 30 — الأداء الحقيقي من صفقاتك المغلقة عند الوسيط\n"
@@ -2641,6 +2642,164 @@ async def refuse_entry(what=""):
     raise safety.EntryBlocked("entry refused by the interlock %s" % what)
 
 
+async def open_test_trade():
+    """Send exactly one live 0.01 order with a mandatory broker stop, or send none.
+
+    Order of operations is the whole design, and it is not the obvious one:
+      1. read the price and work out a stop the broker will actually accept
+      2. SPEND the permit, on disk, fsynced
+      3. only then send
+      4. a timeout marks the outcome UNKNOWN and stops - never retries
+      5. confirm the broker really holds the stop, and close at once if it does not
+    Spending after a successful send would be simpler and wrong: the gap between
+    sending and recording is where one permitted trade becomes an endless loop.
+    """
+    d = safety.test_permit()
+    if not d or d.get("state") != "granted":
+        await send_long("ماكو إذن فعّال. `/testtrade buy` أو `/testtrade sell`.",
+                        markup=keyboard())
+        return
+    if connection is None:
+        await send_long("ماكو اتصال بالوسيط — `/check`.", markup=keyboard())
+        return
+    side, lot = d["side"], float(d["lot"])
+    want = float(d["sl_dollars"])
+
+    try:
+        px = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=8.0)
+        bid, ask = float(px.get("bid", 0) or 0), float(px.get("ask", 0) or 0)
+    except Exception as e:
+        await send_long(f"ما كدرت أقرا السعر: `{str(e)[:150]}` — ما أرسلت شي.",
+                        markup=keyboard())
+        return
+    if not bid or not ask:
+        await send_long("السعر صفر — ما أرسلت شي.", markup=keyboard())
+        return
+    spread = max(0.0, ask - bid)
+    gap = 0.0
+    try:
+        gap = float(await grid.broker_stop_gap(connection, SYMBOL) or 0.0)
+    except Exception:
+        gap = 0.0
+    # The broker refuses a stop closer than `gap`; the spread eats into the distance
+    # on top of that. Take whichever is larger so the order is not bounced, and say
+    # so, rather than sending 3$ and reading a rejection the owner cannot decode.
+    dist = round(max(want, gap + spread + 0.10), 2)
+    entry = ask if side == "buy" else bid
+    sl = round(entry - dist, 2) if side == "buy" else round(entry + dist, 2)
+    risk = round(dist * lot * float(getattr(grid, "GRID_CONTRACT", 100.0)), 2)
+
+    token, err = safety.consume_test_permit(side, lot)      # ON DISK, BEFORE sending
+    if err:
+        await send_long(f"ما أرسلت: {err}", markup=keyboard())
+        return
+
+    maker = (connection.create_market_buy_order if side == "buy"
+             else connection.create_market_sell_order)
+    await send_long(f"📤 *أرسل صفقة الاختبار*\n"
+                    f"• `{side}` `{lot:g}` على `{SYMBOL}`\n"
+                    f"• وقف `{sl}` — بُعد `{dist}$` = خسارة `{risk}$`\n"
+                    f"• الإذن انصرف قبل الإرسال — ماكو صفقة ثانية مهما صار")
+    try:
+        safety.require_entry_permission(stop_loss=sl, lot=lot, conn=connection,
+                                        permit=token)
+        await asyncio.wait_for(
+            maker(symbol=SYMBOL, volume=lot, stop_loss=sl,
+                  options={"magic": safety.MAGIC_TEST}), timeout=20.0)
+    except asyncio.TimeoutError:
+        safety.mark_permit_unknown("send timed out")
+        await send_long(
+            "🚨 *مهلة الإرسال انتهت — الحالة مجهولة*\n"
+            "• ممكن الأمر وصل وممكن لا. **ما أعيد المحاولة.**\n"
+            "• افتح MT5 الآن وشوف إذا أكو صفقة `0.01`\n"
+            "• إذا أكو وما عليها وقف — سكّرها بيدك فوراً\n"
+            "• `/trades` يبيّن اللي أشوفه أنا", markup=keyboard())
+        return
+    except Exception as e:
+        safety.mark_permit_unknown(f"send failed: {str(e)[:120]}")
+        await send_long(
+            f"❌ *الوسيط رفض الأمر*: `{str(e)[:200]}`\n"
+            f"• الإذن انصرف ولا يرجع تلقائياً — `/testtrade {side}` يعطي إذناً جديداً\n"
+            f"• تأكد من MT5 قبلها إنه فعلاً ماكو صفقة", markup=keyboard())
+        return
+
+    await asyncio.sleep(2.0)
+    try:
+        pos = await asyncio.wait_for(connection.get_positions(), timeout=10.0) or []
+    except Exception as e:
+        safety.mark_permit_done(note="opened, could not verify")
+        await send_long(f"⚠️ انفتحت بس ما كدرت أتأكد من الوقف: `{str(e)[:150]}`\n"
+                        f"• افحص MT5 بنفسك الآن", markup=keyboard())
+        return
+    ours = [p for p in pos if p.get("magic") == safety.MAGIC_TEST
+            and p.get("symbol") == SYMBOL]
+    if not ours:
+        safety.mark_permit_unknown("no position found after send")
+        await send_long("🚨 *أرسلت وما ألقى صفقة* — افحص MT5 بنفسك. ما أعيد المحاولة.",
+                        markup=keyboard())
+        return
+    p = ours[0]
+    got = p.get("stopLoss")
+    try:
+        got = float(got) if got else 0.0
+    except (TypeError, ValueError):
+        got = 0.0
+    if not got:
+        # A live position with no stop is the one state this mode promised never to
+        # produce. Close it immediately rather than explain it.
+        try:
+            await asyncio.wait_for(connection.close_position(p["id"]), timeout=10.0)
+            safety.mark_permit_done(p.get("id"), "closed: broker dropped the stop")
+            await send_long("🛑 *الوسيط ما قبل الوقف — سكّرتها فوراً*\n"
+                            "صفقة حقيقية بلا وقف ممنوعة بهذا الوضع.", markup=keyboard())
+        except Exception as e:
+            safety.mark_permit_done(p.get("id"), "NO STOP, close failed")
+            await send_long(f"🚨🚨 *صفقة بلا وقف وما كدرت أسكّرها*: `{str(e)[:150]}`\n"
+                            f"**سكّرها من MT5 حالاً.**", markup=keyboard())
+        return
+    safety.mark_permit_done(p.get("id"), "open with a verified stop")
+    await send_long(
+        f"✅ *انفتحت وعليها وقف حقيقي عند الوسيط*\n"
+        f"• رقمها `{p.get('id')}` · دخول `{p.get('openPrice')}`\n"
+        f"• الوقف `{got}` — لازم تشوف الخط بالـMT5 على نفس الرقم\n"
+        f"• أقصى خسارة متوقعة `{risk}$` (الفجوات ممكن تتعداها)\n"
+        f"• ماكو صفقة ثانية: الإذن انتهى\n"
+        f"• `/stop` يغلقها فوراً", markup=keyboard())
+
+
+async def handle_testtrade(text):
+    """/testtrade [buy|sell|off|go] - the single-trade execution test."""
+    parts = text.split()
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+    if arg in ("off", "cancel", "الغاء", "إلغاء"):
+        ok = safety.revoke_test_permit()
+        await send_long("⛔️ سحبت الإذن." if ok else "ماكو إذن أصلاً.", markup=keyboard())
+        return
+    if arg in ("buy", "sell", "شراء", "بيع"):
+        side = "buy" if arg in ("buy", "شراء") else "sell"
+        ok, msg = safety.grant_test_permit(side)
+        if not ok:
+            await send_long(f"❌ {msg}", markup=keyboard())
+            return
+        await send_long(
+            f"🟡 *إذن صفقة اختبار واحدة*\n"
+            f"• `{side}` · `{safety.TEST_LOT_CAP:g}` لوت · وقف `{safety.TEST_SL_DOLLARS:g}$`\n"
+            f"• ينتهي بعد `{safety.TEST_TTL_SECS // 60}` دقيقة إذا ما استعملته\n"
+            f"• الشبكة والتعزيز وإعادة الدخول تبقى مقفلة\n\n"
+            f"`/testtrade go` ينفّذ · `/testtrade off` يسحب", markup=keyboard())
+        return
+    if arg in ("go", "run", "نفذ", "نفّذ"):
+        await open_test_trade()
+        return
+    await send_long(
+        f"🧪 *وضع اختبار التنفيذ*\n{safety.permit_line()}\n\n"
+        f"`/testtrade buy` · `/testtrade sell` — يعطي إذن صفقة **وحدة**\n"
+        f"`/testtrade go` — ينفّذها\n"
+        f"`/testtrade off` — يسحب الإذن\n\n"
+        f"الحدود: `{safety.TEST_LOT_CAP:g}` لوت · وقف `{safety.TEST_SL_DOLLARS:g}$` إلزامي "
+        f"· صفقة وحدة ما تتكرر ولو انطفى البوت", markup=keyboard())
+
+
 async def handle_rollback():
     """Put the previous version back after a bad update, from Telegram.
 
@@ -2834,7 +2993,7 @@ async def protect_engine():
                 continue
             released = set(grid.load().get("released", []))
             adopted = grid.adopted_ids()
-            magics = (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS
+            magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
             pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
             # Ownership is decided in ONE place now - entry_safety.is_ours - so a
             # hand-opened trade (magic 0) cannot become ours because some call site
@@ -3406,6 +3565,8 @@ async def process_update(update):
                     await send_long(await grid.reconcile_report(
                         connection, SYMBOL, (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS),
                         markup=keyboard())
+            elif text.startswith("/testtrade") or text.startswith("/اختبار"):
+                await handle_testtrade(text)
             elif text.startswith("/rollback"):
                 await handle_rollback()
             elif text.startswith("/live"):

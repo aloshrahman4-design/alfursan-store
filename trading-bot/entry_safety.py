@@ -28,6 +28,8 @@ Five concerns, in the order they bite:
    from a quiet market. Opening into that is how a hedge becomes a naked position.
 """
 
+import hashlib
+import json
 import os
 import time
 
@@ -36,6 +38,10 @@ __all__ = [
     "would_duplicate", "duplicate_report", "needs_real_stop", "reconcile",
     "feed_is_stale", "entry_allowed",
     "EntryBlocked", "require_entry_permission", "entry_lock_state",
+    "MAGIC_TEST", "TEST_LOT_CAP", "TEST_SL_DOLLARS", "TEST_TTL_SECS",
+    "grant_test_permit", "revoke_test_permit", "test_permit",
+    "consume_test_permit", "mark_permit_unknown", "mark_permit_done",
+    "permit_line", "test_mode_active",
 ]
 
 # A position MetaTrader opened for a human rather than an EA. Never ours by default.
@@ -268,7 +274,8 @@ def _is_simulator(conn):
     return getattr(conn, "__simulator__", False) is True
 
 
-def require_entry_permission(*, stop_loss=None, lot=None, market=False, conn=None):
+def require_entry_permission(*, stop_loss=None, lot=None, market=False, conn=None,
+                            permit=None):
     """Explicit opt-in plus mandatory broker-side stop for any new exposure.
 
     This is an interim safety interlock, NOT a complete live risk gate.
@@ -281,6 +288,12 @@ def require_entry_permission(*, stop_loss=None, lot=None, market=False, conn=Non
     """
     if _is_simulator(conn):
         return                      # a simulator: no account, no money, no broker
+    if permit is not None:
+        # The single-trade execution test. A token exists only because
+        # consume_test_permit() already wrote "consumed" to the disk and fsynced
+        # it, so by the time we are here the permit is spent whatever happens next.
+        _check_permit(permit, stop_loss, lot)
+        return
     if os.environ.get(ALLOW_ENV, "").strip() != ALLOW_PHRASE:
         raise EntryBlocked("new orders disabled: %s is not explicitly enabled" % ALLOW_ENV)
     try:
@@ -315,3 +328,219 @@ def entry_lock_state(conn=None):
                       "(`%s` \u0645\u0648 \u0645\u0641\u0639\u0651\u0644)" % ALLOW_ENV)
     return True, ("\U0001f512 \u0642\u0641\u0644 \u0627\u0644\u0623\u0645\u0627\u0646 \u0645\u063a\u0644\u0642: \u0627\u0644\u0645\u0648\u0627\u0641\u0642\u0629 \u0645\u062d\u0641\u0648\u0638\u0629\u060c \u0628\u0633 \u0627\u0644\u0642\u0641\u0644 \u0644\u0627 \u064a\u0632\u0627\u0644 "
                   "\u064a\u0631\u0641\u0636 \u0643\u0644 \u0623\u0645\u0631 \u062c\u062f\u064a\u062f \u0628\u0642\u0635\u062f \u2014 \u062d\u062a\u0649 \u062a\u0646\u0631\u0628\u0637 \u0628\u0648\u0627\u0628\u0629 \u0627\u0644\u0645\u062e\u0627\u0637\u0631 \u0627\u0644\u062d\u064a\u0629")
+
+
+# --------------------------------------------------------------------------- 6
+# THE ONE-TRADE EXECUTION TEST
+#
+# The history says this strategy loses: 2308 closed trades, 75.8% of them winners,
+# and still -2537.80, because the average loss is 4.18x the average win. So this
+# mode is NOT here to find out whether the edge is real. It is here to answer three
+# mechanical questions on a live account for about three and a half dollars: does a
+# stop actually reach the broker, does MT5 draw it, and does it follow the price.
+#
+# Everything below is built so that ONE trade is the most it can ever produce. The
+# permit is a file on disk, it is spent before the order is sent rather than after,
+# a send whose outcome is unknown spends it just the same, and nothing anywhere
+# hands it back. If that costs a wasted permit the owner re-issues it in one line;
+# the opposite mistake costs an unbounded loop of live orders.
+
+MAGIC_TEST = 777555                  # its own magic: the grid must never count it
+TEST_LOT_CAP = 0.01
+TEST_SL_DOLLARS = 3.0                # price distance, and on 0.01 lot of gold
+TEST_TTL_SECS = 3600                 # a permit nobody used is not a standing licence
+PERMIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "test_permit.json")
+
+# granted  -> issued, nothing sent
+# consumed -> spent, the order is about to go or has gone
+# unknown  -> the send timed out; whether it reached the broker is NOT known
+# done     -> a position was confirmed, or the trade is finished
+# revoked  -> withdrawn by the owner
+_LIVE_STATES = ("granted",)
+_SPENT_STATES = ("consumed", "unknown", "done")
+
+
+def _read_permit():
+    try:
+        with open(PERMIT_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _write_permit(d):
+    """Write it and make the kernel admit it is on the disk before returning.
+
+    Without the flush and fsync the record can sit in a buffer while the order is
+    already at the broker. A crash in that window loses the only evidence the
+    permit was spent, and the next start issues the same trade again.
+    """
+    tmp = PERMIT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PERMIT_PATH)
+    try:
+        fd = os.open(os.path.dirname(PERMIT_PATH), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def test_permit(now=None):
+    """The permit as it stands, with expiry already applied. None when there is none."""
+    d = _read_permit()
+    if not d:
+        return None
+    now = time.time() if now is None else now
+    if d.get("state") in _LIVE_STATES and now - float(d.get("granted_at", 0)) > TEST_TTL_SECS:
+        d = dict(d, state="expired")
+        try:
+            _write_permit(d)
+        except Exception:
+            pass
+    return d
+
+
+def test_mode_active(now=None):
+    """True while a permit exists in any state other than finished or withdrawn.
+
+    The grid stays refused for the whole of that window, not just while the permit
+    is unspent: a ladder armed next to a live test trade is exactly the extra
+    exposure this mode promises not to create.
+    """
+    d = test_permit(now)
+    return bool(d and d.get("state") in (_LIVE_STATES + ("consumed", "unknown")))
+
+
+def grant_test_permit(side, lot=TEST_LOT_CAP, sl_dollars=TEST_SL_DOLLARS, now=None):
+    """Issue the single permit. (ok, message). Refuses to overwrite a spent one."""
+    side = str(side or "").strip().lower()
+    if side not in ("buy", "sell"):
+        return False, "الاتجاه لازم يكون `buy` أو `sell`"
+    try:
+        lot = float(lot)
+        sl_dollars = float(sl_dollars)
+    except (TypeError, ValueError):
+        return False, "لوت أو وقف غير صالح"
+    if not (0 < lot <= TEST_LOT_CAP):
+        return False, "اللوت لازم يكون `%g` أو أقل" % TEST_LOT_CAP
+    if sl_dollars <= 0:
+        return False, "الوقف لازم يكون موجباً"
+    old = test_permit(now)
+    if old and old.get("state") in _SPENT_STATES:
+        return False, ("الإذن السابق انصرف (`%s`). ما أعطي إذناً ثانياً لحالي — "
+                       "`/testtrade off` يمسحه إذا متأكد إنه ماكو صفقة مفتوحة."
+                       % old.get("state"))
+    _write_permit({"side": side, "lot": lot, "sl_dollars": sl_dollars,
+                   "granted_at": float(time.time() if now is None else now),
+                   "state": "granted", "token": None, "note": ""})
+    return True, "تم"
+
+
+def revoke_test_permit():
+    """Withdraw it. Always possible, including after it was spent."""
+    d = _read_permit()
+    if not d:
+        return False
+    try:
+        _write_permit(dict(d, state="revoked"))
+    except Exception:
+        return False
+    return True
+
+
+def consume_test_permit(side, lot, now=None):
+    """Spend the permit BEFORE the order is sent. (token, error).
+
+    The write happens here, with fsync, and the caller may only send once this has
+    returned a token. Spending after a successful send would be simpler and wrong:
+    the gap between the two is where a crash turns one permitted trade into a loop.
+    """
+    d = test_permit(now)
+    if not d:
+        return None, "ماكو إذن — `/testtrade buy` أو `/testtrade sell`"
+    st = d.get("state")
+    if st == "expired":
+        return None, "الإذن انتهت مدته (`%d` دقيقة)" % (TEST_TTL_SECS // 60)
+    if st == "revoked":
+        return None, "الإذن مسحوب"
+    if st in _SPENT_STATES:
+        return None, "الإذن انصرف من قبل (`%s`) — ما تنفتح صفقة ثانية" % st
+    if str(side).lower() != d.get("side"):
+        return None, "الإذن على `%s` مو `%s`" % (d.get("side"), side)
+    try:
+        if float(lot) > float(d.get("lot", TEST_LOT_CAP)) + 1e-9:
+            return None, "اللوت أكبر من الإذن"
+    except (TypeError, ValueError):
+        return None, "لوت غير صالح"
+    token = hashlib.sha256(
+        ("%s|%s|%s" % (d.get("granted_at"), side, os.urandom(16).hex())).encode()
+    ).hexdigest()[:32]
+    _write_permit(dict(d, state="consumed", token=token,
+                       consumed_at=float(time.time() if now is None else now)))
+    return token, ""
+
+
+def mark_permit_unknown(note=""):
+    """The send timed out. Whether it reached the broker is not known - say so.
+
+    There is deliberately no retry anywhere near this. A timeout is not a failure;
+    it is an absence of information, and the one thing that must not follow is a
+    second order sent on the assumption that the first did not arrive.
+    """
+    d = _read_permit()
+    if d:
+        _write_permit(dict(d, state="unknown", note=str(note)[:200]))
+
+
+def mark_permit_done(position_id=None, note=""):
+    d = _read_permit()
+    if d:
+        _write_permit(dict(d, state="done", position_id=str(position_id or ""),
+                           note=str(note)[:200]))
+
+
+def _check_permit(token, stop_loss, lot):
+    """The live-order gate for this mode. Raises unless everything lines up."""
+    d = _read_permit()
+    if not d or d.get("state") != "consumed":
+        raise EntryBlocked("no consumed test permit")
+    if not token or token != d.get("token"):
+        raise EntryBlocked("test permit token does not match")
+    try:
+        if float(lot) > TEST_LOT_CAP + 1e-9 or float(lot) <= 0:
+            raise EntryBlocked("test trade is capped at %g lot" % TEST_LOT_CAP)
+        sl = float(stop_loss)
+    except (TypeError, ValueError, OverflowError):
+        raise EntryBlocked("test trade requires a numeric broker-side stop loss")
+    if not (sl > 0 and sl < float("inf")):
+        raise EntryBlocked("test trade requires a positive broker-side stop loss")
+
+
+def permit_line(now=None):
+    """One readable line about the permit, for the panel. Never raises."""
+    d = test_permit(now)
+    if not d:
+        return "🔒 وضع اختبار التنفيذ: ماكو إذن"
+    st = d.get("state")
+    words = {"granted": "🟡 إذن فعّال — صفقة وحدة",
+             "consumed": "🔵 انصرف — الأمر أُرسل",
+             "unknown": "🚨 مجهول — أُرسل وما نعرف وصل",
+             "done": "✅ انتهى",
+             "revoked": "⛔️ مسحوب",
+             "expired": "⌛️ انتهت مدته"}
+    left = ""
+    if st == "granted":
+        secs = TEST_TTL_SECS - ((time.time() if now is None else now)
+                                - float(d.get("granted_at", 0)))
+        left = " · يبقى `%d` دقيقة" % max(0, int(secs // 60))
+    return ("%s · `%s` `%g` لوت · وقف `%g$`%s"
+            % (words.get(st, st), d.get("side", "?"), d.get("lot", 0),
+               d.get("sl_dollars", 0), left))
