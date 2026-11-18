@@ -1,3 +1,4 @@
+from entry_safety import require_entry_permission
 """Two-sided stop-order grid with a capped lot ladder.
 
 The shape comes from the martingale grids sold on social media: a ladder of pending stop
@@ -1330,6 +1331,7 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                 _tsl = server_trail()
                 if _tsl:
                     opts["trailingStopLoss"] = _tsl   # protected from the first tick
+                require_entry_permission(stop_loss=entry_stop(price_at, sign > 0), lot=lot)
                 res = await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
                           stop_loss=entry_stop(price_at, sign > 0),
@@ -2062,6 +2064,13 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
             furthest = max(side_orders, key=lambda o: abs(float(o.get("openPrice", 0) or 0) - ref))
             if abs(float(furthest.get("openPrice", 0) or 0) - ref) <= abs(at - ref):
                 continue                  # nothing is further out than the level we want
+            # Never remove a protective/working pending level unless its replacement
+            # is permitted. In fail-closed mode, leave the existing ladder intact.
+            try:
+                require_entry_permission(stop_loss=entry_stop(at, sign > 0), lot=lot)
+            except Exception as e:
+                log.warning(f"refill blocked before recycling existing order: {e}")
+                continue
             try:
                 await asyncio.wait_for(conn.cancel_order(furthest["id"]), timeout=6.0)
                 recycled += 1
@@ -2073,6 +2082,7 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
             _tsl = server_trail()
             if _tsl:
                 _opts["trailingStopLoss"] = _tsl
+            require_entry_permission(stop_loss=entry_stop(at, sign > 0), lot=lot)
             res = await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
                       stop_loss=entry_stop(at, sign > 0),

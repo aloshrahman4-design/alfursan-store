@@ -1,3 +1,4 @@
+from entry_safety import require_entry_permission
 import asyncio
 import hashlib
 import hmac
@@ -1744,6 +1745,7 @@ async def set_new_buy_anchor(manual=False):
         if ask == 0:
             return
         buy_anchor, buy_waiting, peak_buy_profit = ask, False, 0.0
+        require_entry_permission(lot=TRADE_LOT, market=True)
         await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 🚀"
         await notify(act("🟢 افتح صفقة شراء (BUY)", f"• السعر التقريبي: `{buy_anchor}`")
@@ -1762,6 +1764,7 @@ async def set_new_sell_anchor(manual=False):
         if bid == 0:
             return
         sell_anchor, sell_waiting, peak_sell_profit = bid, False, 0.0
+        require_entry_permission(lot=TRADE_LOT, market=True)
         await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 📉"
         await notify(act("🔴 افتح صفقة بيع (SELL)", f"• السعر التقريبي: `{sell_anchor}`")
@@ -2651,6 +2654,7 @@ async def range_engine():
                     await asyncio.sleep(2.0)
                 elif ask <= (buy_anchor + 0.25):
                     buy_waiting, peak_buy_profit = False, 0.0
+                    require_entry_permission(lot=TRADE_LOT, market=True)
                     await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
                     await notify(act("🟢 افتح شراء (عودة للارتكاز)", f"• الارتكاز: `{buy_anchor}`")
                                  or f"🟢 **فتح شراء جديد لعودة السعر لارتكاز (`{buy_anchor}`)**")
@@ -2687,6 +2691,7 @@ async def range_engine():
                     await asyncio.sleep(2.0)
                 elif bid >= (sell_anchor - 0.25):
                     sell_waiting, peak_sell_profit = False, 0.0
+                    require_entry_permission(lot=TRADE_LOT, market=True)
                     await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
                     await notify(act("🔴 افتح بيع (عودة للارتكاز)", f"• الارتكاز: `{sell_anchor}`")
                                  or f"🔴 **فتح بيع جديد لعودة السعر لارتكاز (`{sell_anchor}`)**")
