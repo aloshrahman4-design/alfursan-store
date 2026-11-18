@@ -1371,8 +1371,14 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                f"فبديت من `{base:g}` بدل `{GRID_BASE_LOT:g}`. "
                f"السقف `{round(min(GRID_RECOVER_MAX, GRID_MAX_LOT), 2):g}` وما يتعداه أبداً.")
     head = why or f"🕸 *نصبت الشبكة حول* `{center}`"
-    await notify(f"{head}\n\n{plan_text(balance)}\n"
-                 f"• أوامر معلّقة: `{placed}`{note}{rec}")
+    # The arming message is the one the owner actually reads, and it was the one
+    # calling plan_text with no price and no spread. cost_verdict returns None on a
+    # zero spread, so the cycle-cost line - the warning that a round trip eats a
+    # third of a typical exit - was silently dropped from exactly that message. The
+    # real bid and ask are right here; there was never a reason not to pass them.
+    if notify:
+        await notify(f"{head}\n\n{plan_text(balance, center, round(ask - bid, 5))}\n"
+                     f"• أوامر معلّقة: `{placed}`{note}{rec}")
     return True, None
 
 
