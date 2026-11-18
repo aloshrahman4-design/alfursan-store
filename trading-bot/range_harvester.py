@@ -3031,12 +3031,20 @@ async def protect_engine():
             if wait and not reads_are_free():
                 await asyncio.sleep(min(wait, 30.0))
                 continue
-            price = await market_price(SYMBOL)
-            grid.note_read_ok()
-            bid, ask = float(price.get("bid", 0) or 0), float(price.get("ask", 0) or 0)
-            if not bid or not ask:
-                await asyncio.sleep(2 if reads_are_free() else RPC_TICK_SECS)
-                continue
+            # The give-back guard reads unrealizedProfit off the position. It does
+            # not need a quote, and it used to die with one: a failed price read
+            # raised out of the whole pass, so a blocked public feed - Yahoo
+            # answering 403, which it does - silently stopped the profit protection
+            # on an account the broker was still streaming perfectly well. The price
+            # is needed only to PLACE stops, so losing it must cost only that.
+            bid = ask = 0.0
+            try:
+                price = await market_price(SYMBOL)
+                grid.note_read_ok()
+                bid = float(price.get("bid", 0) or 0)
+                ask = float(price.get("ask", 0) or 0)
+            except Exception as e:
+                log.warning(f"price unavailable; stops wait, the give-back does not: {e}")
             released = set(grid.load().get("released", []))
             adopted = grid.adopted_ids()
             magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
@@ -3055,13 +3063,18 @@ async def protect_engine():
             # guard. `pos` is already in hand, so this costs no extra read.
             await warn_unmanaged(pos, magics, released, adopted)
             if mine:
+                # FIRST, and whatever else is unavailable: the give-back. It needs
+                # nothing but the profit already in hand, and it is the one action
+                # here that converts a paper gain into a real one.
+                await grid.take_giveback(connection, mine, notify)
                 # Hand the rule to MetaApi first. Once a position carries it, its
                 # protection no longer depends on this loop running at all.
                 await grid.ensure_server_trail(connection, mine, notify)
-                await grid.ensure_entry_stops(connection, mine, bid, ask, notify)
-                gap_floor = await grid.broker_stop_gap(connection, SYMBOL)
-                await grid.apply_breakeven(connection, mine, bid, ask, notify, "",
-                                           gap_floor=gap_floor)
+                if bid and ask:
+                    await grid.ensure_entry_stops(connection, mine, bid, ask, notify)
+                    gap_floor = await grid.broker_stop_gap(connection, SYMBOL)
+                    await grid.apply_breakeven(connection, mine, bid, ask, notify, "",
+                                               gap_floor=gap_floor)
                 # The window no broker stop can reach. Gated on bot_active: tightening a
                 # stop is safe in any state, closing is not, and /pause must mean it.
                 # The same `mine` is reused on purpose - re-reading cost a whole extra
@@ -3071,13 +3084,13 @@ async def protect_engine():
                 # been tightened. Tightening is safe in any state and must keep running
                 # while the system is paused; closing is an action and must not - so
                 # this sits below apply_breakeven and carries the same permission.
-                await grid.take_giveback(connection, mine, notify, allowed=bot_active)
                 # And the owner's own rule: a stranded loser is paid off out of what
                 # the grid has banked, never cut into fresh capital.
-                await grid.rescue_stranded(connection, mine, bid, ask, notify,
-                                           allowed=bot_active)
-                await grid.soft_protect(connection, mine, bid, ask, notify,
-                                        allowed=bot_active)
+                if bid and ask:
+                    await grid.rescue_stranded(connection, mine, bid, ask, notify,
+                                               allowed=bot_active)
+                    await grid.soft_protect(connection, mine, bid, ask, notify,
+                                            allowed=bot_active)
             fast = 1.0 if mine else 3.0
             await asyncio.sleep(fast if reads_are_free() else RPC_TICK_SECS)
         except asyncio.CancelledError:
@@ -3180,25 +3193,15 @@ async def range_engine():
                 # Every position, each with its own peak. Managing only the last one left a
                 # second الشراء trade open for good: it ran into profit, nothing watched it,
                 # and price took the whole gain back.
-                for _p in list(buy_pos):
-                    _id = _p["id"]
-                    curr_profit = float(_p.get("unrealizedProfit", 0.0))
-                    if curr_profit < MIN_CASH_PROFIT:
-                        continue
-                    _peak = max(peak_by_id.get(_id, 0.0), curr_profit)
-                    peak_by_id[_id] = _peak
-                    if curr_profit <= round(_peak - give_back_limit(_peak), 2):
-                        if await safe_close_position(_id):
-                            tracked_positions.pop(_id, None)
-                            peak_by_id.pop(_id, None)
-                            total_profit += curr_profit
-                            buy_count += 1
-                            buy_waiting = True
-                            captured = _peak
-                            peak_buy_profit = 0.0
-                            await notify(act("🟢 اغلق صفقة الشراء الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
-                                         or f"🟢 **حصد قمة الشراء!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
-                            await asyncio.sleep(1.5)
+                # The give-back harvest used to live here, a second copy of the rule
+                # with its own threshold (MIN_CASH_PROFIT), its own peak dictionary
+                # that died with the process, and a reach of exactly two magic
+                # numbers - and the whole loop above it stops under /pause. Two
+                # owners of one rule is why turning the feature "on" kept changing
+                # nothing: whichever copy the owner configured, the other was the one
+                # watching his trade. grid.take_giveback is the only owner now, it
+                # runs in protect_engine which does not stop on /pause, and it covers
+                # every magic the bot owns.
             elif buy_anchor is not None and buy_waiting:
                 if ask >= (buy_anchor + BREAKOUT_DIST):
                     await set_new_buy_anchor(manual=False)
@@ -3217,25 +3220,15 @@ async def range_engine():
                 # Every position, each with its own peak. Managing only the last one left a
                 # second البيع trade open for good: it ran into profit, nothing watched it,
                 # and price took the whole gain back.
-                for _p in list(sell_pos):
-                    _id = _p["id"]
-                    curr_profit = float(_p.get("unrealizedProfit", 0.0))
-                    if curr_profit < MIN_CASH_PROFIT:
-                        continue
-                    _peak = max(peak_by_id.get(_id, 0.0), curr_profit)
-                    peak_by_id[_id] = _peak
-                    if curr_profit <= round(_peak - give_back_limit(_peak), 2):
-                        if await safe_close_position(_id):
-                            tracked_positions.pop(_id, None)
-                            peak_by_id.pop(_id, None)
-                            total_profit += curr_profit
-                            sell_count += 1
-                            sell_waiting = True
-                            captured = _peak
-                            peak_sell_profit = 0.0
-                            await notify(act("🔴 اغلق صفقة البيع الآن!", f"• الربح التقديري: `+{round(curr_profit,2)}$` (القمة كانت `+{round(captured,2)}$`)")
-                                         or f"🔴 **حصد قاع البيع!** القمة: `+{round(captured,2)}$` | الإغلاق: `+{round(curr_profit,2)}$`")
-                            await asyncio.sleep(1.5)
+                # The give-back harvest used to live here, a second copy of the rule
+                # with its own threshold (MIN_CASH_PROFIT), its own peak dictionary
+                # that died with the process, and a reach of exactly two magic
+                # numbers - and the whole loop above it stops under /pause. Two
+                # owners of one rule is why turning the feature "on" kept changing
+                # nothing: whichever copy the owner configured, the other was the one
+                # watching his trade. grid.take_giveback is the only owner now, it
+                # runs in protect_engine which does not stop on /pause, and it covers
+                # every magic the bot owns.
             elif sell_anchor is not None and sell_waiting:
                 if bid <= (sell_anchor - BREAKOUT_DIST):
                     await set_new_sell_anchor(manual=False)

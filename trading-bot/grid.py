@@ -2893,30 +2893,60 @@ async def ensure_server_trail(conn, positions, notify=None):
 # has to be measured here, tick by tick. So the two work together and neither is
 # redundant: this one is tighter and acts first while the bot is alive, and the
 # server-side lock underneath it still holds if the bot is not.
-TRADE_GIVEBACK_PCT = _f("TRADE_GIVEBACK_PCT", 0.0)
+# The owner's rule, in his words: once a trade is +1.50$ up, remember its best, and
+# close it when it gives back a tenth of that best. It shipped working, then stopped,
+# and the reason was never one bug. It was THREE implementations of one idea - this
+# one, the anchor loop in range_harvester, and a MetaApi trailing rule - each with its
+# own threshold, its own switch and its own set of magic numbers, so turning any of
+# them on left the other two off and the behaviour depended on which trade you had.
+# This is now the only one that closes on a give-back.
+#
+# It defaulted to 0.0, which means OFF. A protection whose default is "do nothing"
+# will be off on every machine where nobody remembered to set it, which is every
+# machine.
+TRADE_GIVEBACK_PCT = _f("TRADE_GIVEBACK_PCT", 10.0)
+
+# The profit at which the trailing memory starts. Deliberately its own setting and
+# not BE_LOCK_CASH: the old code armed on the amount it LOCKS, which is a different
+# question from the amount at which it starts WATCHING, and 0.10$ meant it armed on
+# noise.
+GIVEBACK_ARM_CASH = _f("GIVEBACK_ARM_CASH", 1.50)
 
 
 def giveback_floor(peak):
-    """The profit at which a trade that peaked at `peak` should be taken.
+    """The profit at which a trade that peaked at `peak` is taken: peak x 0.90.
 
-    Never below BE_LOCK_CASH: the locked amount is a promise, and a percentage of a
-    small peak can sit under it (15% off a $0.55 peak is $0.47, which would hand back
-    part of a $0.50 lock).
+    No floor under it any more. The old version returned max(peak*0.9, BE_LOCK_CASH),
+    so whenever the lock was the larger of the two the trade closed at the lock
+    instead of at the give-back - the rule the owner asked for, silently replaced by
+    a different one whenever his settings happened to cross.
     """
     if TRADE_GIVEBACK_PCT <= 0 or peak <= 0:
         return None
-    return round(max(peak * (1.0 - TRADE_GIVEBACK_PCT / 100.0), BE_LOCK_CASH), 2)
+    return round(peak * (1.0 - TRADE_GIVEBACK_PCT / 100.0), 2)
 
 
 async def take_giveback(conn, positions, notify=None, allowed=True):
-    """Close any trade that has handed back more than its share of the peak.
+    """Close any trade that has handed back more than its share of its own best.
 
-    Arms only once a position has earned BE_LOCK_CASH, so it can never fire on a
-    trade that was never protected in the first place.
+    NOT gated on the system switch, and that is the correction. /pause is documented
+    to the owner as "freeze the bot WITHOUT closing anything - the guard keeps
+    running", and then the guard was wired to stop with everything else. Refusing to
+    open is a different decision from refusing to protect what is already open, and
+    conflating them meant every pause quietly removed the protection from live money.
+
+    `allowed` is still accepted so existing callers keep working, and still blocks
+    the rest, but it no longer blocks THIS: there is no state of the system in which
+    letting a won trade round-trip is the safer answer.
+
+    This is bot-side, not broker-side. It depends on this process being alive and on
+    MetaApi answering, and the close goes out at market, so what is actually realised
+    can be below the trigger. It is not a guarantee and must not be described as one;
+    the broker-side stop is the thing that holds when this does not.
     """
-    if not (allowed and TRADE_GIVEBACK_PCT > 0) or not hasattr(conn, "close_position"):
+    if TRADE_GIVEBACK_PCT <= 0 or not hasattr(conn, "close_position"):
         return 0
-    taken = []
+    taken, failed = [], []
     for p in positions:
         pid = p.get("id")
         try:
@@ -2924,23 +2954,39 @@ async def take_giveback(conn, positions, notify=None, allowed=True):
         except (TypeError, ValueError):
             continue
         peak = note_peak(pid, profit)
-        if peak < BE_LOCK_CASH or BE_LOCK_CASH <= 0:
-            continue                      # not yet worth protecting
+        if peak < GIVEBACK_ARM_CASH:
+            continue                      # never reached the arming profit
         floor = giveback_floor(peak)
         if floor is None or profit > floor:
             continue
         try:
             await asyncio.wait_for(conn.close_position(pid), timeout=8.0)
-            taken.append((pid, peak, profit))
-            forget_peak(pid)
         except Exception as e:
+            # An error, or a timeout, is NOT a close. Say so and leave the peak in
+            # place so the next tick tries again on the same trade, rather than
+            # reporting a harvest that never happened.
+            failed.append((pid, str(e)[:120]))
             log.warning(f"give-back close refused on {pid}: {e}")
+            continue
+        taken.append((pid, peak, profit))
+        forget_peak(pid)
+        # Drop it from the caller's list too. Everything after this in the pass -
+        # the trail refresh, the break-even move - runs on the SAME list, and a
+        # position that was closed a line ago is still in it. apply_breakeven then
+        # called note_peak on the dead trade and wrote its peak straight back, so a
+        # harvested trade left a peak behind for an id that no longer exists, and
+        # the next ticket to reuse that number would inherit it.
+        positions[:] = [q for q in positions if q.get("id") != pid]
+    if failed and notify:
+        lines = "\n".join(f"\u2022 `{i}` \u2014 `{w}`" for i, w in failed)
+        await notify("\U0001f6a8 *\u0645\u0627 \u0643\u062f\u0631\u062a \u0623\u063a\u0644\u0642 \u0639\u0646\u062f \u0627\u0644\u0627\u0631\u062a\u062f\u0627\u062f*\n" + lines +
+                     "\n\u2022 \u0631\u0627\u062d \u0623\u0639\u064a\u062f \u0627\u0644\u0645\u062d\u0627\u0648\u0644\u0629 \u2014 \u0648\u0625\u0630\u0627 \u0645\u0633\u062a\u0639\u062c\u0644 \u0633\u0643\u0651\u0631\u0647\u0627 \u0645\u0646 MT5")
     if taken and notify:
         tot = round(sum(x[2] for x in taken), 2)
-        lines = "\n".join(f"• قمتها `{pk:g}$` ← أغلقتها على `{pr:g}$`"
-                           for _i, pk, pr in taken)
-        await notify(f"🎯 *حصدت `{len(taken)}` صفقة على ارتداد "
-                     f"`{TRADE_GIVEBACK_PCT:g}%`* — المجموع `{tot:+g}$`\n{lines}")
+        lines = "\n".join(f"\u2022 \u0642\u0645\u062a\u0647\u0627 `{pk:g}$` \u2190 \u0623\u063a\u0644\u0642\u062a\u0647\u0627 \u0639\u0644\u0649 `{pr:g}$`"
+                          for _i, pk, pr in taken)
+        await notify(f"\U0001f3af *\u062d\u0635\u062f\u062a `{len(taken)}` \u0635\u0641\u0642\u0629 \u0639\u0644\u0649 \u0627\u0631\u062a\u062f\u0627\u062f "
+                     f"`{TRADE_GIVEBACK_PCT:g}%`* \u2014 \u0627\u0644\u0645\u062c\u0645\u0648\u0639 `{tot:+g}$`\n{lines}")
     return len(taken)
 
 
@@ -2989,7 +3035,28 @@ def note_peak(pid, profit):
     if peak > 0 and peak > _be_peaks.get(key, 0.0):
         _be_peaks[key] = peak
         _peaks_dirty = True
+        # Once a peak is high enough to decide a close, it goes to disk NOW rather
+        # than waiting out the debounce. The twenty-second window was twenty seconds
+        # in which a crash threw away the number the give-back exit is measured from,
+        # and the exit then used whatever the trade happened to be worth on restart -
+        # which is lower, every time, because that is why it restarted mattering.
+        if peak >= GIVEBACK_ARM_CASH:
+            flush_peaks()
     return peak
+
+
+def flush_peaks():
+    """Write the peaks out now. Safe to call often; it only writes when something moved."""
+    global _peaks_dirty, _peaks_saved_at
+    if not _peaks_dirty:
+        return
+    try:
+        state = load()
+        state["peaks"] = {k: round(v, 2) for k, v in _be_peaks.items()}
+        save(state)
+        _peaks_dirty, _peaks_saved_at = False, time.time()
+    except Exception as e:
+        log.warning(f"could not persist peaks: {e}")
 
 
 def peak_of(pid):
