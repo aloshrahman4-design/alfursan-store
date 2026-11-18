@@ -18,6 +18,7 @@ refuses to re-arm. The second one is the account saver and it does not restart b
 
 import asyncio
 import entry_safety as safety   # whose trade is it, and may we place this?
+from entry_safety import require_entry_permission
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -1374,6 +1375,8 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                 _tsl = server_trail()
                 if _tsl:
                     opts["trailingStopLoss"] = _tsl   # protected from the first tick
+                require_entry_permission(stop_loss=entry_stop(price_at, sign > 0), lot=lot,
+                                         conn=conn)
                 res = await asyncio.wait_for(
                     maker(symbol=symbol, volume=lot, open_price=price_at,
                           stop_loss=entry_stop(price_at, sign > 0),
@@ -1381,6 +1384,14 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                 remember_order((res or {}).get("orderId"))
                 placed += 1
                 placed_lots = round(placed_lots + lot, 2)
+            except safety.EntryBlocked as e:
+                # Our own lock, not the broker. Printing this under "the broker
+                # said" sent the owner looking for a problem at his broker.
+                failed += 1
+                why = "🔒 " + (str(e).strip()[:160] or "entry locked")
+                if why not in reasons:
+                    reasons.append(why)
+                continue
             except Exception as e:
                 failed += 1
                 why = str(e).strip()[:160] or e.__class__.__name__
@@ -1395,7 +1406,9 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
         # the broker had said exactly what was wrong, every time, and it went to the log
         # file the owner cannot read from his phone. Hand him what the broker said.
         detail = "\n".join(f"• `{r}`" for r in reasons[:3]) or "• (الوسيط ما رد بسبب)"
-        return False, (f"ما انحطت ولا أمر. رد الوسيط:\n{detail}\n"
+        src = ("قفل الأمان رفض" if any(r.startswith("🔒") for r in reasons)
+               else "رد الوسيط")
+        return False, (f"ما انحطت ولا أمر. {src}:\n{detail}\n"
                        f"• الأداة `{symbol}` · اللوت `{lots[0]:g}` · العقد "
                        f"`{GRID_CONTRACT:g}` · الخطوة `{GRID_STEP:g}$`"
                        + (f"\n• الوقف الثابت `{GRID_STOP_DIST:g}$` — على أداة بسعر "
@@ -2111,6 +2124,14 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
             furthest = max(side_orders, key=lambda o: abs(float(o.get("openPrice", 0) or 0) - ref))
             if abs(float(furthest.get("openPrice", 0) or 0) - ref) <= abs(at - ref):
                 continue                  # nothing is further out than the level we want
+            # Never remove a protective/working pending level unless its replacement
+            # is permitted. In fail-closed mode, leave the existing ladder intact.
+            try:
+                require_entry_permission(stop_loss=entry_stop(at, sign > 0), lot=lot,
+                                     conn=conn)
+            except Exception as e:
+                log.warning(f"refill blocked before recycling existing order: {e}")
+                continue
             try:
                 await asyncio.wait_for(conn.cancel_order(furthest["id"]), timeout=6.0)
                 recycled += 1
@@ -2122,6 +2143,8 @@ async def refill_gaps(conn, symbol, positions, orders, notify=None, skip_magic=N
             _tsl = server_trail()
             if _tsl:
                 _opts["trailingStopLoss"] = _tsl
+            require_entry_permission(stop_loss=entry_stop(at, sign > 0), lot=lot,
+                                     conn=conn)
             res = await asyncio.wait_for(
                 maker(symbol=symbol, volume=lot, open_price=at,
                       stop_loss=entry_stop(at, sign > 0),

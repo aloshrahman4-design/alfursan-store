@@ -270,6 +270,7 @@ except Exception as _e:
 # on - and silence is the failure this whole module exists to end. It is in
 # CODE_FILES, so /update fetches it and the boot check shouts if it is missing.
 import entry_safety as safety
+from entry_safety import require_entry_permission
 
 try:
     import datafeed  # free prices, so analysis never keeps a billed account deployed
@@ -1894,6 +1895,7 @@ async def set_new_buy_anchor(manual=False):
         if ask == 0:
             return
         buy_anchor, buy_waiting, peak_buy_profit = ask, False, 0.0
+        await refuse_entry("market=True")
         await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 🚀"
         await notify(act("🟢 افتح صفقة شراء (BUY)", f"• السعر التقريبي: `{buy_anchor}`")
@@ -1912,6 +1914,7 @@ async def set_new_sell_anchor(manual=False):
         if bid == 0:
             return
         sell_anchor, sell_waiting, peak_sell_profit = bid, False, 0.0
+        await refuse_entry("market=True")
         await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
         src = "يدويا 🎯" if manual else "تلقائيا 📉"
         await notify(act("🔴 افتح صفقة بيع (SELL)", f"• السعر التقريبي: `{sell_anchor}`")
@@ -2468,6 +2471,27 @@ async def handle_grid_command(text):
     await send_long(grid.status_text(balance, px, sp), markup=keyboard())
 
 
+_entry_refusal_at = 0.0
+
+
+async def refuse_entry(what=""):
+    """Let the interlock stop an entry WITHOUT taking the loop down with it.
+
+    The raise was planted inline in four market-order paths, three of them inside
+    loops whose except clause does not exist. A lock that kills the engine also
+    kills the protection running beside it - and the whole point of this lock is
+    that closing and guarding stay alive while opening does not.
+    """
+    global _entry_refusal_at
+    locked, line = safety.entry_lock_state(connection)
+    if not locked:
+        return
+    if time.time() - _entry_refusal_at > 900:
+        _entry_refusal_at = time.time()
+        await notify("%s\n• ما فتحت صفقة جديدة — والحراسة على المفتوح شغالة مثل ما هي" % line)
+    raise safety.EntryBlocked("entry refused by the interlock %s" % what)
+
+
 async def handle_rollback():
     """Put the previous version back after a bad update, from Telegram.
 
@@ -2827,6 +2851,7 @@ async def range_engine():
                     await asyncio.sleep(2.0)
                 elif ask <= (buy_anchor + 0.25):
                     buy_waiting, peak_buy_profit = False, 0.0
+                    await refuse_entry("market=True")
                     await asyncio.wait_for(connection.create_market_buy_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_BUY}), timeout=5.0)
                     await notify(act("🟢 افتح شراء (عودة للارتكاز)", f"• الارتكاز: `{buy_anchor}`")
                                  or f"🟢 **فتح شراء جديد لعودة السعر لارتكاز (`{buy_anchor}`)**")
@@ -2863,6 +2888,7 @@ async def range_engine():
                     await asyncio.sleep(2.0)
                 elif bid >= (sell_anchor - 0.25):
                     sell_waiting, peak_sell_profit = False, 0.0
+                    await refuse_entry("market=True")
                     await asyncio.wait_for(connection.create_market_sell_order(symbol=SYMBOL, volume=TRADE_LOT, options={"magic": MAGIC_SELL}), timeout=5.0)
                     await notify(act("🔴 افتح بيع (عودة للارتكاز)", f"• الارتكاز: `{sell_anchor}`")
                                  or f"🔴 **فتح بيع جديد لعودة السعر لارتكاز (`{sell_anchor}`)**")
