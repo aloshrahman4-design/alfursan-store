@@ -16,7 +16,7 @@ grep -qs "^FORCE_IPV4=1" "$DIR/.env" && CURL4="-4" || CURL4=""
 # holds every protection - was missing from all three. This script would then report
 # a successful deploy while leaving the old grid.py in place. The bot's own /update
 # reads this set from CODE_FILES, which is why that path was correct and this was not.
-FILES=(range_harvester.py intel.py datafeed.py broker_capital.py broker_paper.py grid.py)
+FILES=(range_harvester.py intel.py datafeed.py broker_capital.py broker_paper.py grid.py entry_safety.py)
 
 echo "==> downloading from branch: $BRANCH"
 for f in "${FILES[@]}"; do
@@ -38,7 +38,7 @@ echo "==> version now on disk"
 ./venv/bin/python - <<'EOF'
 import hashlib, os
 F = ("range_harvester.py", "intel.py", "datafeed.py",
-     "broker_capital.py", "broker_paper.py", "grid.py")
+     "broker_capital.py", "broker_paper.py", "grid.py", "entry_safety.py")
 h = hashlib.sha256()
 for n in sorted(F):
     h.update(n.encode())

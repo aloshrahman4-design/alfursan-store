@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
@@ -110,6 +111,7 @@ SETTABLE_KEYS = {
     "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
     "BROKER": "منصة التنفيذ (metaapi أو capital أو paper)",
+    "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
     "CAPITAL_API_KEY": "مفتاح Capital.com",
     "CAPITAL_EMAIL": "إيميل Capital.com",
     "CAPITAL_PASSWORD": "كلمة سر Capital.com",
@@ -209,7 +211,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
@@ -261,6 +263,13 @@ try:
 except Exception as _e:
     grid = None
     log.warning(f"grid module unavailable: {_e}")
+
+# Not wrapped in a try. Every other optional module degrades to a feature being
+# absent; this one decides what the bot is allowed to TOUCH. A silent fallback
+# here would mean the bot carrying on with no rule about whose money it is acting
+# on - and silence is the failure this whole module exists to end. It is in
+# CODE_FILES, so /update fetches it and the boot check shouts if it is missing.
+import entry_safety as safety
 
 try:
     import datafeed  # free prices, so analysis never keeps a billed account deployed
@@ -926,7 +935,131 @@ async def handle_setkey(text, chat_id, message_id):
 
 
 CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",
-              "broker_paper.py", "grid.py")
+              "broker_paper.py", "grid.py", "entry_safety.py")
+
+
+BACKUP_DIR = os.path.join(BASE_DIR, ".backup")
+MIN_FILE_BYTES = int(os.environ.get("UPDATE_MIN_BYTES", "400"))
+
+
+def _move(src, dst):
+    """Atomic within a filesystem, and needs no spare disk.
+
+    The copy fallback is for ONE error: the two paths on different mounts, which
+    os.replace cannot do. Catching every OSError here would have turned a full
+    disk - the error this whole design exists to survive - back into a copy, and
+    the copy into the same failure one layer down.
+    """
+    try:
+        os.replace(src, dst)
+    except OSError as e:
+        if getattr(e, "errno", None) != errno.EXDEV:
+            raise
+        shutil.copy2(src, dst)
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+
+def _sha(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def sanity_check(tmpdir, files):
+    """Reject a download that arrived truncated, empty, or as someone's error page."""
+    problems = []
+    for name in files:
+        path = os.path.join(tmpdir, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            problems.append("• `%s` — ما وصل أصلاً" % name)
+            continue
+        if size < MIN_FILE_BYTES:
+            problems.append("• `%s` — `%d` بايت فقط، هذا مو ملف كامل" % (name, size))
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(400).lstrip().lower()
+        except OSError as e:
+            problems.append("• `%s` — ما أكدر أقراه: %s" % (name, str(e)[:60]))
+            continue
+        if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+            problems.append("• `%s` — وصلت صفحة HTML مو كود" % name)
+    return "\n".join(problems)
+
+
+def swap_in(tmpdir, files):
+    """Install the downloaded files, keeping a restorable copy of what was running.
+
+    Everything moves with os.replace rather than copy. A move inside one filesystem
+    is atomic and needs no extra disk, which matters because the commonest reason an
+    install fails is a full disk - and a rollback that has to COPY fails for exactly
+    the same reason, right when it is the only thing standing between the owner and
+    a dead bot. .update and .backup both live inside BASE_DIR, so the move is always
+    within one filesystem; the copy path below is only for the odd mount.
+
+    Returns an error string, or None. On any failure every file is put back, so the
+    bot keeps running the version it had rather than a half-replaced mixture.
+    """
+    try:
+        if os.path.isdir(BACKUP_DIR):
+            shutil.rmtree(BACKUP_DIR, ignore_errors=True)
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        for name in files:
+            cur = os.path.join(BASE_DIR, name)
+            if os.path.exists(cur):
+                _move(cur, os.path.join(BACKUP_DIR, name))
+    except Exception as e:
+        restore_backup(files)             # put back whatever already moved out
+        return ("\u26a0\ufe0f \u0645\u0627 \u0643\u062f\u0631\u062a \u0622\u062e\u0630 \u0646\u0633\u062e\u0629 \u0627\u062d\u062a\u064a\u0627\u0637\u064a\u0629\u060c \u0641\u0645\u0627 \u0628\u062f\u0651\u0644\u062a \u0634\u064a: `%s`" % str(e)[:200])
+
+    done = []
+    try:
+        for name in files:
+            src, dst = os.path.join(tmpdir, name), os.path.join(BASE_DIR, name)
+            want = _sha(src)
+            _move(src, dst)
+            # Verify the bytes that landed, not the bytes we meant to write.
+            if _sha(dst) != want:
+                raise OSError("%s: \u0627\u0644\u0645\u0643\u062a\u0648\u0628 \u0645\u0648 \u0646\u0641\u0633 \u0627\u0644\u0645\u0646\u0632\u0651\u0644" % name)
+            done.append(name)
+    except Exception as e:
+        restored, failed = restore_backup(files)
+        if failed:
+            tail = ("\n\U0001f6a8 *\u0648\u0645\u0627 \u0643\u062f\u0631\u062a \u0623\u0631\u062c\u0651\u0639*: `%s` \u2014 \u0644\u0627 \u062a\u0639\u064a\u062f \u0627\u0644\u062a\u0634\u063a\u064a\u0644\u060c \u0631\u0627\u062c\u0639\u0646\u064a."
+                    % ", ".join(failed))
+        else:
+            tail = "\n\u2705 \u0631\u062c\u0651\u0639\u062a `%d` \u0645\u0644\u0641 \u0644\u0644\u0646\u0633\u062e\u0629 \u0627\u0644\u0633\u0627\u0628\u0642\u0629." % restored
+        return ("\u26a0\ufe0f \u0641\u0634\u0644 \u0627\u0644\u062a\u062b\u0628\u064a\u062a \u0639\u0646\u062f `%d` \u0645\u0646 `%d`: `%s`%s"
+                % (len(done) + 1, len(files), str(e)[:200], tail))
+    return None
+
+
+def restore_backup(files=None):
+    """Put the previous version back. Returns (restored count, names that failed)."""
+    names = list(files or CODE_FILES + ("requirements.txt",))
+    restored, failed = 0, []
+    for name in names:
+        src = os.path.join(BACKUP_DIR, name)
+        if not os.path.exists(src):
+            continue
+        try:
+            # Copy, not move: a second /rollback after a bad restart must still work.
+            shutil.copy2(src, os.path.join(BASE_DIR, name))
+            restored += 1
+        except Exception as e:
+            log.error("rollback failed for %s: %s" % (name, e))
+            failed.append(name)
+    return restored, failed
 
 
 def self_update():
@@ -967,12 +1100,26 @@ def self_update():
             except subprocess.TimeoutExpired:
                 log.warning("pip install timed out; continuing with the packages already installed")
 
+        # An EMPTY file compiles perfectly, and so does a truncated one that happens
+        # to end on a statement boundary. curl -f catches a 404, but a proxy or a
+        # captive portal can answer 200 with an HTML page. Neither was checked, and
+        # either would have installed cleanly and left the bot gutted.
+        bad = sanity_check(tmpdir, files)
+        if bad:
+            return "⚠️ التحميل وصل ناقص أو غلط، أُلغي التحديث:\n" + bad
+
         comp = subprocess.run([py, "-m", "py_compile"] + [os.path.join(tmpdir, n) for n in CODE_FILES],
                               capture_output=True, text=True, timeout=180)
         if comp.returncode != 0:
             return f"⚠️ الكود الجديد فيه خطأ، أُلغي التحديث:\n`{comp.stderr.strip()[:400]}`"
-        for name in files:
-            shutil.copy2(os.path.join(tmpdir, name), os.path.join(BASE_DIR, name))
+
+        # Back up what is running, then swap. The old loop copied file by file with
+        # no backup: a failure halfway through - disk full, a permission change, the
+        # process killed - left a NEW range_harvester.py against an OLD grid.py,
+        # a combination nobody has tested and no error message describes.
+        err = swap_in(tmpdir, files)
+        if err:
+            return err
         return None
     except subprocess.TimeoutExpired as e:
         return f"⚠️ التحديث تجاوز الوقت المسموح عند: `{str(e)[:150]}`\nجرب مرة ثانية."
@@ -998,6 +1145,9 @@ HELP_TEXT = (
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
+    "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
+    "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
+    "• `/setkey branch <اسم الفرع>` — من أي فرع يسحب `/update`\n"
     "• /perf 30 — الأداء الحقيقي من صفقاتك المغلقة عند الوسيط\n"
     "• /why — يمشي بكل بوابات المحرك ويقول أي وحدة واقفة\n"
     "• `/setkey account <id>` — رقم الحساب بـ MetaApi\n"
@@ -2318,6 +2468,31 @@ async def handle_grid_command(text):
     await send_long(grid.status_text(balance, px, sp), markup=keyboard())
 
 
+async def handle_rollback():
+    """Put the previous version back after a bad update, from Telegram.
+
+    /update keeps a copy of what was running. Without a way to ask for it back the
+    owner's only recovery was SSH, which he does not have - so a working backup he
+    could not reach was the same as no backup at all.
+    """
+    names = CODE_FILES + ("requirements.txt",)
+    have = [n for n in names if os.path.exists(os.path.join(BACKUP_DIR, n))]
+    if not have:
+        await send_long(
+            "ماكو نسخة احتياطية محفوظة — تننشأ أول مرة تسوي بيها `/update` "
+            "بالنسخة الجديدة.", markup=keyboard())
+        return
+    await send_long("⏳ أرجّع النسخة السابقة...")
+    restored, failed = restore_backup(names)
+    if failed:
+        await send_long("🚨 رجّعت `%d` وفشلت بـ: `%s`"
+                        % (restored, ", ".join(failed)), markup=keyboard())
+        return
+    await send_long("✅ رجّعت `%d` ملف. جاري إعادة التشغيل..." % restored)
+    await asyncio.sleep(1)
+    os._exit(0)          # systemd Restart=always brings it back on the old code
+
+
 async def handle_adopt_command(text):
     """Take over, or hand back, a trade the bot did not open.
 
@@ -2488,11 +2663,12 @@ async def protect_engine():
             adopted = grid.adopted_ids()
             magics = (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS
             pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
-            # Ours by magic, or handed to us by name with /adopt. Either way the
-            # release list wins: a trade given back is never taken back silently.
+            # Ownership is decided in ONE place now - entry_safety.is_ours - so a
+            # hand-opened trade (magic 0) cannot become ours because some call site
+            # forgot to check. The release list still wins over an adoption there.
             mine = [p for p in pos
-                    if p.get("symbol") == SYMBOL and p.get("id") not in released
-                    and (p.get("magic") in magics or str(p.get("id")) in adopted)]
+                    if p.get("symbol") == SYMBOL
+                    and safety.is_ours(p, magics, adopted, released)]
             # Six rounds were spent asking why a winning trade carried no stop, each
             # one guessed from a photo of the chart, because a position the bot does
             # not own gets no stop, no trail and no exit AND SAYS NOTHING. The
@@ -3048,6 +3224,15 @@ async def process_update(update):
                         await send_long(head + accounts_block(accounts)
                                         + "\n\n⚠️ بدّل الحساب بعد `/stop` بس، حتى ما تترك "
                                           "صفقات مفتوحة بلا حارس.", markup=keyboard())
+            elif text.startswith("/reconcile") or text.startswith("/مطابقة"):
+                if grid is None or connection is None:
+                    await send_long("محتاج اتصال بالوسيط أول — `/check`.", markup=keyboard())
+                else:
+                    await send_long(await grid.reconcile_report(
+                        connection, SYMBOL, (MAGIC_BUY, MAGIC_SELL) + grid.MAGICS),
+                        markup=keyboard())
+            elif text.startswith("/rollback"):
+                await handle_rollback()
             elif text.startswith("/live"):
                 await handle_go_live()
             elif text.startswith("/adopt") or text.startswith("/unadopt"):

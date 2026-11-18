@@ -17,6 +17,7 @@ refuses to re-arm. The second one is the account saver and it does not restart b
 """
 
 import asyncio
+import entry_safety as safety   # whose trade is it, and may we place this?
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -126,6 +127,11 @@ _armfail_said = 0.0    # last 'could not arm, still trying' notice
 # single bad setting latched a permanent halt that outlived every fix for it.
 ARM_FAIL_HALT = max(1, _i("ARM_FAIL_HALT", 10))
 ARM_RETRY_SECS = _f("ARM_RETRY_SECS", 30.0)
+
+
+# How old the last successful broker read may be before the bot refuses to OPEN
+# anything. Generous on purpose: this is about a dead connection, not a slow tick.
+ENTRY_MAX_BLIND_SECS = _f("ENTRY_MAX_BLIND_SECS", 180.0)
 
 
 def note_read_ok():
@@ -1304,6 +1310,41 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
 
     placed, failed, placed_lots = 0, 0, 0.0
     reasons = []                      # what the broker actually said, for the user
+    skipped_dup = 0
+    # What is ALREADY in the market. Arming twice - a re-centre, a restart, two
+    # /grid on in a row - used to stack a second ladder on top of the first at the
+    # same prices, doubling the exposure with no message anywhere. One read.
+    #
+    # And if that read FAILS we must not carry on with an empty list, because an
+    # empty list means "nothing is out there" and that is precisely the sentence
+    # this project has been punished for four times. Being unable to see the book
+    # is a reason to place nothing, not a reason to place everything. Protection
+    # is untouched by this: it only ever tightens a stop.
+    #
+    # A broker that CANNOT be asked is not the same as an ask that FAILED. The paper
+    # broker and some adapters expose no order book at all; refusing to arm on those
+    # would be a lockout dressed as caution. Only a reader that exists and then threw
+    # means we are blind.
+    _open, _book_ok = [], True
+    for _getter in ("get_orders", "get_positions"):
+        _fn = getattr(conn, _getter, None)
+        if _fn is None:
+            continue
+        try:
+            _open += list(await asyncio.wait_for(_fn(), timeout=6.0) or [])
+        except Exception as e:
+            log.warning(f"could not read {_getter} before arming: {e}")
+            _book_ok = False
+            break
+    _open = [o for o in _open if o.get("symbol") == symbol]
+    _ok, _why = safety.entry_allowed(time.time(), ENTRY_MAX_BLIND_SECS,
+                                     connected=_book_ok)
+    if not _ok:
+        return False, ("ما نصبت: " + _why + " — ما أكدر أشوف شنو "
+                       "منصوب أصلاً، والنصب على عمى يضاعف المخاطرة. "
+                       "الحراسة على الصفقات المفتوحة مستمرة.")
+    # Half a step: two rungs closer together than that are the same rung twice.
+    _dup_tol = max(GRID_STEP * 0.5, 0.01)
     # GRID_MAX_POSITIONS is a promise about OPEN trades, but what enforces it is how
     # many triggers are sitting in the market. Arming six levels a side on both sides
     # leaves twelve, against a cap of eight - and a whipsaw fills them faster than the
@@ -1324,6 +1365,9 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                 continue              # never hedge past flat and open fresh exposure
             if max_orders is not None and placed >= max_orders:
                 continue              # see below: never leave more triggers than the cap
+            if safety.would_duplicate(price_at, sign > 0, _open, _dup_tol):
+                skipped_dup += 1
+                continue              # this rung is already in the market
             tp = round(price_at + sign * dist, 2) if dist else None
             try:
                 opts = {"magic": magic}
@@ -1343,6 +1387,9 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
                 if why not in reasons:
                     reasons.append(why)
                 log.warning(f"grid level {i} at {price_at} failed: {e}")
+    if not placed and skipped_dup:
+        return False, (f"كل المستويات منصوبة من قبل (`{skipped_dup}` رتبة) — "
+                       f"ما ضاعفت شي. `/grid reset` يلغي وينصب من جديد.")
     if not placed:
         # "Check the symbol and the lot size" was a guess printed INSTEAD of the answer:
         # the broker had said exactly what was wrong, every time, and it went to the log
@@ -1376,9 +1423,11 @@ async def arm(conn, symbol, notify, only_magic=None, max_lots=None, why="",
     # zero spread, so the cycle-cost line - the warning that a round trip eats a
     # third of a typical exit - was silently dropped from exactly that message. The
     # real bid and ask are right here; there was never a reason not to pass them.
+    dup = (f"\n♻️ تجاوزت `{skipped_dup}` رتبة منصوبة من قبل — ما ضاعفت المخاطرة."
+           if skipped_dup else "")
     if notify:
         await notify(f"{head}\n\n{plan_text(balance, center, round(ask - bid, 5))}\n"
-                     f"• أوامر معلّقة: `{placed}`{note}{rec}")
+                     f"• أوامر معلّقة: `{placed}`{note}{rec}{dup}")
     return True, None
 
 
@@ -2352,6 +2401,47 @@ async def history_report(conn, symbol, days=30, lot=None, contract=None):
          f"الفرق `{round(need - rate, 1)}` نقطة" if rate < need else
          f"✅ نسبة نجاحك فوق المطلوب بـ`{round(rate - need, 1)}` نقطة"),
     ])
+
+
+async def reconcile_report(conn, symbol, magics=None):
+    """What the bot believes, next to what the broker actually holds.
+
+    Four separate defects in this project were the same shape: the bot could not
+    see something, so it behaved as though it were not there. This asks the broker
+    and prints the difference instead of assuming they agree.
+    """
+    try:
+        orders = list(await asyncio.wait_for(conn.get_orders(), timeout=8.0) or [])
+        positions = list(await asyncio.wait_for(conn.get_positions(), timeout=8.0) or [])
+    except Exception as e:
+        return f"⚠️ ما كدرت أقرا من الوسيط: `{str(e)[:200]}`"
+    orders = [o for o in orders if o.get("symbol") == symbol]
+    positions = [p for p in positions if p.get("symbol") == symbol]
+    st = load()
+    r = safety.reconcile(
+        expected_order_ids=st.get("pending_ids", []),
+        broker_orders=orders, broker_positions=positions,
+        magics=tuple(magics or MAGICS), trigger_cash=BE_TRIGGER_CASH,
+        adopted=st.get("adopted", []), released=st.get("released", []),
+        tolerance=max(GRID_STEP * 0.5, 0.01))
+    out = [f"🧮 *مطابقة `{symbol}`*",
+           await account_line(conn),
+           f"عند الوسيط: `{len(orders)}` أمر معلّق · `{len(positions)}` صفقة مفتوحة"]
+    rows = []
+    if r["vanished"]:
+        rows.append(f"❌ `{len(r['vanished'])}` أمر أحسبه موجود وماكو عند الوسيط")
+    if r["unexpected"]:
+        rows.append(f"❓ `{len(r['unexpected'])}` أمر بماغيك البوت ما أتابعه")
+    if r["unprotected"]:
+        ids = ", ".join(f"`{p.get('id')}`" for p in r["unprotected"][:5])
+        rows.append(f"🚨 `{len(r['unprotected'])}` صفقة رابحة بلا وقف حقيقي: {ids}")
+    if r["duplicates"]:
+        rows.append(f"♻️ `{len(r['duplicates'])}` مستوى مكرر (شبكة منصوبة مرتين)")
+    if r["foreign"]:
+        rows.append(f"👤 `{len(r['foreign'])}` صفقة مو من البوت — ما يلمسها (`/trades`)")
+    out.append("\n".join(rows) if rows
+               else "✅ كل شي مطابق — ماكو فرق بين اللي أحسبه واللي عند الوسيط.")
+    return "\n\n".join(out)
 
 
 async def account_line(conn):
