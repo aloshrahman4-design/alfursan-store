@@ -11,25 +11,40 @@ cd "$DIR"
 # prefer IPv4 when the host is configured for it: unroutable IPv6 makes curl hang
 grep -qs "^FORCE_IPV4=1" "$DIR/.env" && CURL4="-4" || CURL4=""
 
+# One list, used for downloading, compiling and swapping. It was written out three
+# times by hand, and grid.py - the largest module in the project, and the one that
+# holds every protection - was missing from all three. This script would then report
+# a successful deploy while leaving the old grid.py in place. The bot's own /update
+# reads this set from CODE_FILES, which is why that path was correct and this was not.
+FILES=(range_harvester.py intel.py datafeed.py broker_capital.py broker_paper.py grid.py)
+
 echo "==> downloading from branch: $BRANCH"
-curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/range_harvester.py" -o range_harvester.py.new
-curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/intel.py" -o intel.py.new
-curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/datafeed.py" -o datafeed.py.new
-curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/broker_capital.py" -o broker_capital.py.new
-curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/broker_paper.py" -o broker_paper.py.new
+for f in "${FILES[@]}"; do
+  curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/$f" -o "$f.new"
+done
 curl -fsSL ${CURL4:-} --connect-timeout 15 --retry 2 "$RAW/requirements.txt" -o requirements.txt
 
 echo "==> installing/updating python packages"
 ./venv/bin/pip install -q -r requirements.txt
 
 echo "==> compile check"
-./venv/bin/python -m py_compile range_harvester.py.new intel.py.new datafeed.py.new broker_capital.py.new broker_paper.py.new
-mv range_harvester.py.new range_harvester.py
-mv intel.py.new intel.py
-mv datafeed.py.new datafeed.py
-mv broker_capital.py.new broker_capital.py
-mv broker_paper.py.new broker_paper.py
+# Compile them TOGETHER and swap only if every one of them is good: a half-swapped
+# set is a bot that imports a new range_harvester against an old grid.
+./venv/bin/python -m py_compile "${FILES[@]/%/.new}"
+for f in "${FILES[@]}"; do mv "$f.new" "$f"; done
 echo "COMPILE_OK"
+
+echo "==> version now on disk"
+./venv/bin/python - <<'EOF'
+import hashlib, os
+F = ("range_harvester.py", "intel.py", "datafeed.py",
+     "broker_capital.py", "broker_paper.py", "grid.py")
+h = hashlib.sha256()
+for n in sorted(F):
+    h.update(n.encode())
+    h.update(open(n, "rb").read() if os.path.exists(n) else b"")
+print("FINGERPRINT:", h.hexdigest()[:7])
+EOF
 
 echo "==> restarting service"
 # Passwordless sudo is the normal path; if it is not available, killing the process is
