@@ -3020,18 +3020,30 @@ async def apply_breakeven(conn, positions, bid, ask, notify=None, label="", gap_
             continue                      # already at or better than break-even
         try:
             await asyncio.wait_for(conn.modify_position(p["id"], stop_loss=target), timeout=8.0)
-            moved.append((p["id"], target))
+            moved.append((p["id"], target, current, locked, peak))
         except Exception as e:
             log.warning(f"break-even move failed on {p.get('id')}: {e}")
     live = {p.get("id") for p in positions}
     prune_peaks(live)
     for gone in [k for k in _be_waiting if k not in live]:
         _be_waiting.pop(gone, None)
-    for pid, _ in moved:
+    for pid, *_ in moved:
         _be_waiting.pop(pid, None)        # it is covered now; the warning can fire again
     if moved and notify:
         tail = (f"\nوالوقف يتبع الربح على بُعد `{BE_TRAIL_CASH:g}$` من القمة."
                 if BE_TRAIL_CASH > 0 else "")
+        # The message used to say only HOW MANY trades were secured. The owner looks
+        # at MT5, where the one thing he can check is the price of the line on his
+        # chart - and that was the one number we never gave him. Now every move
+        # prints where the stop went, where it was, and what it guarantees, so a
+        # claim of protection can be checked against his own screen in one glance.
+        rows = []
+        for pid, tgt, was, locked, pk in moved:
+            frm = f" (كان `{was:g}`)" if was is not None else " (ما كان بيه وقف)"
+            rows.append(f"• الوقف الآن على `{tgt:g}`{frm} — يضمن `{locked:g}$` "
+                        f"· القمة `{pk:.2f}$`")
         await notify(f"🛡 *أمّنت `{len(moved)}` صفقة{(' ' + label) if label else ''}* — ربحت أكثر من "
-                     f"`{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.{tail}")
+                     f"`{BE_TRIGGER_CASH:g}$`، فما تقدر ترجع خسارة بعد الآن.{tail}\n"
+                     + "\n".join(rows)
+                     + "\n_افتح الـMT5: لازم تشوف خط الوقف على نفس هذا السعر._")
     return len(moved)
