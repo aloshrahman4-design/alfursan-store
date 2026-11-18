@@ -112,6 +112,12 @@ SETTABLE_KEYS = {
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
     "BROKER": "منصة التنفيذ (metaapi أو capital أو paper)",
     "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
+    # Settable on purpose. When this floor wrongly refused a 59-byte
+    # requirements.txt the server could install nothing at all, the fix for the
+    # check included, and there was no way to relax it without the SSH access
+    # the owner does not have.
+    "UPDATE_MIN_BYTES": "أقل حجم مقبول لملف كود بالتحديث",
+    "UPDATE_MIN_TEXT_BYTES": "أقل حجم مقبول لملف نصي بالتحديث",
     "CAPITAL_API_KEY": "مفتاح Capital.com",
     "CAPITAL_EMAIL": "إيميل Capital.com",
     "CAPITAL_PASSWORD": "كلمة سر Capital.com",
@@ -211,7 +217,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
     "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
     "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
@@ -1083,6 +1089,10 @@ CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.p
 
 BACKUP_DIR = os.path.join(BASE_DIR, ".backup")
 MIN_FILE_BYTES = int(os.environ.get("UPDATE_MIN_BYTES", "400"))
+# A plain text file is allowed to be short, because some of them are. This floor
+# only catches "nothing arrived"; WHAT the file must contain is checked separately,
+# which is the part a byte count was never able to do.
+MIN_TEXT_BYTES = int(os.environ.get("UPDATE_MIN_TEXT_BYTES", "20"))
 
 
 def _move(src, dst):
@@ -1117,26 +1127,62 @@ def _sha(path):
 
 
 def sanity_check(tmpdir, files):
-    """Reject a download that arrived truncated, empty, or as someone's error page."""
+    """Reject a download that arrived truncated, empty, or as someone's error page.
+
+    The first version held every file to one 400-byte floor. requirements.txt is
+    four package names and a newline - 59 bytes, complete and correct - so the
+    check refused it, and refusing one file refuses the whole update. That left
+    the server unable to install anything at all, including the fix for the check
+    itself, over a file that was never wrong. A floor has to come from what the
+    file IS, not from one number applied to everything.
+    """
     problems = []
     for name in files:
         path = os.path.join(tmpdir, name)
         try:
             size = os.path.getsize(path)
         except OSError:
-            problems.append("• `%s` — ما وصل أصلاً" % name)
+            problems.append("\u2022 `%s` \u2014 \u0645\u0627 \u0648\u0635\u0644 \u0623\u0635\u0644\u0627\u064b" % name)
             continue
-        if size < MIN_FILE_BYTES:
-            problems.append("• `%s` — `%d` بايت فقط، هذا مو ملف كامل" % (name, size))
+        floor = MIN_FILE_BYTES if name.endswith(".py") else MIN_TEXT_BYTES
+        if size < floor:
+            problems.append("\u2022 `%s` \u2014 `%d` \u0628\u0627\u064a\u062a\u060c \u0648\u0627\u0644\u062d\u062f \u0627\u0644\u0623\u062f\u0646\u0649 `%d`"
+                            % (name, size, floor))
             continue
         try:
             with open(path, "rb") as f:
                 head = f.read(400).lstrip().lower()
         except OSError as e:
-            problems.append("• `%s` — ما أكدر أقراه: %s" % (name, str(e)[:60]))
+            problems.append("\u2022 `%s` \u2014 \u0645\u0627 \u0623\u0643\u062f\u0631 \u0623\u0642\u0631\u0627\u0647: %s" % (name, str(e)[:60]))
             continue
-        if head.startswith(b"<!doctype") or head.startswith(b"<html"):
-            problems.append("• `%s` — وصلت صفحة HTML مو كود" % name)
+        if head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<html" in head:
+            problems.append("\u2022 `%s` \u2014 \u0648\u0635\u0644\u062a \u0635\u0641\u062d\u0629 HTML \u0645\u0648 \u0643\u0648\u062f" % name)
+            continue
+        # A size floor cannot tell a short, correct file from a truncated one, so
+        # each kind is checked for the shape it must have.
+        if name == "requirements.txt":
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    body = f.read()
+            except OSError:
+                body = ""
+            pkgs = [ln.strip() for ln in body.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")]
+            if not pkgs:
+                problems.append("\u2022 `%s` \u2014 \u0645\u0627\u0643\u0648 \u0648\u0644\u0627 \u062d\u0632\u0645\u0629 \u0628\u064a\u0647" % name)
+        elif name.endswith(".py"):
+            # The WHOLE file, not its first few thousand bytes: range_harvester.py
+            # opens with a long docstring and a wall of imports, so looking only at
+            # the head reported "no functions" about a perfectly complete module.
+            # This catches the truncation py_compile cannot - a cut that happens to
+            # land on a valid statement boundary.
+            # `def` OR `class`: the rule is "this module defines something", not
+            # "this module defines a function". It still cannot vouch for a module
+            # that is only constants - py_compile is what guards the rest.
+            with open(path, encoding="utf-8", errors="replace") as f:
+                _b = f.read()
+            if "def " not in _b and "class " not in _b:
+                problems.append("\u2022 `%s` \u2014 \u0645\u0627\u0643\u0648 \u0648\u0644\u0627 \u062f\u0627\u0644\u0629 \u0648\u0644\u0627 \u0635\u0646\u0641 \u0628\u0627\u0644\u0645\u0644\u0641" % name)
     return "\n".join(problems)
 
 

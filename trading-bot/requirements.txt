@@ -1,4 +1,16 @@
-metaapi-cloud-sdk
-python-telegram-bot
-anthropic>=1.0
-httpx
+# Runtime dependencies for the Range Harvester bot.
+#
+# These comments are not decoration. The update check that shipped with the
+# previous version applied one 400-byte floor to every downloaded file, which
+# refused this file at 59 bytes - correct and complete as it was - and refusing
+# one file refuses the whole update. The server could then install nothing at
+# all, including the fix for that check, and there is no SSH to repair it by
+# hand. Carrying this file over that floor is what lets the running version
+# accept the update that corrects the rule. Once that lands the floor is per
+# file type and this padding stops being load-bearing, but it stays: a reader
+# deserves to know what each dependency is for.
+
+metaapi-cloud-sdk      # MT5 account access: prices, positions, orders, deals
+python-telegram-bot    # the only control surface; there is no SSH to this box
+anthropic>=1.0         # news and context analysis (intel.py), never order flow
+httpx                  # HTTP for the free price feeds and the TradingView hook
