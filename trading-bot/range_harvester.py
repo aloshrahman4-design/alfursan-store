@@ -1098,7 +1098,8 @@ async def handle_setkey(text, chat_id, message_id):
 
 
 CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",
-              "broker_paper.py", "grid.py", "entry_safety.py", "range_break.py")
+              "broker_paper.py", "grid.py", "entry_safety.py", "range_break.py",
+              "backtest_break.py")
 
 
 BACKUP_DIR = os.path.join(BASE_DIR, ".backup")
