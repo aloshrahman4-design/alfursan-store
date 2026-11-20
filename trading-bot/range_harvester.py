@@ -107,6 +107,15 @@ SETTABLE_KEYS = {
     "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
     "BROKER": "منصة التنفيذ (metaapi أو capital أو paper)",
+    "BREAK_ENABLED": "تشغيل استراتيجية كسر النطاق",
+    "BREAK_LOT": "لوت صفقة كسر النطاق",
+    "BREAK_TF": "إطار الشمعة اللي يُقرأ منها النطاق",
+    "BREAK_EDGE_PCT": "بُعد الفخ عن حافة النطاق كنسبة من عرضه",
+    "BREAK_STOP_PCT": "الوقف كنسبة من عرض النطاق",
+    "BREAK_MIN_RANGE": "أضيق نطاق يستاهل النصب",
+    "BREAK_MAX_RANGE": "أوسع نطاق يستاهل النصب",
+    "BREAK_MAX_LOSSES": "خسائر اليوم قبل ما يوقف",
+    "BREAK_EXPIRY_MINS": "عمر الفخ قبل ما يُسحب",
     "ADOPT_STOP_DOLLARS": "بُعد الوقف اللي يُحط على صفقة تسلّمها للبوت",
     "HEARTBEAT_MINS": "كل كم دقيقة يرسل نبضة وهو ماسك صفقات (0 = مطفي)",
     "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
@@ -213,7 +222,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "break": "BREAK_ENABLED", "breaklot": "BREAK_LOT", "breaktf": "BREAK_TF", "breakedge": "BREAK_EDGE_PCT", "breakstop": "BREAK_STOP_PCT", "breakmin": "BREAK_MIN_RANGE", "breakmax": "BREAK_MAX_RANGE", "breaklosses": "BREAK_MAX_LOSSES", "breakexpiry": "BREAK_EXPIRY_MINS", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     # pct/trail/percent used to point at PULLBACK_PCT, which governs nothing now.
     # An alias that writes a value nobody reads is the exact failure this whole
     # session was spent on, so they point at the rule that is actually applied.
@@ -422,6 +431,12 @@ except Exception as _e:
 # happened. So this file repairs itself before importing anything that needs it.
 import entry_safety as safety
 from entry_safety import require_entry_permission
+
+try:
+    import range_break                      # two traps on the last hour's edges
+except Exception as _e:
+    range_break = None
+    log.warning(f"range_break unavailable: {_e}")
 
 try:
     import datafeed  # free prices, so analysis never keeps a billed account deployed
@@ -1083,7 +1098,7 @@ async def handle_setkey(text, chat_id, message_id):
 
 
 CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",
-              "broker_paper.py", "grid.py", "entry_safety.py")
+              "broker_paper.py", "grid.py", "entry_safety.py", "range_break.py")
 
 
 BACKUP_DIR = os.path.join(BASE_DIR, ".backup")
@@ -1333,7 +1348,7 @@ HELP_TEXT = (
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
-    "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"
+    "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"    "• /break — فخّان على حافتي نطاق آخر ساعة (`/break on` · `/break off`)\n"
     "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
     "• /testtrade — وضع اختبار التنفيذ: صفقة حقيقية وحدة `0.01` بوقف إلزامي\n"
     "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
@@ -2872,6 +2887,119 @@ async def handle_rollback():
 HEARTBEAT_MINS = float(os.environ.get("HEARTBEAT_MINS", "0"))
 
 
+async def range_break_engine():
+    """Re-arm the two traps once per closed candle, and watch them in between.
+
+    Deliberately thin. Everything that decides anything lives in range_break, and
+    everything that exits a position lives in grid.take_giveback. This loop only
+    answers "is it time to re-arm?" and "did one spring?", because the last engine
+    that decided things in three places took a month to debug.
+    """
+    if range_break is None:
+        return
+    last_bar = None
+    while True:
+        try:
+            await asyncio.sleep(20.0)
+            if not range_break.BREAK_ENABLED or connection is None or datafeed is None:
+                continue
+            if not bot_active:
+                continue              # /pause stops OPENING. Guards keep running.
+            # Spring-check first: a filled trap leaves its twin naked, and that
+            # matters more than being on time with the next pair.
+            await range_break.watch(connection, notify)
+            if range_break.armed_ids():
+                continue
+            if market_closed():
+                continue
+            try:
+                candles = await datafeed.get_candles(SYMBOL, range_break.BREAK_TF, 5)
+            except Exception as e:
+                log.warning(f"range-break has no candles: {e}")
+                continue
+            rng = range_break.last_closed_range(candles)
+            if not rng:
+                continue
+            bar = (candles[-2].get("time") if len(candles) >= 2 else None)
+            if bar is not None and bar == last_bar:
+                continue              # already armed on this one; do not re-pay
+            # Nothing new is opened while we already hold one of these.
+            try:
+                pos = await asyncio.wait_for(connection.get_positions(), timeout=8.0) or []
+            except Exception as e:
+                log.warning(f"range-break could not read positions: {e}")
+                continue
+            if any(p.get("magic") == range_break.MAGIC_BREAK
+                   and p.get("symbol") == SYMBOL for p in pos):
+                continue
+            ok, why = await range_break.arm(
+                connection, SYMBOL, candles, notify,
+                contract=float(getattr(grid, "GRID_CONTRACT", 100.0)))
+            if ok:
+                last_bar = bar
+            elif why and "مطفي" not in why:
+                global last_break_note
+                if time.time() - last_break_note > 3600:
+                    last_break_note = time.time()
+                    await notify(f"🪤 ما نصبت: {why}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"range-break pass failed: {e}")
+            await asyncio.sleep(10)
+
+
+last_break_note = 0.0
+
+
+async def handle_break_command(text):
+    """/break - the state of the two traps, and the switch."""
+    if range_break is None:
+        await send_long("وحدة كسر النطاق مو محمّلة — `/update`.", markup=keyboard())
+        return
+    arg = (text.split()[1].strip().lower() if text.split()[1:2] else "")
+    if arg in ("on", "1", "شغل"):
+        write_env_value("BREAK_ENABLED", "1")
+        await send_long("🟢 شغّلت كسر النطاق. أعيد التشغيل الآن...")
+        await asyncio.sleep(1.0)
+        os._exit(0)
+    if arg in ("off", "0", "اطفي", "إطفاء"):
+        if connection is not None and range_break.armed_ids():
+            await range_break.cancel_all(connection)
+        write_env_value("BREAK_ENABLED", "0")
+        await send_long("🔴 طفّيت كسر النطاق وسحبت الفخاخ. أعيد التشغيل...")
+        await asyncio.sleep(1.0)
+        os._exit(0)
+    if arg in ("cancel", "سحب", "الغاء"):
+        n = (await range_break.cancel_all(connection)) if connection is not None else 0
+        await send_long(f"🧹 سحبت `{n}` فخ.", markup=keyboard())
+        return
+    lines = [range_break.settings_line(), ""]
+    ids = range_break.armed_ids()
+    lines.append(f"• منصوب الآن: `{len(ids)}` فخ" if ids else "• ماكو فخاخ منصوبة")
+    if range_break.stood_down():
+        lines.append(f"• ⛔️ واقف لليوم — خسائر اليوم بلغت الحد")
+    if datafeed is not None:
+        try:
+            candles = await datafeed.get_candles(SYMBOL, range_break.BREAK_TF, 5)
+            rng = range_break.last_closed_range(candles)
+            if rng:
+                hi, lo = rng
+                p, why = range_break.plan(hi, lo)
+                if p:
+                    lines += [
+                        f"• آخر نطاق مغلق: `{lo}` — `{hi}` (عرضه `{p['range']}$`)",
+                        f"• شراء فوق `{p['buy_at']}` · بيع تحت `{p['sell_at']}`",
+                        f"• أقصى خسارة للمحاولة "
+                        f"`{range_break.risk_cash(p['stop'], contract=float(getattr(grid, 'GRID_CONTRACT', 100.0)))}$`"]
+                else:
+                    lines.append(f"• {why}")
+        except Exception as e:
+            lines.append(f"• ⚠️ ماكو شموع: `{str(e)[:90]}`")
+    lines += ["", "`/break on` · `/break off` · `/break cancel`"]
+    await send_long("\n".join(lines), markup=keyboard())
+
+
 async def heartbeat_engine():
     """Say "still here" on a timer, but only while something is open.
 
@@ -2892,7 +3020,7 @@ async def heartbeat_engine():
                 continue
             pos = await asyncio.wait_for(connection.get_positions(), timeout=10.0) or []
             st = grid.load()
-            magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
+            magics = our_magics()
             mine = [p for p in pos if safety.is_ours(p, magics, grid.adopted_ids(),
                                                      st.get("released", []))]
             if not mine:
@@ -2910,6 +3038,22 @@ async def heartbeat_engine():
             raise
         except Exception as e:
             log.warning(f"heartbeat failed: {e}")
+
+
+def our_magics():
+    """Every magic number the bot is responsible for, in one place.
+
+    This tuple was built by hand in three different functions. A strategy added
+    to two of them and forgotten in the third would place trades that one guard
+    protects and another ignores - which is precisely the shape of the bug that
+    made the give-back appear dead for weeks. One definition, no exceptions.
+    """
+    mg = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST)
+    if grid is not None:
+        mg = mg + tuple(grid.MAGICS)
+    if range_break is not None:
+        mg = mg + (range_break.MAGIC_BREAK,)
+    return mg
 
 
 async def handle_sleep_command(text):
@@ -2936,7 +3080,7 @@ async def handle_sleep_command(text):
         await send_long(f"⚠️ ما كدرت أقرا الصفقات: `{str(e)[:150]}`", markup=keyboard())
         return
     st = grid.load()
-    magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
+    magics = our_magics()
     mine_already = [p for p in pos if safety.is_ours(p, magics, grid.adopted_ids(),
                                                      st.get("released", []))]
     yours = [p for p in pos if p not in mine_already]
@@ -3211,7 +3355,7 @@ async def protect_engine():
                 log.warning(f"price unavailable; stops wait, the give-back does not: {e}")
             released = set(grid.load().get("released", []))
             adopted = grid.adopted_ids()
-            magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
+            magics = our_magics()
             pos = await asyncio.wait_for(connection.get_positions(), timeout=6.0)
             # Ownership is decided in ONE place now - entry_safety.is_ours - so a
             # hand-opened trade (magic 0) cannot become ours because some call site
@@ -3772,6 +3916,8 @@ async def process_update(update):
                 await handle_rollback()
             elif text.startswith("/live"):
                 await handle_go_live()
+            elif text.startswith("/break") or text.startswith("/كسر"):
+                await handle_break_command(text)
             elif text.startswith("/sleep") or text.startswith("/نوم"):
                 await handle_sleep_command(text)
             elif text.startswith("/adopt") or text.startswith("/unadopt"):
@@ -4075,6 +4221,7 @@ async def main():
         supervise("hook_server", hook_server),
         supervise("protect", protect_engine),
         supervise("heartbeat", heartbeat_engine),
+        supervise("range_break", range_break_engine),
     ]
     if grid is not None:
         # Watching what was handed over is not conditional on the grid running: those
