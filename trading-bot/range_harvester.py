@@ -27,11 +27,7 @@ TRADE_LOT = float(os.environ.get("TRADE_LOT", "0.03"))
 # with the lot instead, and the behaviour in price terms stays identical.
 REF_LOT = 0.03
 _scale = TRADE_LOT / REF_LOT if REF_LOT else 1.0
-MIN_CASH_PROFIT = round(float(os.environ.get("MIN_CASH_PROFIT", 2.00 * _scale)), 2)
-PULLBACK_CASH = round(float(os.environ.get("PULLBACK_CASH", 0.80 * _scale)), 2)
 # Give-back as a share of the peak profit rather than a fixed sum: a trade that ran to +40$
-# should be allowed to breathe more than one sitting at +6$. Set to 0 to use PULLBACK_CASH.
-PULLBACK_PCT = float(os.environ.get("PULLBACK_PCT", "10"))
 BREAKOUT_DIST = float(os.environ.get("BREAKOUT_DIST", "4.50"))   # a price distance: never scaled
 CONNECT_NOTE_QUIET_SECS = int(os.environ.get("CONNECT_NOTE_QUIET_SECS", "900"))
 CONNECTION_STALE_SECS = 25  # if no successful price fetch in this window, force a reconnect
@@ -111,6 +107,8 @@ SETTABLE_KEYS = {
     "DAILY_TRADE_HOUR_UTC": "ساعة صفقة اليوم (UTC)",
     "EXTRA_SYMBOLS": "الأسواق المرتبطة",
     "BROKER": "منصة التنفيذ (metaapi أو capital أو paper)",
+    "ADOPT_STOP_DOLLARS": "بُعد الوقف اللي يُحط على صفقة تسلّمها للبوت",
+    "HEARTBEAT_MINS": "كل كم دقيقة يرسل نبضة وهو ماسك صفقات (0 = مطفي)",
     "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
     # Settable on purpose. When this floor wrongly refused a 59-byte
     # requirements.txt the server could install nothing at all, the fix for the
@@ -127,9 +125,6 @@ SETTABLE_KEYS = {
     "LEAN": "وضع التداول فقط بدون أخبار وتحليل (1 أو 0)",
     "SIGNAL": "وضع الإشارات: البوت ينبّه وأنت تنفّذ (1 أو 0)",
     "TRADE_LOT": "حجم اللوت",
-    "MIN_CASH_PROFIT": "حد الحصاد بالدولار",
-    "PULLBACK_CASH": "الارتداد المسموح من القمة بالدولار",
-    "PULLBACK_PCT": "الارتداد المسموح كنسبة % من القمة (0 = استخدم الدولار)",
     "BREAKOUT_DIST": "مسافة الاختراق للارتكاز الجديد",
     "HOOK_ENABLED": "استقبال إشارات TradingView (1 أو 0)",
     "HOOK_MODE": "تصرف الإشارة: watch مراقبة فقط أو trade تنفيذ",
@@ -147,6 +142,7 @@ SETTABLE_KEYS = {
     "RESCUE_RESERVE": "ربح محجوز ما ينصرف على التصفية أبداً",
     "GRID_RECENTER_STEPS": "كم خطوة يبتعد السعر قبل ما يعيد توسيط الشبكة (0 = مطفي)",
     "TRADE_GIVEBACK_PCT": "نسبة الارتداد من قمة ربح الصفقة اللي يغلق عندها (0 = مطفي)",
+    "GIVEBACK_ARM_CASH": "الربح اللي تبدأ عنده ملاحقة القمة",
     "FLOOR_HEADROOM_CASH": "كم ربح إضافي قبل ما يثبّت الأرضية (فراغ بين الوقف والسعر)",
     "GRID_CONTRACT": "وحدات اللوت الواحد (الذهب 100 أونصة، البيتكوين 1)",
     "GRID_STEP_MIN_PCT": "أصغر خطوة مسموحة كنسبة من السعر (حارس)",
@@ -217,9 +213,13 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
-    "profit": "MIN_CASH_PROFIT", "pullback": "PULLBACK_CASH", "breakout": "BREAKOUT_DIST",
-    "pct": "PULLBACK_PCT", "trail": "PULLBACK_PCT", "percent": "PULLBACK_PCT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    # pct/trail/percent used to point at PULLBACK_PCT, which governs nothing now.
+    # An alias that writes a value nobody reads is the exact failure this whole
+    # session was spent on, so they point at the rule that is actually applied.
+    "profit": "GIVEBACK_ARM_CASH", "arm": "GIVEBACK_ARM_CASH",
+    "breakout": "BREAKOUT_DIST",
+    "pct": "TRADE_GIVEBACK_PCT", "trail": "TRADE_GIVEBACK_PCT", "percent": "TRADE_GIVEBACK_PCT",
     "gridon": "GRID_ENABLED", "newsmax": "NEWS_MAX_ANALYSES_DAY",
     "gridlot": "GRID_BASE_LOT", "gridmax": "GRID_MAX_LOT", "gridlevels": "GRID_LEVELS",
     "gridstep": "GRID_STEP", "gridtp": "GRID_TP_CASH", "gridtpone": "GRID_TP_PER_TRADE", "gridtrail": "GRID_TRAIL_PCT", "gridtrailmin": "GRID_TRAIL_MIN", "be": "BE_TRIGGER_CASH", "beon": "BE_ENABLED", "belock": "BE_LOCK_CASH", "betrail": "BE_TRAIL_CASH", "befloor": "BE_FLOOR_CASH", "begap": "BE_MIN_GAP", "streamonly": "STREAM_ONLY", "streamwait": "STREAM_RETRY_SECS", "servertrail": "SERVER_TRAIL", "besoft": "BE_SOFT", "besoftexit": "BE_SOFT_EXIT",
@@ -264,6 +264,9 @@ except Exception as _e:
     broker_capital = None
     log.warning(f"broker_capital unavailable: {_e}")
 
+# How far a handed-over trade's stop goes when it has none. Widened at the time
+# to clear whatever minimum the broker is quoting.
+ADOPT_STOP_DOLLARS = float(os.environ.get("ADOPT_STOP_DOLLARS", "3"))
 ENTRY_SAFETY_PATH = os.path.join(BASE_DIR, "entry_safety.py")
 STUB_MARK = "IS_BOOTSTRAP_STUB"
 
@@ -445,7 +448,6 @@ handed_over_ids = set()
 tracked_positions = {}
 hook_last, hook_count = None, 0
 # Peak profit per open position: the harvest trails each trade on its own.
-peak_by_id = {}
 # Reconnects are routine; announcing each one is noise.
 last_connect_note = 0.0
 hook_bound_port = None
@@ -698,7 +700,7 @@ async def broker_check():
             f"• صفقات مفتوحة: `{len(pos)}` منها `{len(ours)}` ارتكاز و`{len(gridded)}` شبكة"
             + (f" — `{sum(1 for p in ours if user_took_over(p))}` سلّمتها لك" if any(user_took_over(p) for p in ours) else ""),
             f"• الوضع: {mode_label()}",
-            f"• قاعدة الحصاد: ما يغلق قبل `{MIN_CASH_PROFIT}$`، وبعدها يغلق إذا رجع {trail_rule_line()}",
+            f"• قاعدة الحصاد: يغلق إذا رجع {trail_rule_line()}",
         ]
         guarded = sum(1 for p in ours if has_stop_loss(p) and not user_took_over(p))
         if guarded:
@@ -1054,9 +1056,6 @@ async def handle_setkey(text, chat_id, message_id):
 
     try:
         write_env_value(key, value)
-        if key in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
-            # Remember that this number was chosen, so /lot does not rescale it away later.
-            write_env_value("PROFIT_PINNED", "1")
         if intel is not None:
             intel.refresh_keys()
         if broker_capital is not None:
@@ -1334,6 +1333,7 @@ HELP_TEXT = (
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
+    "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"
     "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
     "• /testtrade — وضع اختبار التنفيذ: صفقة حقيقية وحدة `0.01` بوقف إلزامي\n"
     "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
@@ -2119,25 +2119,23 @@ async def set_new_sell_anchor(manual=False):
         log.error(f"Sell err: {e}", exc_info=True)
 
 
-def give_back_limit(peak):
-    """How much of the peak profit a trade may surrender before it is harvested.
-
-    A share of the peak, not a fixed sum: a trade that ran to +40$ deserves more room than
-    one sitting at +6$, and a fixed give-back would either strangle the big move or let the
-    small one round-trip. MIN_CASH_PROFIT still gates the close, so the bot never harvests
-    below the floor however small the give-back works out to be.
-    """
-    if PULLBACK_PCT > 0:
-        return round(peak * PULLBACK_PCT / 100.0, 2)
-    return PULLBACK_CASH
-
-
 def trail_rule_line():
-    """One line that states the harvest rule exactly as it will behave."""
-    if PULLBACK_PCT > 0:
-        return (f"`{round(PULLBACK_PCT, 2)}%` من أعلى ربح توصله الصفقة "
-                f"(مثلاً قمة `20$` ← يغلق عند `{round(20 * (1 - PULLBACK_PCT / 100.0), 2)}$`)")
-    return f"`{PULLBACK_CASH}$` من أعلى ربح توصله الصفقة"
+    """One line that states the harvest rule exactly as it will behave.
+
+    It used to read PULLBACK_PCT, which stopped governing anything the moment the
+    give-back moved into grid.take_giveback. /check and /lot then announced a rule
+    the bot did not follow, from a number the owner could change with no effect.
+    Reading the live owner of the rule is the only way this line can be true.
+    """
+    try:
+        pct = float(grid.TRADE_GIVEBACK_PCT)
+        arm = float(grid.GIVEBACK_ARM_CASH)
+    except Exception:
+        return "`?` — وحدة الشبكة مو محمّلة"
+    if pct <= 0:
+        return "⛔️ مطفية — `/setkey pct 10` يشغّلها"
+    return (f"`{pct:g}%` من أعلى ربح توصله الصفقة، بعد ما تعدّي `{arm:g}$` "
+            f"(قمة `20$` ← يغلق عند `{round(20 * (1 - pct / 100.0), 2)}$`)")
 
 
 def user_took_over(p):
@@ -2871,6 +2869,99 @@ async def handle_rollback():
     os._exit(0)          # systemd Restart=always brings it back on the old code
 
 
+HEARTBEAT_MINS = float(os.environ.get("HEARTBEAT_MINS", "0"))
+
+
+async def heartbeat_engine():
+    """Say "still here" on a timer, but only while something is open.
+
+    He has no SSH. If this process dies at 3am, nothing tells him - the bot simply
+    stops speaking, and silence from a bot that is usually silent looks identical to
+    a bot that is working. A pulse turns that into a signal: one line an hour while
+    he has money in the market, and its absence means something stopped.
+
+    Deliberately off by default and silent when flat. A notification every hour on
+    an empty account is noise, and noise is how a real alert gets ignored.
+    """
+    if HEARTBEAT_MINS <= 0:
+        return
+    while True:
+        try:
+            await asyncio.sleep(max(60.0, HEARTBEAT_MINS * 60.0))
+            if connection is None or grid is None:
+                continue
+            pos = await asyncio.wait_for(connection.get_positions(), timeout=10.0) or []
+            st = grid.load()
+            magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
+            mine = [p for p in pos if safety.is_ours(p, magics, grid.adopted_ids(),
+                                                     st.get("released", []))]
+            if not mine:
+                continue                   # nothing at risk: nothing worth waking him
+            pnl = round(sum(float(p.get("unrealizedProfit", 0) or 0) for p in mine), 2)
+            guarded = sum(1 for p in mine if p.get("stopLoss"))
+            peaks = [grid.peak_of(p.get("id")) for p in mine]
+            best = max(peaks) if peaks else 0.0
+            await notify(
+                f"💓 *شغّال* — `{len(mine)}` صفقة · `{pnl:+.2f}$`\n"
+                f"• `{guarded}` منها عليها وقف عند الوسيط\n"
+                + (f"• أعلى قمة متابَعة `{best:.2f}$`\n" if best else "")
+                + f"• النسخة `{code_version()}`")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"heartbeat failed: {e}")
+
+
+async def handle_sleep_command(text):
+    """/sleep - hand every hand-opened trade over at once, each with a real stop.
+
+    Typing /trades, reading an id off a phone screen and typing /adopt for each is
+    friction at exactly the moment he has none to spare: he is going to bed, or the
+    connection is about to drop. One command, and every answer says what the broker
+    actually holds now, not what was requested.
+    """
+    if grid is None or connection is None:
+        await send_long("محتاج اتصال بالوسيط — `/check`.", markup=keyboard())
+        return
+    if text.split()[1:2] and text.split()[1].lower() in ("off", "wake", "صحيت"):
+        ids = list(grid.adopted_ids())
+        for i in ids:
+            grid.unadopt(i)
+        await send_long(f"☀️ رجّعت `{len(ids)}` صفقة إلك — البوت ما يلمسها."
+                        if ids else "ماكو صفقات مستلمة.", markup=keyboard())
+        return
+    try:
+        pos = await asyncio.wait_for(connection.get_positions(), timeout=10.0) or []
+    except Exception as e:
+        await send_long(f"⚠️ ما كدرت أقرا الصفقات: `{str(e)[:150]}`", markup=keyboard())
+        return
+    st = grid.load()
+    magics = (MAGIC_BUY, MAGIC_SELL, safety.MAGIC_TEST) + grid.MAGICS
+    mine_already = [p for p in pos if safety.is_ours(p, magics, grid.adopted_ids(),
+                                                     st.get("released", []))]
+    yours = [p for p in pos if p not in mine_already]
+    if not yours:
+        await send_long(
+            f"😴 ماكو صفقة يدوية أستلمها.\n"
+            f"• `{len(mine_already)}` صفقة تحت حراستي أصلاً\n"
+            f"• نام مرتاح — الحراسة تشتغل حتى والنظام متوقف", markup=keyboard())
+        return
+    lines = [f"😴 *استلمت `{len(yours)}` صفقة*", ""]
+    for p in yours:
+        pid = p.get("id")
+        grid.adopt(pid)
+        side = "شراء" if p.get("type") == "POSITION_TYPE_BUY" else "بيع"
+        lines.append(f"*{side} `{p.get('volume')}` على `{p.get('symbol')}`* "
+                     f"· `{float(p.get('unrealizedProfit', 0) or 0):+.2f}$` · رقمها `{pid}`")
+        lines.append(await ensure_adopted_stop(pid))
+    trig = getattr(grid, "GIVEBACK_ARM_CASH", 1.5)
+    pct = getattr(grid, "TRADE_GIVEBACK_PCT", 0.0)
+    lines += ["", f"• أتابع قمة كل وحدة من ربح `{trig:g}$` وأغلق لو رجعت `{pct:g}%`",
+              "• الوقف عند الوسيط يشتغل حتى لو انطفى كل شي عندي",
+              "• `/sleep off` يرجّعهن إلك"]
+    await send_long("\n".join(lines), markup=keyboard())
+
+
 async def handle_adopt_command(text):
     """Take over, or hand back, a trade the bot did not open.
 
@@ -2914,13 +3005,86 @@ async def handle_adopt_command(text):
                         markup=keyboard())
         return
     ok = grid.adopt(pid)
-    trig = getattr(grid, "BE_TRIGGER_CASH", 0.0)
+    if not ok:
+        await send_long(f"`{pid}` متبنّاة من قبل.", markup=keyboard())
+        return
+    # A stop, NOW. The reason he hands a trade over is that he is about to stop
+    # watching it - asleep, offline, busy - and until this the bot only started
+    # protecting once profit cleared the broker's minimum distance, which on 0.01
+    # lot of gold is about 2.82$. Hand over a trade at +0.50$ and go to sleep and
+    # nothing at all was holding it. The bot-side trail dies with the process or
+    # the connection; a broker stop does not, and that is the whole point here.
+    line = await ensure_adopted_stop(pid)
+    trig = getattr(grid, "GIVEBACK_ARM_CASH", 1.5)
+    pct = getattr(grid, "TRADE_GIVEBACK_PCT", 0.0)
     await send_long(
-        (f"✅ *تبنّيت الصفقة `{pid}`*\n"
-         f"• أحط عليها وقف متابعة من ربح `{trig:g}$`\n"
-         f"• وأغلقها لو ارتد الربح أو وصل الهدف — يعني صرت أكدر أسكّرها\n"
-         f"• `/unadopt {pid}` يرجّعها إلك"
-         if ok else f"`{pid}` متبنّاة من قبل."), markup=keyboard())
+        f"✅ *استلمت الصفقة `{pid}`*\n"
+        f"{line}\n"
+        f"• أتابع القمة من ربح `{trig:g}$`، وأغلق لو رجع `{pct:g}%` منها\n"
+        f"• `/unadopt {pid}` يرجّعها إلك", markup=keyboard())
+
+
+async def ensure_adopted_stop(pid, want=None):
+    """Put a broker stop on a handed-over trade right away. Returns a line to show.
+
+    Never moves a stop that is already there - his own stop is his decision - and
+    never closes anything. A losing trade gets a stop, not an exit: deciding to take
+    a loss stays with him.
+    """
+    if connection is None:
+        return "• ⚠️ ماكو اتصال — ما كدرت أحط وقف الآن"
+    try:
+        pos = await asyncio.wait_for(connection.get_positions(), timeout=8.0) or []
+    except Exception as e:
+        return f"• ⚠️ ما كدرت أقرا الصفقة: `{str(e)[:90]}`"
+    p = next((x for x in pos if str(x.get("id")) == str(pid)), None)
+    if p is None:
+        return "• ⚠️ ما لقيت الصفقة عند الوسيط"
+    have = p.get("stopLoss")
+    try:
+        have = float(have) if have else 0.0
+    except (TypeError, ValueError):
+        have = 0.0
+    if have:
+        return f"• وقفك موجود عند `{have}` — ما لمسته"
+    try:
+        q = await asyncio.wait_for(
+            connection.get_symbol_price(symbol=p.get("symbol") or SYMBOL), timeout=8.0)
+        bid, ask = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0)
+    except Exception as e:
+        return f"• ⚠️ ماكو سعر، فما حطيت وقف: `{str(e)[:90]}`"
+    if not bid or not ask:
+        return "• ⚠️ ماكو سعر، فما حطيت وقف"
+    is_buy = p.get("type") == "POSITION_TYPE_BUY"
+    gap = 0.0
+    try:
+        gap = float(await grid.broker_stop_gap(connection, p.get("symbol") or SYMBOL) or 0.0)
+    except Exception:
+        gap = 0.0
+    spread = max(0.0, ask - bid)
+    dist = round(max(float(want or ADOPT_STOP_DOLLARS), gap + spread + 0.10), 2)
+    ref = bid if is_buy else ask
+    sl = round(ref - dist, 2) if is_buy else round(ref + dist, 2)
+    try:
+        await asyncio.wait_for(connection.modify_position(p["id"], stop_loss=sl), timeout=8.0)
+    except Exception as e:
+        return (f"• 🚨 *ما كدرت أحط وقف*: `{str(e)[:90]}`\n"
+                f"  حطّه بيدك من MT5 — الصفقة بلا حماية عند الوسيط")
+    # Read it back. "I sent it" is not "the broker took it", and the difference is
+    # the whole value of the feature on a night he is not watching.
+    try:
+        again = await asyncio.wait_for(connection.get_positions(), timeout=8.0) or []
+        q2 = next((x for x in again if str(x.get("id")) == str(pid)), None)
+        got = float((q2 or {}).get("stopLoss") or 0)
+    except Exception:
+        got = 0.0
+    if not got:
+        return ("• 🚨 *الوسيط ما قبل الوقف* — الصفقة بلا حماية عنده\n"
+                "  حطّه بيدك من MT5 الآن")
+    risk = round(abs(ref - got) * float(p.get("volume", 0) or 0)
+                 * float(getattr(grid, "GRID_CONTRACT", 100.0)), 2)
+    return (f"• 🛡 حطيت وقف عند `{got}` وتأكدت إنه عند الوسيط\n"
+            f"  أقصى خسارة `{risk}$` — يشتغل حتى لو البوت مطفي أو النت مقطوع")
 
 
 async def warn_unmanaged(pos, magics, released, adopted=frozenset()):
@@ -3161,7 +3325,6 @@ async def handle_hook_command(text):
 async def range_engine():
     global bot_active, connection, buy_anchor, sell_anchor, buy_waiting, sell_waiting
     global peak_buy_profit, peak_sell_profit, total_profit, buy_count, sell_count, last_price_ok
-    global peak_by_id
 
     while True:
         try:
@@ -3181,7 +3344,6 @@ async def range_engine():
             await note_external_closes(mine)
             # a peak belongs to a position; drop it when the position is gone
             live_ids = {p.get("id") for p in mine}
-            peak_by_id = {k: v for k, v in peak_by_id.items() if k in live_ids}
             buy_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_BUY" and p.get("magic") == MAGIC_BUY
                        and not user_took_over(p)]
             sell_pos = [p for p in mine if p.get("type") == "POSITION_TYPE_SELL" and p.get("magic") == MAGIC_SELL
@@ -3610,6 +3772,8 @@ async def process_update(update):
                 await handle_rollback()
             elif text.startswith("/live"):
                 await handle_go_live()
+            elif text.startswith("/sleep") or text.startswith("/نوم"):
+                await handle_sleep_command(text)
             elif text.startswith("/adopt") or text.startswith("/unadopt"):
                 await handle_adopt_command(text)
             elif text.startswith("/why") or text.startswith("/ليش"):
@@ -3686,20 +3850,13 @@ async def process_update(update):
                     if not 0 < lot <= 10:
                         await send_long("حجم غير صالح.")
                     else:
-                        sc = lot / REF_LOT
                         write_env_value("TRADE_LOT", str(lot))
-                        # A threshold the user chose himself is a decision, not a default:
-                        # silently rescaling it here once wiped a deliberate 5$ harvest.
-                        pinned = os.environ.get("PROFIT_PINNED", "0") in ("1", "true", "yes")
-                        if pinned:
-                            limits = (f"• حد الحصاد: `{MIN_CASH_PROFIT}$` — خليته مثل ما ضبطته بنفسك\n"
-                                      f"• الارتداد: {trail_rule_line()}\n")
-                        else:
-                            for k in ("MIN_CASH_PROFIT", "PULLBACK_CASH"):
-                                os.environ.pop(k, None)
-                                write_env_value(k, str(round((2.00 if k == "MIN_CASH_PROFIT" else 0.80) * sc, 2)))
-                            limits = (f"• حد الحصاد: `{round(2.00 * sc, 2)}$` (كان 2.00$)\n"
-                                      f"• الارتداد: {trail_rule_line()}\n")
+                        # Nothing to rescale any more. The two thresholds this block
+                        # used to resize - MIN_CASH_PROFIT and PULLBACK_CASH - were
+                        # the dead give-back's, and the live rule is a PERCENTAGE of
+                        # the peak, which is already lot-independent. The pinning
+                        # machinery existed only to protect them from this block.
+                        limits = f"• الارتداد: {trail_rule_line()}\n"
                         await send_long(
                             f"✅ *اللوت صار* `{lot}`\n\n"
                             f"والحدود:\n{limits}"
@@ -3917,6 +4074,7 @@ async def main():
         supervise("cost_governor", cost_governor),
         supervise("hook_server", hook_server),
         supervise("protect", protect_engine),
+        supervise("heartbeat", heartbeat_engine),
     ]
     if grid is not None:
         # Watching what was handed over is not conditional on the grid running: those
