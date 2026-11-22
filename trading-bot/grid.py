@@ -2272,15 +2272,120 @@ async def halve_distant(conn, positions, bid, ask, notify=None):
     return False
 
 
-# The broker's own minimum distance between a stop and the market, in PRICE. Asked for
-# once and kept: it is a contract term, not a quote. None means "never got an answer",
-# and the caller then keeps the old conservative behaviour rather than guessing.
-_stops = {"value": None, "asked": 0.0}
+# The broker's own rules for an instrument: contract size, digits, lot limits and the
+# minimum distance between a stop and the market. Asked for once per symbol and kept -
+# these are contract terms, not quotes.
+#
+# Keyed BY SYMBOL, and that is the whole point of this rewrite. The cache used to be a
+# single pair of values for the entire bot, which was harmless while only gold was ever
+# traded and silently wrong the moment a second instrument appeared: ask about gold,
+# then ask about bitcoin, and bitcoin is handed gold's answer. Gold's contract is 100
+# ounces and bitcoin's is 1 coin, so every dollar figure would have been out by a
+# hundredfold - in the direction that understates the risk.
+_specs = {}                       # symbol -> {"spec": {...}|None, "asked": float}
 STOPS_RETRY_SECS = _f("STOPS_RETRY_SECS", 600.0)
 
 
 def stops_reset():
-    _stops.update({"value": None, "asked": 0.0})
+    _specs.clear()
+
+
+def points_to_price(points, digits):
+    """A broker's stopsLevel is quoted in POINTS. This is the only place that converts.
+
+    One point is one unit of the last decimal place, so 20 points on a 2-digit symbol
+    is 0.20 of price. This function exists because the conversion was written twice in
+    this file with two different formulas - one of them multiplied by a further 10 - and
+    the two disagreed by an order of magnitude about the broker's minimum stop. Which
+    copy you happened to read decided whether a break-even stop looked possible. That
+    is the same "two owners of one rule" failure this project has already paid for
+    three times, so there is now exactly one.
+    """
+    try:
+        points, digits = float(points or 0), int(digits if digits is not None else 2)
+    except (TypeError, ValueError):
+        return 0.0
+    if points <= 0:
+        return 0.0
+    return round(points * (10.0 ** -digits), 6)
+
+
+def normalise_spec(sp):
+    """The broker's specification reduced to the numbers we act on.
+
+    `contract` is None when the broker did not say. None means unknown and callers must
+    refuse to size an order on it - never fall back to a number, because the only
+    number available to fall back to is gold's.
+    """
+    sp = sp or {}
+
+    def _n(key):
+        try:
+            v = float(sp.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v
+
+    digits = int(_n("digits") or 2)
+    cs = _n("contractSize")
+    return {
+        "symbol": sp.get("symbol") or "",
+        "digits": digits,
+        "contract": cs if cs > 0 else None,
+        "min_lot": _n("minVolume"),
+        "max_lot": _n("maxVolume"),
+        "lot_step": _n("volumeStep"),
+        "stop_points": _n("stopsLevel"),
+        "gap": points_to_price(_n("stopsLevel"), digits),
+    }
+
+
+async def symbol_spec(conn, symbol, force=False):
+    """The normalised spec for one symbol, or None when the broker has not answered.
+
+    Cached per symbol so this costs one request per instrument per session, not one
+    per tick. A failure is remembered too, briefly, so a broker that cannot answer is
+    not hammered once a second.
+    """
+    key = str(symbol or "")
+    hit = _specs.get(key)
+    if hit and not force:
+        if hit.get("spec") is not None:
+            return hit["spec"]
+        if time.time() - hit.get("asked", 0) < STOPS_RETRY_SECS:
+            return None
+    _specs[key] = {"spec": None, "asked": time.time()}
+    if not hasattr(conn, "get_symbol_specification"):
+        return None
+    try:
+        raw = await asyncio.wait_for(conn.get_symbol_specification(key), timeout=8.0)
+    except Exception as e:
+        log.warning(f"could not read the specification for {key}: {e}")
+        return None
+    spec = normalise_spec(raw)
+    _specs[key] = {"spec": spec, "asked": time.time()}
+    log.info(f"spec {key}: contract={spec['contract']} digits={spec['digits']} "
+             f"stops={spec['stop_points']}pt = {spec['gap']} price "
+             f"lot {spec['min_lot']}/{spec['lot_step']}/{spec['max_lot']}")
+    return spec
+
+
+def lot_problem(lot, spec):
+    """Why this lot is not allowed for this instrument, or None when it is fine."""
+    if not spec:
+        return None
+    try:
+        lot = float(lot)
+    except (TypeError, ValueError):
+        return "اللوت مو رقم"
+    mn, mx, st = spec.get("min_lot") or 0, spec.get("max_lot") or 0, spec.get("lot_step") or 0
+    if mn and lot < mn - 1e-9:
+        return f"اللوت `{lot:g}` أصغر من أقل لوت للوسيط `{mn:g}`"
+    if mx and lot > mx + 1e-9:
+        return f"اللوت `{lot:g}` أكبر من أقصى لوت للوسيط `{mx:g}`"
+    if st and abs(round(lot / st) * st - lot) > 1e-6:
+        return f"اللوت `{lot:g}` مو من مضاعفات خطوة الوسيط `{st:g}`"
+    return None
 
 
 async def why_not(conn, symbol, is_active=None, price=0.0):
@@ -2609,18 +2714,14 @@ async def spec_report(conn, symbol, price=0.0):
     """
     if not hasattr(conn, "get_symbol_specification"):
         return "هذا الوسيط ما يعطي مواصفات الأداة."
-    try:
-        sp = await asyncio.wait_for(conn.get_symbol_specification(symbol), timeout=8.0)
-    except Exception as e:
-        return f"⚠️ ما كدرت أجيب مواصفات `{symbol}`: `{str(e)[:200]}`"
-    sp = sp or {}
-    mn = float(sp.get("minVolume", 0) or 0)
-    mx = float(sp.get("maxVolume", 0) or 0)
-    st = float(sp.get("volumeStep", 0) or 0)
-    cs = float(sp.get("contractSize", 0) or 0)
-    dg = int(sp.get("digits", 2) or 2)
-    lvl = float(sp.get("stopsLevel", 0) or 0)
-    gap = round(lvl / (10.0 ** dg) * 10, 6) if lvl else 0.0   # points -> price
+    sp = await symbol_spec(conn, symbol, force=True)
+    if sp is None:
+        return f"⚠️ ما كدرت أجيب مواصفات `{symbol}`."
+    mn, mx, st = sp["min_lot"], sp["max_lot"], sp["lot_step"]
+    cs = sp["contract"] or 0.0
+    dg = sp["digits"]
+    lvl = sp["stop_points"]
+    gap = sp["gap"]
 
     lots = ladder(base=recovery_base(load().get("loss_streak", 0)))
     lot = lots[0] if lots else GRID_BASE_LOT
@@ -2653,7 +2754,8 @@ async def spec_report(conn, symbol, price=0.0):
     return ("\n".join([
         f"🔎 *قواعد الوسيط لـ* `{symbol}`",
         f"• أقل لوت `{mn:g}` · خطوة اللوت `{st:g}` · أقصى `{mx:g}`",
-        f"• حجم العقد `{cs:g}` · الخانات `{dg}` · أقرب وقف `{gap:g}$`",
+        f"• حجم العقد `{cs:g}` · الخانات `{dg}` · "
+        f"أقرب وقف `{lvl:g}` نقطة = `{gap:g}$`",
         "",
         f"⚙️ *إعداداتك:* لوت `{lot:g}` · عقد `{GRID_CONTRACT:g}` · "
         f"خطوة `{GRID_STEP:g}$` · وقف ثابت `{GRID_STOP_DIST:g}$`",
@@ -2663,32 +2765,12 @@ async def spec_report(conn, symbol, price=0.0):
 async def broker_stop_gap(conn, symbol):
     """Smallest gap the broker allows between a stop and the market, in price units.
 
-    `stopsLevel` is quoted in POINTS, so it is scaled by the symbol's digits: on gold with
-    2 digits, 20 points is 0.20$. Returns None when the broker has not told us, and the
-    answer is cached so this costs one request per session, not one per tick.
+    Now a thin read over symbol_spec, which owns both the request and the points
+    conversion. Returns None when the broker has not told us, and the caller then keeps
+    its conservative behaviour rather than guessing.
     """
-    if _stops["value"] is not None:
-        return _stops["value"]
-    if time.time() - _stops["asked"] < STOPS_RETRY_SECS:
-        return None
-    _stops["asked"] = time.time()
-    if not hasattr(conn, "get_symbol_specification"):
-        return None
-    try:
-        spec = await asyncio.wait_for(
-            conn.get_symbol_specification(symbol), timeout=6.0)
-    except Exception as e:
-        log.warning(f"could not read the broker stop distance: {e}")
-        return None
-    try:
-        points = float((spec or {}).get("stopsLevel", 0) or 0)
-        digits = int((spec or {}).get("digits", 2) or 2)
-    except (TypeError, ValueError):
-        return None
-    gap = round(points * (10 ** -digits), 5)
-    _stops["value"] = gap
-    log.info(f"broker stop distance for {symbol}: {points} points = {gap}$")
-    return gap
+    spec = await symbol_spec(conn, symbol)
+    return None if spec is None else spec["gap"]
 
 
 # --- the owner's rule, handed to the server instead of polled for -------------------

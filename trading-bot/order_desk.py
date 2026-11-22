@@ -60,18 +60,39 @@ def kind(side, price, bid, ask):
     return None, "سعر البيع يساوي السوق — استخدم صفقة فورية مو أمر معلّق"
 
 
-def check(side, price, tp, sl, bid, ask, gap=0.0, lot=0.01, contract=100.0):
+def check(side, price, tp, sl, bid, ask, gap=0.0, lot=0.01, contract=None,
+          digits=2, symbol="", lot_why=None):
     """Everything about the order, or (None, why) with the reason in plain words.
 
     Refuses here whatever the broker would refuse there. A rejection from MetaApi
     arrives as a code the owner cannot read, minutes after he typed the command;
     a refusal here arrives with the number that was wrong.
+
+    `contract` has NO default on purpose. Gold is 100 ounces a lot and bitcoin is 1
+    coin, so a missing contract size is not a detail to paper over with the number
+    that happened to be right for the instrument this bot started on - every dollar
+    figure would be out by a hundredfold, in the direction that understates the risk.
+    Unknown means refuse, and the caller gets told to ask the broker.
+
+    `digits` is that symbol's own precision. Prices are rounded to it before any
+    comparison, so a level the broker cannot even quote is never checked as though
+    it could be.
     """
     k, why = kind(side, price, bid, ask)
     if k is None:
         return None, why
+    try:
+        digits = max(0, min(8, int(digits)))
+    except (TypeError, ValueError):
+        digits = 2
+    if contract in (None, "", 0) or float(contract) <= 0:
+        return None, (f"ما أعرف حجم عقد `{symbol or 'هذه الأداة'}` عند وسيطك، "
+                      f"وبدونه كل أرقام الدولار غلط. أرسل `/spec` أول.")
+    contract = float(contract)
+    if lot_why:
+        return None, lot_why
     buy = k.startswith("buy")
-    price = float(price)
+    price = round(float(price), digits)
     gap = max(0.0, float(gap or 0.0))
 
     # The entry itself has to clear the broker's minimum distance from the market.
@@ -80,8 +101,8 @@ def check(side, price, tp, sl, bid, ask, gap=0.0, lot=0.01, contract=100.0):
         return None, (f"السعر `{price}` قريب من السوق `{round(ref, 2)}` — "
                       f"الوسيط يطلب `{gap}$` على الأقل. ابعده شوي.")
 
-    tp = None if tp in (None, "") else float(tp)
-    sl = None if sl in (None, "") else float(sl)
+    tp = None if tp in (None, "") else round(float(tp), digits)
+    sl = None if sl in (None, "") else round(float(sl), digits)
 
     if tp is not None:
         if buy and tp <= price:
@@ -100,16 +121,15 @@ def check(side, price, tp, sl, bid, ask, gap=0.0, lot=0.01, contract=100.0):
             return None, (f"الوقف `{sl}` قريب من الدخول — "
                           f"الوسيط يطلب `{gap}$` على الأقل")
 
-    per = float(lot) * float(contract)
+    per = float(lot) * contract            # dollars per 1.00 of price
     risk = round(abs(price - sl) * per, 2) if sl is not None else None
     reward = round(abs(tp - price) * per, 2) if tp is not None else None
     rr = round(reward / risk, 2) if (risk and reward) else None
     return {
-        "kind": k, "side": "buy" if buy else "sell", "price": round(price, 2),
-        "tp": round(tp, 2) if tp is not None else None,
-        "sl": round(sl, 2) if sl is not None else None,
-        "lot": float(lot), "risk": risk, "reward": reward, "rr": rr,
-        "ref": round(ref, 2),
+        "kind": k, "side": "buy" if buy else "sell", "price": price,
+        "tp": tp, "sl": sl, "lot": float(lot), "risk": risk, "reward": reward,
+        "rr": rr, "ref": round(ref, digits), "digits": digits,
+        "contract": contract, "symbol": symbol,
     }, ""
 
 
@@ -119,12 +139,20 @@ KIND_WORD = {"buy_limit": "شراء عند هبوط (Buy Limit)",
              "sell_stop": "بيع عند كسر (Sell Stop)"}
 
 
-def plan_text(p, symbol):
-    """What he is about to sign, in full, before anything is sent."""
+def plan_text(p, symbol=""):
+    """What he is about to sign, in full, before anything is sent.
+
+    The instrument and its contract size are on the face of it. On a multi-instrument
+    desk the single most expensive confusion available is signing bitcoin's numbers
+    believing they are gold's, so the line that makes them different is shown rather
+    than assumed.
+    """
+    symbol = symbol or p.get("symbol") or ""
     lines = [f"📋 *أمر معلّق على `{symbol}`*",
              f"• النوع: {KIND_WORD.get(p['kind'], p['kind'])}",
              f"• ينفّذ عند `{p['price']}` (السوق الآن `{p['ref']}`)",
-             f"• اللوت `{p['lot']:g}`"]
+             f"• اللوت `{p['lot']:g}` · العقد `{p.get('contract', 0):g}` وحدة "
+             f"= `{round(p['lot'] * p.get('contract', 0), 4):g}` للنقطة الكاملة"]
     if p["tp"] is not None:
         lines.append(f"• 🎯 يغلق على ربح عند `{p['tp']}` = `{p['reward']}$`")
     else:

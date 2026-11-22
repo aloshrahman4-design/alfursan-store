@@ -801,6 +801,91 @@ ASSET_WORDS = {"gold": "gold", "ذهب": "gold", "xau": "gold",
                "silver": "silver", "فضة": "silver", "xag": "silver"}
 
 
+def pick_symbol(which, symbols, prefix=""):
+    """Which of the account's symbol names is the instrument `which`, or (None, why).
+
+    Lifted out of /asset so that /order resolves a name the same way. It used to live
+    inside that command, which meant a second command wanting the same answer had to
+    copy it - and a copied rule is how this project lost three weeks. Pure: it is given
+    the account's list and returns a choice, so a test can hand it any broker's naming.
+
+    `prefix` is the command the owner should send to act on a name it offers. /asset
+    passes its own, because tapping `/asset BTCUSD` goes down the path that also sets
+    the lot size and the step for that instrument, while a bare name invites
+    `/setkey symbol`, which skips both and leaves bitcoin running on gold's
+    hundred-ounce contract. A suggestion that leads to the wrong command is worse
+    than no suggestion.
+    """
+    hunt = ASSET_HUNT.get(which)
+    if hunt is None:
+        return None, f"ما أعرف أداة اسمها `{which}`"
+    matches = [x for x in symbols if any(w in x.upper() for w in hunt["want"])]
+    if not matches:
+        # "Not found" with nothing else is a dead end. Show what the account actually
+        # carries that is even vaguely related, so he can pick a name instead of
+        # guessing whether the broker offers it at all.
+        near = [x for x in symbols if any(k in x.upper() for k in
+                ("BTC", "ETH", "CRYPTO", "COIN", "XAU", "XAG", "GOLD", "SILVER"))][:15]
+        hint = ("\n\nالموجود بحسابك من هذا النوع:\n"
+                + "\n".join(f"• `{prefix}{x}`" for x in near)) if near else \
+               f"\n\nعدد أدوات حسابك `{len(symbols)}` وماكو ولا وحدة قريبة من هذا النوع."
+        return None, (f"ما لكيت أداة {hunt['ar']} بهذا الحساب — "
+                      f"يعني وسيطك ما يوفرها على الأغلب.{hint}")
+
+    def _stripped(name):
+        up = name.upper()
+        for w in hunt["want"]:
+            up = up.replace(w, "")
+        return up
+
+    # XAUEUR and BTCEUR are the same asset against another currency, not the one traded.
+    best = [x for x in matches if not any(c in _stripped(x) for c in hunt["avoid"])] or matches
+    # BTC against USD is the one being asked for. An account also lists BTCETH, BTCLTC,
+    # BTCXAU and friends - every one of them bitcoin, none of them the instrument.
+    usd = [x for x in best if _stripped(x) in ("USD", "USDT", "USDC")]
+    if len(usd) == 1:
+        best = usd
+    if len(best) > 1:
+        return None, ("لكيت أكثر من أداة " + hunt["ar"] + " — اختر واحدة وأرسل سطرها:\n\n"
+                      + "\n".join(f"• `{prefix}{x}`" for x in best[:12]))
+    return best[0], ""
+
+
+async def resolve_symbol(word):
+    """A word from the owner -> a name his broker actually quotes, or (None, why).
+
+    Empty means the instrument the bot itself trades. A name the broker lists is taken
+    as given. A word this does not know is REFUSED: it does not fall back to gold,
+    because an order sized for gold and sent on bitcoin is a hundredfold mistake, and
+    silently picking the default is how /asset once reported a switch that never
+    happened.
+    """
+    global symbols_cache
+    word = str(word or "").strip()
+    if not word:
+        return SYMBOL, ""
+    if connection is None:
+        return None, "ماكو اتصال بالوسيط"
+    if not hasattr(connection, "get_symbols"):
+        return None, "هذا الوسيط ما يعطي قائمة أدوات"
+    try:
+        symbols = list(symbols_cache) if symbols_cache else list(
+            await asyncio.wait_for(connection.get_symbols(), timeout=30) or [])
+    except Exception as e:
+        return None, f"ما كدرت أجيب قائمة الأدوات: `{str(e)[:150]}`"
+    symbols_cache = list(symbols)
+    up = word.upper()
+    exact = [x for x in symbols if x.upper() == up]
+    if exact:
+        return exact[0], ""
+    which = ASSET_WORDS.get(word.lower())
+    if which is None:
+        opts = " · ".join(f"`{k}`" for k in ASSET_WORDS if k.isascii())
+        return None, (f"ما أعرف أداة اسمها `{word}` وما راح أخمّن.\n"
+                      f"المعروف: {opts}\nأو اكتب اسمها عند وسيطك بالضبط.")
+    return pick_symbol(which, symbols, prefix="/asset ")
+
+
 async def handle_gold_symbol(arg=""):
     """/gold or /asset <name> — ask the broker what this instrument is called here.
 
@@ -851,40 +936,14 @@ async def handle_gold_symbol(arg=""):
         await send_long(f"⚠️ ما كدرت أجيب قائمة الأدوات: `{str(e)[:250]}`", markup=keyboard())
         return
     symbols_cache = list(symbols)
-    matches = [s for s in symbols if any(w in s.upper() for w in hunt["want"])]
-    if not matches:
-        # "Not found" with nothing else is a dead end. Show what the account actually
-        # carries that is even vaguely related, so he can pick a name instead of
-        # guessing whether the broker offers it at all.
-        near = [x for x in symbols if any(k in x.upper() for k in
-                ("BTC", "ETH", "CRYPTO", "COIN", "XAU", "XAG", "GOLD", "SILVER"))][:15]
-        hint = ("\n\nالموجود بحسابك من هذا النوع:\n"
-                + "\n".join(f"• `/asset {x}`" for x in near)) if near else \
-               f"\n\nعدد أدوات حسابك `{len(symbols)}` وماكو ولا وحدة قريبة من هذا النوع."
-        await send_long(f"⚠️ ما لكيت أداة {hunt['ar']} بهذا الحساب — "
-                        f"يعني وسيطك ما يوفرها على الأغلب.{hint}", markup=keyboard())
-        return
-    # XAUEUR and BTCEUR are the same asset against another currency, not the one we trade.
-    def _stripped(name):
-        up = name.upper()
-        for w in hunt["want"]:
-            up = up.replace(w, "")
-        return up
-    best = [s for s in matches
-            if not any(c in _stripped(s) for c in hunt["avoid"])] or matches
-    # BTC against USD is the one being asked for. The account also lists BTCETH,
-    # BTCLTC, BTCBCH, BTCXAU and friends - every one of them bitcoin, none of them the
-    # instrument. If exactly one candidate quotes in plain USD, that is it.
-    usd = [x for x in best if _stripped(x) in ("USD", "USDT", "USDC")]
-    if len(usd) == 1:
-        best = usd
-    if len(best) > 1:
-        lines = "\n".join(f"• `/asset {s}`" for s in best[:12])
-        await send_long(f"لكيت أكثر من أداة {hunt['ar']} — اختر واحدة وأرسل سطرها:\n\n{lines}",
-                        markup=keyboard())
-        return
     exact = [x for x in symbols if x.upper() == str(arg).strip().upper()]
-    found = exact[0] if exact else best[0]
+    if exact:
+        found = exact[0]
+    else:
+        found, why = pick_symbol(which, symbols, prefix="/asset ")
+        if found is None:
+            await send_long(f"⚠️ {why}", markup=keyboard())
+            return
     try:  # a name that does not quote is the wrong name, however right it looks
         price = await asyncio.wait_for(connection.get_symbol_price(symbol=found), timeout=15)
     except Exception as e:
@@ -1360,6 +1419,7 @@ HELP_TEXT = (
     "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"
     "• /break — فخّان على حافتي نطاق آخر ساعة (`/break on` · `/break off`)\n"
     "• `/order buy 3850 tp 3870 sl 3840` — أمر معلّق عند الوسيط، ينفّذ والبوت مطفي\n"
+    "   وعلى أي أداة: `/order btc buy 95000 tp 97000 sl 94000`\n"
     "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
     "• /testtrade — وضع اختبار التنفيذ: صفقة حقيقية وحدة `0.01` بوقف إلزامي\n"
     "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
@@ -2974,14 +3034,49 @@ except (TypeError, ValueError):
 _pending_order = {}          # the plan waiting for /order yes
 
 
-async def handle_order_command(text):
-    """/order - a conditional order the BROKER holds.
+_order_subs = set()           # symbols already subscribed to for quotes
 
-    Two steps on purpose. "3850" and "3580" differ by one keystroke on a phone,
-    and the difference is a trade on the wrong side of the market. The first
-    command prints exactly what will be signed, with the money in dollars; the
-    second signs it. The plan expires so a forgotten one cannot be confirmed into
-    a market that has moved under it.
+
+async def order_quote(sym):
+    """bid/ask for any instrument, or (None, None, why).
+
+    A symbol the bot does not itself trade is not subscribed to, and on MetaApi an
+    unsubscribed symbol answers with nothing or with a stale price. One subscribe per
+    symbol per session, then read.
+    """
+    if sym != SYMBOL and sym not in _order_subs:
+        sub = getattr(connection, "subscribe_to_market_data", None)
+        if sub is not None:
+            try:
+                await asyncio.wait_for(sub(symbol=sym), timeout=10.0)
+                _order_subs.add(sym)
+                await asyncio.sleep(1.0)      # let the first tick arrive
+            except Exception as e:
+                log.warning(f"could not subscribe to {sym}: {e}")
+    try:
+        q = await asyncio.wait_for(connection.get_symbol_price(symbol=sym), timeout=10.0)
+    except Exception as e:
+        return None, None, f"ما كدرت أقرا سعر `{sym}`: `{str(e)[:150]}`"
+    bid, ask = float((q or {}).get("bid", 0) or 0), float((q or {}).get("ask", 0) or 0)
+    if not (bid > 0 and ask > 0):
+        return None, None, f"`{sym}` ما طلّع سعر صالح — تأكد من اسمها بـ `/asset`"
+    return bid, ask, ""
+
+
+async def handle_order_command(text):
+    """/order - a conditional order the BROKER holds, on any instrument he names.
+
+    Two steps on purpose. "3850" and "3580" differ by one keystroke on a phone, and
+    the difference is a trade on the wrong side of the market. The first command
+    prints exactly what will be signed, with the money in dollars; the second signs
+    it. The plan expires so a forgotten one cannot be confirmed into a market that
+    has moved under it.
+
+    Every number that turns price into money is read from THAT symbol's own
+    specification. Gold is 100 ounces a lot, bitcoin is 1 coin: carrying one
+    instrument's contract size onto another is a hundredfold error in the direction
+    that understates the risk, so an unknown contract size is a refusal, not a
+    default.
     """
     global _pending_order
     if order_desk is None:
@@ -3008,7 +3103,7 @@ async def handle_order_command(text):
             await send_long(f"⌛️ الاقتراح عدّى عليه `{ORDER_TTL_SECS // 60}` دقائق "
                             f"والسوق تحرك. اكتبه من جديد.", markup=keyboard())
             return
-        await place_pending_order(plan["p"])
+        await place_pending_order(plan["p"], plan["symbol"])
         return
 
     if arg in ("list", "قائمة", ""):
@@ -3042,20 +3137,35 @@ async def handle_order_command(text):
             await send_long(f"⚠️ ما كدرت أسحبه: `{str(e)[:150]}`", markup=keyboard())
         return
 
-    # /order buy 3850 tp 3870 sl 3840 [lot 0.02]
-    if arg not in ("buy", "sell", "شراء", "بيع"):
-        await send_long(
-            "📋 *أمر معلّق عند الوسيط*\n"
-            "`/order buy 3850 tp 3870 sl 3840`\n"
-            "`/order sell 3900 tp 3880 sl 3910 lot 0.02`\n\n"
-            "• الوسيط ينفّذه ويغلقه — يشتغل والبوت مطفي\n"
-            "• `/order` يعرض المعلّق · `/order drop <رقم>` يسحب واحد\n"
-            "• نوع الأمر (Limit أو Stop) أحسبه أنا من سعر السوق",
-            markup=keyboard())
-        return
+    # /order [أداة] buy 3850 tp 3870 sl 3840 [lot 0.02]
+    SIDES = ("buy", "sell", "شراء", "بيع")
+    word = ""                          # no instrument named -> the one the bot trades
+    if arg not in SIDES:
+        # The first word is an instrument, and the side follows it.
+        nxt = parts[2].strip().lower() if len(parts) > 2 else ""
+        if nxt not in SIDES:
+            await send_long(
+                "📋 *أمر معلّق عند الوسيط*\n"
+                "`/order buy 3850 tp 3870 sl 3840`\n"
+                "`/order btc buy 95000 tp 97000 sl 94000`\n"
+                "`/order sell 3900 tp 3880 sl 3910 lot 0.02`\n\n"
+                "• الوسيط ينفّذه ويغلقه — يشتغل والبوت مطفي\n"
+                "• الأدوات: `gold` · `btc` · `eth` · `silver` أو اسمها عند وسيطك\n"
+                "• بلا أداة = اللي يتداولها البوت الآن\n"
+                "• `/order` يعرض المعلّق · `/order drop <رقم>` يسحب واحد\n"
+                "• نوع الأمر (Limit أو Stop) أحسبه أنا من سعر السوق",
+                markup=keyboard())
+            return
+        word, parts = arg, parts[:1] + parts[2:]     # drop the instrument word
+        arg = parts[1].strip().lower()
     side = "buy" if arg in ("buy", "شراء") else "sell"
     if connection is None:
         await send_long("ماكو اتصال بالوسيط — `/check`.", markup=keyboard())
+        return
+
+    sym, why = await resolve_symbol(word)
+    if sym is None:
+        await send_long(f"❌ {why}", markup=keyboard())
         return
 
     def _num(key):
@@ -3074,31 +3184,42 @@ async def handle_order_command(text):
                         markup=keyboard())
         return
     tp, sl = _num("tp"), _num("sl")
-    lot = _num("lot") or ORDER_LOT
+    lot = _num("lot")
 
-    try:
-        q = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=8.0)
-        bid, ask = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0)
-    except Exception as e:
-        await send_long(f"ما كدرت أقرا السعر: `{str(e)[:150]}`", markup=keyboard())
+    bid, ask, why = await order_quote(sym)
+    if bid is None:
+        await send_long(f"❌ {why}", markup=keyboard())
         return
-    gap = 0.0
-    try:
-        gap = float(await grid.broker_stop_gap(connection, SYMBOL) or 0.0)
-    except Exception:
-        gap = 0.0
 
-    p, why = order_desk.check(side, price, tp, sl, bid, ask, gap=gap, lot=lot,
-                              contract=float(getattr(grid, "GRID_CONTRACT", 100.0)))
+    # Everything that turns price into money comes from THIS symbol, asked of the
+    # broker, cached per symbol. Nothing here is inherited from gold.
+    spec = await grid.symbol_spec(connection, sym)
+    if spec is None:
+        await send_long(f"⚠️ وسيطك ما جاوب على مواصفات `{sym}`، وبدونها ما أعرف "
+                        f"حجم العقد ولا أقرب وقف — فما أرسل شي. جرّب `/spec`.",
+                        markup=keyboard())
+        return
+    if lot is None:
+        # His own default, raised to the instrument's minimum when that is bigger.
+        lot = max(ORDER_LOT, spec["min_lot"] or 0.0) or ORDER_LOT
+        if spec["lot_step"]:
+            st = spec["lot_step"]
+            lot = round(round(lot / st) * st, 8) or st
+
+    p, why = order_desk.check(side, price, tp, sl, bid, ask, gap=spec["gap"],
+                              lot=lot, contract=spec["contract"],
+                              digits=spec["digits"], symbol=sym,
+                              lot_why=grid.lot_problem(lot, spec))
     if p is None:
         await send_long(f"❌ {why}", markup=keyboard())
         return
-    _pending_order = {"p": p, "at": time.time()}
-    await send_long(order_desk.plan_text(p, SYMBOL), markup=keyboard())
+    _pending_order = {"p": p, "at": time.time(), "symbol": sym}
+    await send_long(order_desk.plan_text(p, sym), markup=keyboard())
 
 
-async def place_pending_order(p):
+async def place_pending_order(p, symbol=None):
     """Send it, then read the broker's own book back to prove it is there."""
+    symbol = symbol or p.get("symbol") or SYMBOL
     maker = getattr(connection, order_desk.maker_name(p["kind"]), None)
     if maker is None:
         await send_long(f"⚠️ الوسيط ما يدعم `{p['kind']}`.", markup=keyboard())
@@ -3112,7 +3233,7 @@ async def place_pending_order(p):
         return
     try:
         res = await asyncio.wait_for(
-            maker(symbol=SYMBOL, volume=p["lot"], open_price=p["price"],
+            maker(symbol=symbol, volume=p["lot"], open_price=p["price"],
                   stop_loss=p["sl"], take_profit=p["tp"],
                   options={"magic": order_desk.MAGIC_ORDER}), timeout=20.0)
     except asyncio.TimeoutError:
@@ -3139,7 +3260,7 @@ async def place_pending_order(p):
                         f"• افحص MT5 بنفسك قبل ما تعتمد عليه", markup=keyboard())
         return
     await send_long(
-        f"✅ *الأمر عند الوسيط* — رقمه `{oid}`\n"
+        f"✅ *الأمر عند الوسيط* — رقمه `{oid}` على `{symbol}`\n"
         f"• ينفّذ عند `{seen.get('openPrice', p['price'])}`\n"
         f"• هدف `{seen.get('takeProfit') or 'ماكو'}` · وقف `{seen.get('stopLoss') or 'ماكو'}`\n"
         f"• من الآن الوسيط مسؤول عنه — يشتغل والبوت مطفي\n"
@@ -3160,7 +3281,8 @@ async def pending_orders_text():
                 "مثال: `/order buy 3850 tp 3870 sl 3840`")
     out = [f"📋 *أوامرك المعلّقة* (`{len(mine)}`)"]
     for o in mine:
-        out.append(f"• `{o.get('id')}` · `{o.get('type', '?')}` `{o.get('volume')}` "
+        out.append(f"• `{o.get('id')}` · `{o.get('symbol') or '?'}` · "
+                   f"`{o.get('type', '?')}` `{o.get('volume')}` "
                    f"@ `{o.get('openPrice')}` · هدف `{o.get('takeProfit') or '—'}` "
                    f"· وقف `{o.get('stopLoss') or '—'}`")
     out.append("\n`/order drop <رقم>` يسحب واحد")
@@ -3421,9 +3543,41 @@ async def ensure_adopted_stop(pid, want=None):
     except Exception:
         gap = 0.0
     spread = max(0.0, ask - bid)
-    dist = round(max(float(want or ADOPT_STOP_DOLLARS), gap + spread + 0.10), 2)
+    # ADOPT_STOP_DOLLARS is MONEY, and converting it to a price distance needs this
+    # instrument's contract size and this position's volume. It used to be used as a
+    # price distance directly, which is accidentally correct on gold - 0.01 lot of a
+    # 100-ounce contract moves 1$ per 1$ of price - and badly wrong anywhere else: on
+    # bitcoin, whose contract is 1 coin, "3" became a stop three dollars away from a
+    # ninety-thousand-dollar price, which the first tick takes out. The money the
+    # owner typed is the money he meant.
+    sym = p.get("symbol") or SYMBOL
+    want_cash = float(want or ADOPT_STOP_DOLLARS)
+    spec = None
+    try:
+        spec = await grid.symbol_spec(connection, sym)
+        if spec is None or not spec.get("contract"):
+            # One forced retry before giving up. A cached failure is usually a network
+            # blip, and this is a live trade being handed over for protection - worth
+            # one more request before telling him to do it himself.
+            spec = await grid.symbol_spec(connection, sym, force=True)
+    except Exception:
+        spec = None
+    vol = 0.0
+    try:
+        vol = float(p.get("volume") or 0)
+    except (TypeError, ValueError):
+        vol = 0.0
+    per = (vol * spec["contract"]) if (spec and spec.get("contract") and vol) else 0.0
+    if per <= 0:
+        # No contract size means no way to turn money into price. Refusing beats
+        # inventing a distance on a live trade.
+        return (f"• ⚠️ ما أعرف حجم عقد `{sym}` فما كدرت أحوّل `{want_cash:g}$` "
+                f"لمسافة سعر — ما حطيت وقف. جرّب `/spec`.")
+    digits = int(spec.get("digits") or 2)
+    want_px = want_cash / per
+    dist = round(max(want_px, gap + spread + (10.0 ** -digits) * 10), digits)
     ref = bid if is_buy else ask
-    sl = round(ref - dist, 2) if is_buy else round(ref + dist, 2)
+    sl = round(ref - dist, digits) if is_buy else round(ref + dist, digits)
     try:
         await asyncio.wait_for(connection.modify_position(p["id"], stop_loss=sl), timeout=8.0)
     except Exception as e:
@@ -3440,9 +3594,11 @@ async def ensure_adopted_stop(pid, want=None):
     if not got:
         return ("• 🚨 *الوسيط ما قبل الوقف* — الصفقة بلا حماية عنده\n"
                 "  حطّه بيدك من MT5 الآن")
-    risk = round(abs(ref - got) * float(p.get("volume", 0) or 0)
-                 * float(getattr(grid, "GRID_CONTRACT", 100.0)), 2)
-    return (f"• 🛡 حطيت وقف عند `{got}` وتأكدت إنه عند الوسيط\n"
+    # `per` is this instrument's own money-per-price, worked out above from its
+    # contract size. GRID_CONTRACT used to be read here, which reported gold's
+    # hundred ounces for whatever the position actually was.
+    risk = round(abs(ref - got) * per, 2)
+    return (f"• 🛡 حطيت وقف عند `{got}` على `{sym}` وتأكدت إنه عند الوسيط\n"
             f"  أقصى خسارة `{risk}$` — يشتغل حتى لو البوت مطفي أو النت مقطوع")
 
 
