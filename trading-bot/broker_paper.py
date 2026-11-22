@@ -297,7 +297,7 @@ class PaperBroker:
             _save(state)
 
     async def _place_pending(self, kind, volume, open_price, options, take_profit=None,
-                             symbol=None):
+                             symbol=None, stop_loss=None):
         state = _load()
         order = {
             "id": f"O{state['next_id']}",
@@ -306,6 +306,9 @@ class PaperBroker:
             "magic": (options or {}).get("magic", 0),
             "openPrice": round(float(open_price), 2),
             "takeProfit": round(float(take_profit), 2) if take_profit else None,
+            # Recorded so a test can prove the stop reached the book, not just the
+            # call. "I sent it" and "the broker holds it" are different claims.
+            "stopLoss": round(float(stop_loss), 2) if stop_loss else None,
             "volume": float(volume or 0.01),
             "placedAt": int(time.time()),
         }
@@ -314,15 +317,25 @@ class PaperBroker:
         _save(state)
         return {"orderId": order["id"]}
 
+    async def create_limit_buy_order(self, symbol=None, volume=None, open_price=None,
+                                     stop_loss=None, take_profit=None, options=None, **kw):
+        return await self._place_pending("ORDER_TYPE_BUY_LIMIT", volume, open_price,
+                                         options, take_profit, symbol, stop_loss)
+
+    async def create_limit_sell_order(self, symbol=None, volume=None, open_price=None,
+                                      stop_loss=None, take_profit=None, options=None, **kw):
+        return await self._place_pending("ORDER_TYPE_SELL_LIMIT", volume, open_price,
+                                         options, take_profit, symbol, stop_loss)
+
     async def create_stop_buy_order(self, symbol=None, volume=None, open_price=None,
                                     stop_loss=None, take_profit=None, options=None, **kw):
         return await self._place_pending("ORDER_TYPE_BUY_STOP", volume, open_price,
-                                         options, take_profit, symbol)
+                                         options, take_profit, symbol, stop_loss)
 
     async def create_stop_sell_order(self, symbol=None, volume=None, open_price=None,
                                      stop_loss=None, take_profit=None, options=None, **kw):
         return await self._place_pending("ORDER_TYPE_SELL_STOP", volume, open_price,
-                                         options, take_profit, symbol)
+                                         options, take_profit, symbol, stop_loss)
 
     async def get_orders(self, **kw):
         await self._trigger_pending()

@@ -116,6 +116,8 @@ SETTABLE_KEYS = {
     "BREAK_MAX_RANGE": "أوسع نطاق يستاهل النصب",
     "BREAK_MAX_LOSSES": "خسائر اليوم قبل ما يوقف",
     "BREAK_EXPIRY_MINS": "عمر الفخ قبل ما يُسحب",
+    "ORDER_TTL_SECS": "كم ثانية يبقى الأمر المقترح صالحاً للتأكيد",
+    "ORDER_LOT": "لوت `/order` الافتراضي إذا ما كتبت `lot`",
     "ADOPT_STOP_DOLLARS": "بُعد الوقف اللي يُحط على صفقة تسلّمها للبوت",
     "HEARTBEAT_MINS": "كل كم دقيقة يرسل نبضة وهو ماسك صفقات (0 = مطفي)",
     "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
@@ -222,7 +224,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "break": "BREAK_ENABLED", "breaklot": "BREAK_LOT", "breaktf": "BREAK_TF", "breakedge": "BREAK_EDGE_PCT", "breakstop": "BREAK_STOP_PCT", "breakmin": "BREAK_MIN_RANGE", "breakmax": "BREAK_MAX_RANGE", "breaklosses": "BREAK_MAX_LOSSES", "breakexpiry": "BREAK_EXPIRY_MINS", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "break": "BREAK_ENABLED", "breaklot": "BREAK_LOT", "breaktf": "BREAK_TF", "breakedge": "BREAK_EDGE_PCT", "breakstop": "BREAK_STOP_PCT", "breakmin": "BREAK_MIN_RANGE", "breakmax": "BREAK_MAX_RANGE", "breaklosses": "BREAK_MAX_LOSSES", "breakexpiry": "BREAK_EXPIRY_MINS", "orderttl": "ORDER_TTL_SECS", "orderlot": "ORDER_LOT", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     # pct/trail/percent used to point at PULLBACK_PCT, which governs nothing now.
     # An alias that writes a value nobody reads is the exact failure this whole
     # session was spent on, so they point at the rule that is actually applied.
@@ -431,6 +433,12 @@ except Exception as _e:
 # happened. So this file repairs itself before importing anything that needs it.
 import entry_safety as safety
 from entry_safety import require_entry_permission
+
+try:
+    import order_desk                       # one conditional order, held by the broker
+except Exception as _e:
+    order_desk = None
+    log.warning(f"order_desk unavailable: {_e}")
 
 try:
     import range_break                      # two traps on the last hour's edges
@@ -1099,7 +1107,7 @@ async def handle_setkey(text, chat_id, message_id):
 
 CODE_FILES = ("range_harvester.py", "intel.py", "datafeed.py", "broker_capital.py",
               "broker_paper.py", "grid.py", "entry_safety.py", "range_break.py",
-              "backtest_break.py")
+              "backtest_break.py", "order_desk.py")
 
 
 BACKUP_DIR = os.path.join(BASE_DIR, ".backup")
@@ -1349,7 +1357,9 @@ HELP_TEXT = (
     "• /spec — يسأل وسيطك عن أقل لوت وأقرب وقف ويقارنها بإعداداتك\n"
     "• /trades — كل صفقة مفتوحة: مين يديرها، وقفها، وشنو يشتغل عليها الجاي\n"
     "• /adopt <رقم> — يخلي البوت يحمي صفقة فتحتها إنت بيدك (/unadopt يرجّعها)\n"
-    "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"    "• /break — فخّان على حافتي نطاق آخر ساعة (`/break on` · `/break off`)\n"
+    "• /sleep — يستلم كل صفقاتك اليدوية ويحط وقف على كل وحدة (/sleep off يرجّعهن)\n"
+    "• /break — فخّان على حافتي نطاق آخر ساعة (`/break on` · `/break off`)\n"
+    "• `/order buy 3850 tp 3870 sl 3840` — أمر معلّق عند الوسيط، ينفّذ والبوت مطفي\n"
     "• /reconcile — يقارن اللي يحسبه البوت باللي عند الوسيط فعلاً\n"
     "• /testtrade — وضع اختبار التنفيذ: صفقة حقيقية وحدة `0.01` بوقف إلزامي\n"
     "• /rollback — يرجّع النسخة السابقة إذا طلع `/update` مشكلة\n"
@@ -2953,6 +2963,210 @@ async def range_break_engine():
 last_break_note = 0.0
 
 
+ORDER_TTL_SECS = int(os.environ.get("ORDER_TTL_SECS", "300"))
+# Its own lot, deliberately not grid's. GRID_BASE_LOT is 0.02 and governs a
+# different strategy; a hand-placed order inheriting it would quietly be
+# double what the command implies.
+try:
+    ORDER_LOT = float(os.environ.get("ORDER_LOT", "0.01"))
+except (TypeError, ValueError):
+    ORDER_LOT = 0.01
+_pending_order = {}          # the plan waiting for /order yes
+
+
+async def handle_order_command(text):
+    """/order - a conditional order the BROKER holds.
+
+    Two steps on purpose. "3850" and "3580" differ by one keystroke on a phone,
+    and the difference is a trade on the wrong side of the market. The first
+    command prints exactly what will be signed, with the money in dollars; the
+    second signs it. The plan expires so a forgotten one cannot be confirmed into
+    a market that has moved under it.
+    """
+    global _pending_order
+    if order_desk is None:
+        await send_long("وحدة الأوامر مو محمّلة — `/update`.", markup=keyboard())
+        return
+    parts = text.split()
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if arg in ("no", "cancel", "الغاء", "إلغاء") and len(parts) == 2:
+        had = bool(_pending_order)
+        _pending_order = {}
+        await send_long("أُلغي الأمر المقترح." if had else "ماكو أمر مقترح.",
+                        markup=keyboard())
+        return
+
+    if arg in ("yes", "ok", "نعم", "تمام"):
+        plan = _pending_order
+        _pending_order = {}
+        if not plan:
+            await send_long("ماكو أمر مقترح. اكتب `/order buy 3850 tp 3870 sl 3840`.",
+                            markup=keyboard())
+            return
+        if time.time() - plan["at"] > ORDER_TTL_SECS:
+            await send_long(f"⌛️ الاقتراح عدّى عليه `{ORDER_TTL_SECS // 60}` دقائق "
+                            f"والسوق تحرك. اكتبه من جديد.", markup=keyboard())
+            return
+        await place_pending_order(plan["p"])
+        return
+
+    if arg in ("list", "قائمة", ""):
+        await send_long(await pending_orders_text(), markup=keyboard())
+        return
+
+    if arg in ("drop", "سحب") and len(parts) > 2:
+        oid = parts[2].strip("`")
+        # Never cancel an order this command did not place. A pending order the
+        # owner set by hand is magic 0 and is his alone - the same rule that keeps
+        # the bot off his manual positions applies to his manual orders.
+        try:
+            book = await asyncio.wait_for(connection.get_orders(), timeout=10.0) or []
+        except Exception as e:
+            await send_long(f"⚠️ ما كدرت أقرا الأوامر فما أسحب شي: `{str(e)[:150]}`",
+                            markup=keyboard())
+            return
+        target = next((o for o in book if str(o.get("id")) == str(oid)), None)
+        if target is None:
+            await send_long(f"ماكو أمر رقمه `{oid}` عند الوسيط.", markup=keyboard())
+            return
+        if target.get("magic") != order_desk.MAGIC_ORDER:
+            await send_long(f"🚫 الأمر `{oid}` مو مني (magic "
+                            f"`{target.get('magic')}`) — ما ألمسه. "
+                            f"إذا هو إلك اسحبه من MT5.", markup=keyboard())
+            return
+        try:
+            await asyncio.wait_for(connection.cancel_order(oid), timeout=8.0)
+            await send_long(f"🧹 سحبت الأمر `{oid}`.", markup=keyboard())
+        except Exception as e:
+            await send_long(f"⚠️ ما كدرت أسحبه: `{str(e)[:150]}`", markup=keyboard())
+        return
+
+    # /order buy 3850 tp 3870 sl 3840 [lot 0.02]
+    if arg not in ("buy", "sell", "شراء", "بيع"):
+        await send_long(
+            "📋 *أمر معلّق عند الوسيط*\n"
+            "`/order buy 3850 tp 3870 sl 3840`\n"
+            "`/order sell 3900 tp 3880 sl 3910 lot 0.02`\n\n"
+            "• الوسيط ينفّذه ويغلقه — يشتغل والبوت مطفي\n"
+            "• `/order` يعرض المعلّق · `/order drop <رقم>` يسحب واحد\n"
+            "• نوع الأمر (Limit أو Stop) أحسبه أنا من سعر السوق",
+            markup=keyboard())
+        return
+    side = "buy" if arg in ("buy", "شراء") else "sell"
+    if connection is None:
+        await send_long("ماكو اتصال بالوسيط — `/check`.", markup=keyboard())
+        return
+
+    def _num(key):
+        for i, w in enumerate(parts):
+            if w.lower() == key and i + 1 < len(parts):
+                try:
+                    return float(parts[i + 1])
+                except ValueError:
+                    return None
+        return None
+
+    try:
+        price = float(parts[2])
+    except (IndexError, ValueError):
+        await send_long("ماكو سعر. مثال: `/order buy 3850 tp 3870 sl 3840`",
+                        markup=keyboard())
+        return
+    tp, sl = _num("tp"), _num("sl")
+    lot = _num("lot") or ORDER_LOT
+
+    try:
+        q = await asyncio.wait_for(connection.get_symbol_price(symbol=SYMBOL), timeout=8.0)
+        bid, ask = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0)
+    except Exception as e:
+        await send_long(f"ما كدرت أقرا السعر: `{str(e)[:150]}`", markup=keyboard())
+        return
+    gap = 0.0
+    try:
+        gap = float(await grid.broker_stop_gap(connection, SYMBOL) or 0.0)
+    except Exception:
+        gap = 0.0
+
+    p, why = order_desk.check(side, price, tp, sl, bid, ask, gap=gap, lot=lot,
+                              contract=float(getattr(grid, "GRID_CONTRACT", 100.0)))
+    if p is None:
+        await send_long(f"❌ {why}", markup=keyboard())
+        return
+    _pending_order = {"p": p, "at": time.time()}
+    await send_long(order_desk.plan_text(p, SYMBOL), markup=keyboard())
+
+
+async def place_pending_order(p):
+    """Send it, then read the broker's own book back to prove it is there."""
+    maker = getattr(connection, order_desk.maker_name(p["kind"]), None)
+    if maker is None:
+        await send_long(f"⚠️ الوسيط ما يدعم `{p['kind']}`.", markup=keyboard())
+        return
+    try:
+        safety.require_entry_permission(stop_loss=p["sl"], lot=p["lot"],
+                                        conn=connection)
+    except Exception as e:
+        await send_long(f"🔒 قفل الأمان رفض: `{str(e)[:160]}`\n"
+                        f"• ما انرسل شي.", markup=keyboard())
+        return
+    try:
+        res = await asyncio.wait_for(
+            maker(symbol=SYMBOL, volume=p["lot"], open_price=p["price"],
+                  stop_loss=p["sl"], take_profit=p["tp"],
+                  options={"magic": order_desk.MAGIC_ORDER}), timeout=20.0)
+    except asyncio.TimeoutError:
+        await send_long("🚨 *مهلة الإرسال — الحالة مجهولة*\n"
+                        "• ممكن وصل وممكن لا. **ما أعيد المحاولة.**\n"
+                        "• `/order` يعرض اللي عند الوسيط فعلاً", markup=keyboard())
+        return
+    except Exception as e:
+        await send_long(f"❌ الوسيط رفض: `{str(e)[:200]}`", markup=keyboard())
+        return
+    oid = (res or {}).get("orderId")
+    # Saying "sent" is not saying "the broker has it". Read it back.
+    seen = None
+    try:
+        await asyncio.sleep(1.5)
+        for o in (await asyncio.wait_for(connection.get_orders(), timeout=10.0) or []):
+            if str(o.get("id")) == str(oid):
+                seen = o
+                break
+    except Exception:
+        seen = None
+    if seen is None:
+        await send_long(f"⚠️ أرسلته (`{oid}`) بس ما ألقيته بقائمة الوسيط.\n"
+                        f"• افحص MT5 بنفسك قبل ما تعتمد عليه", markup=keyboard())
+        return
+    await send_long(
+        f"✅ *الأمر عند الوسيط* — رقمه `{oid}`\n"
+        f"• ينفّذ عند `{seen.get('openPrice', p['price'])}`\n"
+        f"• هدف `{seen.get('takeProfit') or 'ماكو'}` · وقف `{seen.get('stopLoss') or 'ماكو'}`\n"
+        f"• من الآن الوسيط مسؤول عنه — يشتغل والبوت مطفي\n"
+        f"• `/order drop {oid}` يسحبه", markup=keyboard())
+
+
+async def pending_orders_text():
+    """What the broker is actually holding for us."""
+    if connection is None:
+        return "ماكو اتصال بالوسيط — `/check`."
+    try:
+        orders = await asyncio.wait_for(connection.get_orders(), timeout=10.0) or []
+    except Exception as e:
+        return f"⚠️ ما كدرت أقرا الأوامر: `{str(e)[:150]}`"
+    mine = [o for o in orders if o.get("magic") == order_desk.MAGIC_ORDER]
+    if not mine:
+        return ("ماكو أوامر معلّقة من `/order`.\n"
+                "مثال: `/order buy 3850 tp 3870 sl 3840`")
+    out = [f"📋 *أوامرك المعلّقة* (`{len(mine)}`)"]
+    for o in mine:
+        out.append(f"• `{o.get('id')}` · `{o.get('type', '?')}` `{o.get('volume')}` "
+                   f"@ `{o.get('openPrice')}` · هدف `{o.get('takeProfit') or '—'}` "
+                   f"· وقف `{o.get('stopLoss') or '—'}`")
+    out.append("\n`/order drop <رقم>` يسحب واحد")
+    return "\n".join(out)
+
+
 async def handle_break_command(text):
     """/break - the state of the two traps, and the switch."""
     if range_break is None:
@@ -3917,6 +4131,8 @@ async def process_update(update):
                 await handle_rollback()
             elif text.startswith("/live"):
                 await handle_go_live()
+            elif text.startswith("/order") or text.startswith("/امر"):
+                await handle_order_command(text)
             elif text.startswith("/break") or text.startswith("/كسر"):
                 await handle_break_command(text)
             elif text.startswith("/sleep") or text.startswith("/نوم"):
