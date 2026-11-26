@@ -118,6 +118,7 @@ SETTABLE_KEYS = {
     "BREAK_EXPIRY_MINS": "عمر الفخ قبل ما يُسحب",
     "ORDER_TTL_SECS": "كم ثانية يبقى الأمر المقترح صالحاً للتأكيد",
     "ORDER_LOT": "لوت `/order` الافتراضي إذا ما كتبت `lot`",
+    "LISTEN_DEAD_SECS": "كم ثانية بلا استلام أوامر قبل ما يصيح (0 = مطفي)",
     "ADOPT_STOP_DOLLARS": "بُعد الوقف اللي يُحط على صفقة تسلّمها للبوت",
     "HEARTBEAT_MINS": "كل كم دقيقة يرسل نبضة وهو ماسك صفقات (0 = مطفي)",
     "UPDATE_BRANCH": "فرع GitHub اللي يسحب منه /update",
@@ -224,7 +225,7 @@ KEY_ALIASES = {
     "poll": "NEWS_POLL_MINUTES", "symbols": "EXTRA_SYMBOLS",
     "broker": "BROKER", "capkey": "CAPITAL_API_KEY", "capmail": "CAPITAL_EMAIL",
     "cappass": "CAPITAL_PASSWORD", "capdemo": "CAPITAL_DEMO", "capsize": "CAPITAL_TRADE_SIZE",
-    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "break": "BREAK_ENABLED", "breaklot": "BREAK_LOT", "breaktf": "BREAK_TF", "breakedge": "BREAK_EDGE_PCT", "breakstop": "BREAK_STOP_PCT", "breakmin": "BREAK_MIN_RANGE", "breakmax": "BREAK_MAX_RANGE", "breaklosses": "BREAK_MAX_LOSSES", "breakexpiry": "BREAK_EXPIRY_MINS", "orderttl": "ORDER_TTL_SECS", "orderlot": "ORDER_LOT", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
+    "active": "BOT_ACTIVE", "system": "BOT_ACTIVE", "sl": "STOP_LOSS_DIST", "tp": "TAKE_PROFIT_DIST", "ipv4": "FORCE_IPV4", "break": "BREAK_ENABLED", "breaklot": "BREAK_LOT", "breaktf": "BREAK_TF", "breakedge": "BREAK_EDGE_PCT", "breakstop": "BREAK_STOP_PCT", "breakmin": "BREAK_MIN_RANGE", "breakmax": "BREAK_MAX_RANGE", "breaklosses": "BREAK_MAX_LOSSES", "breakexpiry": "BREAK_EXPIRY_MINS", "orderttl": "ORDER_TTL_SECS", "orderlot": "ORDER_LOT", "deaf": "LISTEN_DEAD_SECS", "branch": "UPDATE_BRANCH", "adoptsl": "ADOPT_STOP_DOLLARS", "heartbeat": "HEARTBEAT_MINS", "pulse": "HEARTBEAT_MINS", "minbytes": "UPDATE_MIN_BYTES", "mintext": "UPDATE_MIN_TEXT_BYTES", "lean": "LEAN", "signal": "SIGNAL", "lot": "TRADE_LOT",
     # pct/trail/percent used to point at PULLBACK_PCT, which governs nothing now.
     # An alias that writes a value nobody reads is the exact failure this whole
     # session was spent on, so they point at the rule that is actually applied.
@@ -4466,7 +4467,60 @@ async def process_update(update):
         elif update.callback_query:
             asyncio.create_task(handle_callback(update.callback_query))
     except Exception as e:
+        # This used to log and stop there. The owner runs this from a phone with no
+        # shell, so a line in a log file he cannot open is the same as silence - and
+        # silence here looks exactly like a dead bot: the engines keep sending their
+        # scheduled notices while every command he types vanishes. That happened, for
+        # eight and a half hours, and the only evidence was that nothing came back.
         log.error(f"Process update error: {e}", exc_info=True)
+        try:
+            _cmd = ""
+            if getattr(update, "message", None) and update.message.text:
+                _cmd = update.message.text.strip().split()[0]
+            await send_long(f"🚨 *الأمر `{_cmd or '؟'}` وقع بخطأ داخلي*\n"
+                            f"`{type(e).__name__}: {str(e)[:300]}`\n"
+                            f"• البوت شغّال — هذا الأمر وحده فشل\n"
+                            f"• جرّب `/update` إذا تكرر")
+        except Exception:
+            log.error("could not even report the failure to telegram", exc_info=True)
+
+
+# When the last getUpdates call actually came back. Sending and receiving are two
+# different paths on this bot, and only one of them is visible to the owner: if the
+# receiving half stops, the engines carry on posting their scheduled notices and the
+# bot looks perfectly healthy while every command he types disappears. That is not a
+# hypothetical - it ran that way for eight and a half hours before the process died,
+# and nothing in the chat said so. This timestamp is what lets the bot notice.
+_poll = {"ok": 0.0, "warned": 0.0}
+try:
+    LISTEN_DEAD_SECS = float(os.environ.get("LISTEN_DEAD_SECS", "300"))
+except (TypeError, ValueError):
+    LISTEN_DEAD_SECS = 300.0
+# How long an engine must have been up for its failure to count as a stumble rather
+# than a loop.
+HEALTHY_RUN_SECS = 60.0
+
+
+async def listener_watchdog():
+    """Say it out loud when the bot can send but can no longer hear.
+
+    Deliberately a separate task from the listener: a watchdog that lives inside the
+    thing it watches reports nothing when that thing is the part that stopped.
+    """
+    while True:
+        await asyncio.sleep(60)
+        if LISTEN_DEAD_SECS <= 0 or not _poll["ok"]:
+            continue                      # never polled yet; nothing to compare to
+        quiet = time.time() - _poll["ok"]
+        if quiet < LISTEN_DEAD_SECS:
+            continue
+        if time.time() - _poll["warned"] < 3600:
+            continue                      # one warning an hour, not one a minute
+        _poll["warned"] = time.time()
+        await notify(f"🚨 *ما أستلم أوامر من `{int(quiet // 60)}` دقيقة*\n"
+                     f"• الإرسال شغّال — هذي الرسالة دليله\n"
+                     f"• بس أوامرك ما تصلني، فلا تعتمد على أي أمر ترسله\n"
+                     f"• أعد تشغيل الخدمة من Oracle")
 
 
 async def telegram_listener():
@@ -4476,6 +4530,7 @@ async def telegram_listener():
         try:
             updates = await asyncio.wait_for(bot.get_updates(offset=offset, timeout=10), timeout=20)
             conflicts = 0
+            _poll["ok"] = time.time()
             for u in updates:
                 offset = u.update_id + 1
                 asyncio.create_task(process_update(u))
@@ -4496,16 +4551,40 @@ async def telegram_listener():
 
 
 async def supervise(name, coro_func):
-    """Restart a task loop if it ever raises instead of letting the whole process die silently."""
+    """Keep an engine running, and never let one die quietly.
+
+    Every engine here is an endless loop, so returning is as much a fault as raising -
+    but the old version logged "exited; not restarting" and returned, leaving a dead
+    engine behind with nothing said to anyone. If that engine is the Telegram
+    listener, the bot goes on sending its scheduled notices while every command the
+    owner types disappears, which is indistinguishable from a crash he can see. It
+    restarts now, and it says so.
+    """
+    restarts = 0
     while True:
+        began = time.time()
         try:
             await coro_func()
-            log.warning(f"Task '{name}' exited; not restarting")
-            return
+            restarts += 1
+            log.error(f"Task '{name}' returned unexpectedly (restart {restarts})")
+            if restarts in (1, 5, 20):
+                await notify(f"⚠️ *المحرك '{name}' توقف من نفسه* — أعيد تشغيله "
+                             f"(المحاولة `{restarts}`).")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
+            restarts += 1
             log.error(f"Task '{name}' crashed unexpectedly: {e}", exc_info=True)
             await notify(f"⚠️ **خطأ داخلي في '{name}'، جاري إعادة التشغيل تلقائياً...**\n`{e}`")
-            await asyncio.sleep(3)
+        # An engine that ran for a decent stretch before falling over is not the same
+        # animal as one failing instantly in a loop, so the count resets. Without that
+        # the backoff only ever grows, and an engine that stumbles once a day ends up
+        # waiting a minute to come back for no reason at all.
+        if time.time() - began > HEALTHY_RUN_SECS:
+            restarts = 1
+        # Backs off so a task that fails instantly cannot spin the CPU, but never
+        # stops trying: an engine nobody restarts is an engine nobody notices.
+        await asyncio.sleep(min(3 * restarts, 60))
 
 
 def claim_single_instance():
@@ -4590,6 +4669,7 @@ async def main():
         supervise("connection", ensure_connection),
         supervise("range_engine", range_engine),
         supervise("telegram_listener", telegram_listener),
+        supervise("listener_watchdog", listener_watchdog),
         supervise("cost_governor", cost_governor),
         supervise("hook_server", hook_server),
         supervise("protect", protect_engine),
